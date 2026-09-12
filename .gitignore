@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Model weights -- large binaries, fetched by hand (see README's Setup
+# section for exact fetch commands per model). Never commit these.
+models/
+
+# Runtime-generated state (per-machine, not source)
+logs/
+*.log
+llm_usage_log.jsonl
+learned_seeds.json
+seed_promotion_state.json
