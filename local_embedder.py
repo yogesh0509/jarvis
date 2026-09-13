@@ -2,9 +2,11 @@
 Local ONNX embedding inference for BAAI/bge-small-en-v1.5, bypassing
 fastembed's automatic Hugging Face download -- Python's HTTPS client
 gets blocked/reset on this machine while PowerShell/.NET's doesn't
-(see tls_compat.py for the investigation). Model files were fetched
-once via PowerShell into models/bge-small-en-v1.5-onnx-q/ and are
-loaded from disk here; no network involved at import or inference time.
+(see README's TLS notes for the investigation -- tls_compat.py, an
+early monkeypatch shim for this, was removed once every model moved to
+this manual-fetch pattern). Model files were fetched once via
+PowerShell into models/bge-small-en-v1.5-onnx-q/ and are loaded from
+disk here; no network involved at import or inference time.
 
 BGE models use CLS-token pooling (not mean pooling) + L2 normalization
 -- this is the model card's documented usage, not a guess.

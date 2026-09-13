@@ -60,9 +60,13 @@ main.py              orchestrator: audio streams, wake word, VAD, session
                       state machine, control server, single-instance guard
 actions.py           the execution layer -- every allowlisted action as a
                       plain Python function; the only thing ever dispatched to
-apps_registry.py     the registered-apps table (chrome/discord/vscode/
-                      file_explorer/settings/local_disk_d) -- the actual
-                      security boundary for "open/minimize apps in general"
+apps_registry.py     the registered-apps table -- 7 hand-curated entries
+                      (chrome/discord/vscode/file_explorer/settings/
+                      local_disk_d/terminal) plus whatever app_discovery.py
+                      finds; the actual security boundary for "open/
+                      minimize apps in general"
+app_discovery.py     scans the Start Menu at startup to expand apps_registry's
+                      table automatically -- never overrides a curated entry
 intent_matcher.py    fast path: local sentence-embedding similarity match
 local_embedder.py    ONNX inference for bge-small-en-v1.5 (bypasses fastembed's
                       HF auto-download entirely)
@@ -75,7 +79,16 @@ vad.py               Silero VAD wrapper (speech/silence probability per frame)
 virtual_desktop.py   IVirtualDesktopManager COM wrapper (current-desktop check)
 tts.py               Piper TTS playback, mic-mute-while-speaking, persistent
                       output stream
-jarvisctl.py         one-shot control-socket client (status/pause/resume/quit)
+hud.py               the terminal display -- single locked writer for all
+                      user-facing output, pinned status bands, live mic meter,
+                      in-place line rewriting. `python hud.py` runs a
+                      standalone preview
+earcons.py           short non-verbal cues synthesized with numpy at import
+                      (wake blip, understood, decline, error, spin-down)
+phrases.py           reply phrasing as pools of variants, one place to change
+                      anything Jarvis says
+jarvisctl.py         one-shot control-socket client (status/stats/debug/
+                      pause/resume/quit)
 jarvis.cmd           `jarvis <command>` wrapper, `start` handled here directly
 launch.ps1           the actual `main.py` launch command (see "Terminal
                       theming" below for why this is a separate file)
@@ -84,8 +97,10 @@ _bench_llm.py        standalone latency/accuracy benchmark for llm_intent.py
                       changing the model/prompt/schema
 requirements.txt      pinned dependencies (excl. llama-cpp-python, see Setup)
 models/               model weights (gitignored -- see "Fetching the models")
-logs/                 headless-mode output (gitignored; dead in the normal
-                      flow, see the autostart section)
+tests/               pytest suite -- no audio device, no models,
+                      no window manager required
+logs/                 headless-mode output plus session.jsonl, the structured
+                      event log written in every mode (gitignored)
 ```
 
 ## Known environment issue: TLS 1.3 gets reset
@@ -269,11 +284,14 @@ removed it entirely in favor of a local control socket
 one-shot client. `jarvis.cmd` forwards those straight through and handles
 `start` itself (`wt.exe -F -p Jarvis` -- `jarvisctl.py` can only talk to
 an already-running instance, it can't launch a fresh one). `pause`/
-`resume` are a genuine hardware-level mic on/off (`stream.stop()`/
-`.close()` on the main listening stream, so Windows' mic-in-use indicator
-reflects it correctly) -- the only real "mic fully off" control, since
-wake-word detection has to keep the mic hot no matter what to hear "hey
-jarvis" at all.
+`resume` close/reopen the main listening stream (`stream.stop()`/
+`.close()`) -- the only real "stop acting on anything I say" control,
+since wake-word detection has to keep the mic hot no matter what to
+hear "hey jarvis" at all. Push-to-talk's own stream is deliberately left
+running through a pause, so it can still bring Jarvis back by voice --
+which means Windows' mic-in-use indicator can stay lit while paused
+(it reflects that stream sitting armed for a press, not the main
+listening path, which really is fully stopped).
 
 ### Idle unload after 30 minutes ("deep sleep")
 
@@ -372,10 +390,12 @@ effect.
 
 **Generalized app actions** (`apps_registry.py`, `actions.py`): the
 original Chrome-only `focus_or_launch_chrome`/window-finding code
-generalized into a registry-driven pattern for six apps (chrome,
-discord, vscode, file_explorer, settings, local_disk_d) plus
-`focus_vscode_repo` (free-text substring match against `Code.exe` window
-titles -- inherently safe regardless of the string, worst case is
+generalized into a registry-driven pattern -- originally seven
+hand-curated apps (chrome, discord, vscode, file_explorer, settings,
+local_disk_d, terminal), later joined by whatever `app_discovery.py`
+finds by scanning the Start Menu (Phase 7) -- plus `focus_vscode_repo`
+(free-text substring match against `Code.exe` window titles --
+inherently safe regardless of the string, worst case is
 focusing the wrong window), `switch_desktop` (next/previous only, via
 synthetic Ctrl+Win+arrow key events -- no undocumented COM interface, no
 absolute desktop numbers, no stable public API for that), and two
@@ -409,11 +429,14 @@ closing/quitting anything, per explicit user instruction).
 
 ### Virtual-desktop awareness
 
-`focus_or_launch_app`/`count_app_windows` only count a window as
-"already up" if it's on the *current* virtual desktop --
-`SetForegroundWindow` on a window on another desktop makes Windows
-silently switch your active desktop to follow it, which is not what
-"open X" should do to you. Uses the officially documented
+`focus_or_launch_app` only counts a window as "already up" if it's on
+the *current* virtual desktop -- `SetForegroundWindow` on a window on
+another desktop makes Windows silently switch your active desktop to
+follow it, which is not what "open X" should do to you.
+`count_app_windows` deliberately does the opposite -- "how many chrome
+windows are open" is naturally a system-wide question, not one scoped
+to whatever desktop you happen to be on, so it counts across all of
+them. Uses the officially documented
 `IVirtualDesktopManager` COM interface, not a reverse-engineered
 third-party wrapper. Two real bugs hit and fixed here early on: the COM
 object failed to instantiate with `CLSCTX_LOCAL_SERVER` ("Class not
@@ -479,6 +502,193 @@ project already fought through, for something this frequent.
   retries once before giving up and logging, rather than staying
   silently broken.
 
+**Non-verbal cues (`earcons.py`)** -- short tones synthesized with numpy
+at import (~40KB of float32 arrays total, no model, no files, no
+per-play synthesis), played through the output stream `tts.py` already
+keeps open. Purely additive: nothing that was spoken before is spoken
+any less.
+
+The case for them is latency, not decoration. The wake word firing used
+to be signalled only by a printed line and then a ~1s spoken "Yes,
+sir?", with no confirmation at all in between that anything had been
+heard; an 80ms rising blip lands immediately and makes the whole system
+feel instant even when the work behind it isn't. Cues also mark
+"understood", declines, errors, session close, entering/leaving low
+power, boot, and shutdown.
+
+They are generated at 22050Hz specifically to match the Piper medium
+voice, so the shared output stream is never torn down and re-opened
+between a cue and a reply -- that would reintroduce the cold-open glitch
+this project already fought (see above). Each one has a raised-cosine
+envelope on both edges: a bare sine that starts or stops at a nonzero
+sample clicks, and on a 60ms tone the click is most of what you hear.
+
+Critically they go through `tts._begin_speaking`/`_end_speaking` rather
+than straight to the device. The session listener is always-on and mutes
+itself only for the duration of *tracked* speech, so an untracked tone
+would be heard back through the mic as input -- the same bug class
+documented above for spoken replies. Silero is speech-specific and
+probably wouldn't fire on a pure tone, but "probably wouldn't" isn't
+something to build on.
+
+**Reply phrasing (`phrases.py`)** -- replies are drawn from pools of
+variants rather than being one hardcoded string per outcome.
+
+The specific problem: `actions.py` returned the same `"Done, sir."` for
+minimize, maximize, play/pause and mute. Hearing the identical four
+syllables for five unrelated actions was the most robotic thing about
+the system -- considerably more so than anything about the voice model.
+Every reply also ended in "sir", at 100% density, which reads as a
+template rather than a butler; that's now roughly half, and not always
+trailing.
+
+Deliberately straight -- no jokes, no time-of-day asides, no commentary
+on what you're doing. The goal was that it stop sounding *generated*,
+not that it become a character. `pick()` never returns the same variant
+twice running for a given key, which matters more than pool size:
+back-to-back repeats are what actually gets noticed. If a wit dial is
+ever wanted, `phrases.py` is the only file that would need to change.
+
+Two defects this shook out, both caught by the tests rather than in use:
+a variant leading with a lowercase placeholder rendered as a fragment
+("next desktop, sir."), and a pool whose variants disagreed about which
+placeholder they wanted would have raised `KeyError` only on the
+unlucky pick.
+
+**The HUD (`hud.py`)** -- the single writer for everything user-facing.
+
+Output used to be ~40 scattered `print()` calls across `main.py` and
+`tts.py` on several threads. That ruled out anything that redraws: two
+threads printing into one line interleave, and nothing knew where the
+cursor was. Routing it all through one locked module is what made the
+rest possible.
+
+- **Layout via a DECSTBM scroll region** (`ESC[{top};{bottom}r`) --
+  reserves row 1 and the last three rows so ordinary printing scrolls
+  only the middle band, leaving a pinned colour band at the top and a
+  status strip between two more bands at the bottom. No dependency, no
+  TUI framework. `rich`/`textual` were considered and rejected: `Live`
+  at 10fps is measurable CPU next to Whisper, and Textual would have
+  meant restructuring `main()` for no visual gain.
+- **Each utterance is one block that evolves, not three lines that
+  repeat.** The transcript used to print twice -- once as an immediate
+  echo, once again alongside the resolution -- which was the single
+  strongest "this is a log file" tell. The echo now opens a status line
+  underneath it that is erased and redrawn in place (`\r` + `ESC[2K`) as
+  the resolution lands, so nothing scrolls and nothing repeats. While
+  the LLM fallback runs, that line is a spinner with a live elapsed
+  count, which reassures better than the old static
+  `[checking with the local model...]` *and* costs one line instead of
+  two. Raw parse dicts and stack traces no longer appear at all unless
+  debug is on.
+- **Confidence is a bar, not just a number** -- gold at ≥0.85, amber to
+  0.60, red below. A suspect resolution is visible without anyone having
+  to remember what 0.62 means.
+- **Live mic meter**, fed one float per frame from the audio callbacks.
+  This is what makes the display read as a machine listening to the room
+  rather than a log. The audio callbacks do nothing else for it:
+  anything that blocks there drops frames and costs real transcription
+  accuracy, so all drawing happens on the render thread.
+- **Boot is a staged self-test** with real per-stage timings, filling
+  latency that was being spent anyway -- the old boot printed flat lines
+  and then stalled silently for three seconds loading Whisper.
+- **Steady state vs flash.** The listener owns the steady state (armed /
+  session / recording / off duty / asleep); success gold, error red and
+  thinking amber ride on top as transient flashes. An earlier version
+  had `flash()` snapshot the current state and restore it on a timer,
+  which clobbered the steady state whenever the loop changed mode
+  mid-flash -- e.g. a reply landing just as a session closed silently
+  reverted the close. Splitting the two fixed it; there's a test for it.
+- **Degrades to plain `print()` when stdout isn't a terminal.** Under
+  `pythonw.exe` (the Task Scheduler autostart entry) stdout is
+  `logs/jarvis.log`, and escape sequences there help nobody. No render
+  thread starts in that mode at all.
+
+Cost: one thread at 15fps writing a few hundred bytes. Nothing touches
+the recognition path.
+
+Three real bugs came out of actually booting this and living with it,
+rather than only running the tests:
+
+1. **`UnicodeEncodeError` at boot with stdout redirected.** Python picks
+   the console codepage for stdout on Windows -- cp1252 for a redirected
+   or non-UTF-8 console -- which cannot encode the box drawing, arrows or
+   `≥` used in the boot detail lines. The process died on the very first
+   boot step, before the listener ever started. `hud.init()` now forces
+   `reconfigure(encoding="utf-8", errors="replace")` before anything is
+   written, ahead of the `isatty` check, since the plain-text fallback is
+   just as exposed as the styled path.
+2. **The bands scrolled the screen and the HUD walked down it.** The
+   bands are exactly `cols` wide, so the last one fills the
+   bottom-right cell of the screen -- and with autowrap (DECAWM) on,
+   writing that cell scrolls the display by a line. `DECSC` saved the
+   cursor, the band paint scrolled the screen underneath it, and `DECRC`
+   restored to a row that had since moved; the spinner's next in-place
+   redraw then landed on the wrong line. At 15fps the whole display
+   walked steadily downward, stranding copies of the status band in the
+   scrollback with runs of blank lines between them. Only ever visible
+   while the spinner was running, because every other write ends in a
+   newline and self-corrects -- which is why it looked like an
+   LLM-fallback bug rather than a rendering one. Autowrap is now
+   disabled for the duration of each band paint and restored
+   immediately after, inside the cursor save/restore.
+3. **A pause displayed as LOW POWER.** `_unload_heavy_models()` is
+   reached two ways -- the 30-minute idle timeout and an explicit
+   `jarvis pause` -- and setting the display state inside that shared
+   helper overwrote the OFF DUTY its caller had just set. State now
+   belongs to each caller.
+
+**An exception in a sounddevice callback kills the stream outright.**
+Worth stating on its own, because the symptom looks nothing like the
+cause and this cost real debugging time.
+
+`sounddevice` registers its PortAudio callback with
+`_ffi.callback('PaStreamCallback', error=_lib.paAbort)`. Any exception
+escaping the Python callback therefore returns `paAbort` (2), and
+PortAudio **permanently stops the stream** -- no further callbacks, for
+the life of the process. It is not a dropped frame; it is the end of
+listening.
+
+What triggered it: `state` was assigned *after* `stream =
+_create_stream()`, so the first callback could fire while the name was
+still unbound and raise `NameError`. Latent since the original build and
+timing-dependent, so it fired on some boots and not others.
+
+The symptom was "hey jarvis" doing nothing at all with the display stuck
+on ARMED, while push-to-talk kept working perfectly -- because
+`hotkey_stream` is opened further down, after `state` exists. The 5s
+input watchdog would eventually notice the silence and reopen the main
+stream (by which point `state` was bound), so it recovered on its own
+and looked intermittent rather than deterministic.
+
+Fixed twice over: `state` is now defined before any stream is opened,
+and both callbacks wrap their entire body in `try/except` that logs to
+`session.jsonl` and returns. Neither may ever let an exception reach
+PortAudio, whatever goes wrong inside. `tests/test_audio_callbacks.py`
+covers both halves, and also asserts that sounddevice still uses
+`error=_lib.paAbort` -- if that ever changes, the guards stop being
+load-bearing and the test should be what says so.
+
+**llama-cpp's teardown noise at exit.** `Llama.__del__` ran during
+interpreter shutdown, by which point the module globals its cleanup
+chain depends on were already `None`, printing a `TypeError: 'NoneType'
+object is not callable` traceback *after* the goodbye. Harmless, but the
+last thing on screen and it reads like a crash. `_shutdown()` now calls
+`llm_intent.unload()` explicitly, freeing the model while the
+interpreter is still fully alive.
+
+**Structured logging + a runtime debug toggle** -- every event is
+appended to `logs/session.jsonl` (transcript, match score, parsed
+action, per-stage timings, errors) regardless of what the terminal is
+showing. The HUD is a *view*; it elides detail to stay readable, and
+none of that should be lost because the pretty layer chose not to draw
+it. `jarvis debug on|off` (or bare `jarvis debug` to toggle) flips
+terminal verbosity over the existing control socket with no restart --
+the point being to turn detail on the moment something misbehaves and
+catch the *next* occurrence, rather than restarting and losing the state
+that produced the bug. `jarvis stats` also reports p50/p95/worst latency
+per stage now.
+
 **Terminal theming** -- a dedicated Windows Terminal profile named
 "Jarvis" (own GUID, in `settings.json`), so none of this touches the
 user's default/other profiles. Custom color scheme "Jarvis HUD":
@@ -486,7 +696,31 @@ background/foreground/cursor built around the Mark III suit's hot-rod red
 and gold (`#FF2A1F` red, `#FFD8A8` warm gold-white foreground, `#0C0403`
 near-black background), with cyan (`#00D9FF`) kept as the ANSI cyan accent
 -- the original arc-reactor-blue HUD scheme, preserved as a "mix" rather
-than fully replaced. Font: JetBrainsMono NFM (already the system default).
+than fully replaced. Font: JetBrainsMono NFM (already the system default),
+whose Nerd Font glyph coverage is what the HUD's symbol set relies on.
+
+The profile launches fullscreen (`wt.exe -F -p Jarvis`), which matters
+for more than looks: the monitor-sync lights behind the display mirror
+whatever colour is on screen, sampling the edge zones. A coloured glyph
+in a sea of near-black moves the room barely at all, so the HUD drives
+those zones deliberately -- full-width bands top and bottom, plus a
+two-column state-coloured gutter down the left of every content line.
+State colour is eased toward its target over ~300ms rather than snapped
+(stepped colour reads as a glitch), and while an utterance is being
+recorded the bands' brightness tracks live mic level, so the room
+breathes with whatever is being said to it. The red-to-cyan snap when
+the wake word lands is the most visible thing the system does.
+
+Optional profile settings worth trying, none of them wired up here:
+`"experimental.retroTerminalEffect": true` for CRT scanlines and
+phosphor glow, an animated arc-reactor GIF as `backgroundImage` at
+`backgroundImageOpacity` around 0.07, and `"cursorShape": "filledBox"`.
+Avoid acrylic/transparency -- it bleeds the desktop through and muddies
+what the sync lights see.
+
+`python hud.py` runs a standalone live preview of the whole display
+(boot sequence, states, spinner, mic meter) without starting the stack,
+which is the quickest way to judge how it looks in the room.
 
 Two silent failures hit getting the launch itself right (both exit code
 0, nothing printed -- diagnosed by testing the inner command directly,
@@ -502,6 +736,18 @@ bypassing `wt.exe`, to isolate launcher from program):
    nothing at all.
 
 ## Known limitations / open items
+
+- **`logs/session.jsonl` is never rotated or pruned.** One line per
+  event, so realistically kilobytes per day -- but it grows without
+  bound across a long-running install. Delete it whenever; nothing reads
+  it back.
+- **The HUD's pinned bands depend on the terminal honouring DECSTBM
+  scroll regions.** Windows Terminal does, and there's a fallback to
+  plain text when stdout isn't a terminal at all -- but a terminal that
+  accepts VT sequences while ignoring `ESC[{top};{bottom}r` would scroll
+  the reserved rows away rather than degrading cleanly. `python hud.py`
+  renders the whole display standalone, which is the fastest way to
+  check a given terminal before wiring anything else to it.
 
 - **The session listener blocks synchronously while handling one
   command.** Transcription + action dispatch (up to ~5s for a cold app
@@ -579,3 +825,29 @@ instance.
       timing; session-open readiness cue; VAD onset debounce; TTS
       self-hearing fix; persistent audio streams (input and output) with
       device-failure recovery; listener-thread crash containment
+- [x] Phase 7 -- hardening pass (thread-affinity fix for virtual-desktop
+      COM calls; VAD rebuffered to Silero's native window size, cutting
+      its noise false-positive rate roughly 5x; seed-promotion label
+      allowlist + confidence gate against Whisper hallucinations; unload
+      races closed with a reentrant processing lock; input-stream
+      watchdog; a pytest suite for the previously-untested pure logic)
+      plus a round of feature work: local-LLM small talk/general
+      questions (the model also answers anything that isn't a command,
+      honestly declining anything needing live data); one turn of
+      pronoun memory ("open chrome" then "minimize it"); push-to-talk
+      barge-in to cut off a long reply mid-sentence (see `tts.py` for
+      two real concurrency bugs found and fixed getting this right);
+      dictation mode (`take dictation`/`stop dictation`, typed via
+      `keyboard.write()`); system/media controls (volume, mute, media
+      transport, lock, maximize, Windows' own window-snap) as a new
+      no-parameter action class; an auto-discovered app registry
+      (`app_discovery.py` scans the Start Menu at startup, folded into
+      `apps_registry.py`'s curated table); and a `jarvis stats` command
+      for basic observability (match-rate breakdown, last 20
+      utterances). Also closed two bugs found in real use after this
+      phase: an unhandled `AttachThreadInput` failure in
+      `_force_foreground` that could crash the listener thread, and the
+      LLM fallback picking an unrelated app when nothing registered
+      actually matched (now declines honestly instead of guessing) --
+      see `actions.py`, `apps_registry.py`'s `terminal` entry, and
+      `llm_intent.py`'s "don't guess" rule.

@@ -2,9 +2,14 @@
 Phase 5: auto-promotes frequently-seen LLM-fallback utterances into
 the fast embedding-matcher path, so a phrasing that started out
 needing the ~2.5-3s LLM detour becomes instant once it's proven to be
-something the user actually says regularly. Checked once at startup
-("is 24h+ elapsed since the last run"), not a persistent background
-timer -- simplest thing that satisfies "updates roughly once a day".
+something the user actually says regularly. Manual, on demand only --
+run directly (`python seed_promotion.py`), not wired into main.py's
+startup at all: embedding a bigger seed list adds measurable startup
+time, and the user would rather trigger this by hand when they know a
+new phrasing has become common. The 24h gate below (PROMOTION_INTERVAL_
+SECONDS) exists so re-running this by hand doesn't reprocess the whole
+log every time, not because anything calls it automatically -- pass
+force=True (as the __main__ entry point below does) to ignore it.
 
 Scope: only the bounded-enum actions (focus_or_launch_app, minimize_app,
 switch_desktop) get logged/promoted here. Their compound labels
@@ -17,12 +22,13 @@ phrasing into.
 Promotion requires the same (text, label) pair to have been seen at
 least PROMOTION_THRESHOLD times, not just once -- guards against a
 single LLM misclassification becoming a permanent bad fast-path seed.
-
-Not run automatically at startup -- embedding a bigger seed list adds
-measurable startup time, and the user would rather trigger this by
-hand when they know a new phrasing has become common. Run it directly
-(`python seed_promotion.py`) to check the log and promote anything
-that qualifies, ignoring the 24h gate.
+This alone wasn't enough in practice: two near-duplicate Whisper
+hallucinations of TRANSCRIBE_HOTWORDS fragments (main.py) each landed
+at count 1 against a threshold of 2, one utterance away from being
+promoted permanently. load_learned_seeds() below now also rejects any
+label that isn't one of the exact compound shapes compound_label()
+itself would ever produce -- defense in depth against a bad or
+hand-edited learned_seeds.json, not just a bad count.
 """
 
 import json
@@ -30,18 +36,33 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from apps_registry import APPS
+
 USAGE_LOG_PATH = Path(__file__).parent / "llm_usage_log.jsonl"
 LEARNED_SEEDS_PATH = Path(__file__).parent / "learned_seeds.json"
 PROMOTION_STATE_PATH = Path(__file__).parent / "seed_promotion_state.json"
 
 PROMOTION_INTERVAL_SECONDS = 24 * 60 * 60
-PROMOTION_THRESHOLD = 2
+PROMOTION_THRESHOLD = 3
+
+# The exact set of labels compound_label() can ever produce -- anything
+# else in learned_seeds.json (a bad promotion from before this fix, or
+# a hand edit) is silently dropped rather than trusted, since the
+# embedding matcher would otherwise happily match against and confidently
+# "resolve" an intent nothing in actions.py knows how to dispatch.
+_VALID_LABELS = (
+    {f"focus_or_launch_app:{app}" for app in APPS}
+    | {f"minimize_app:{app}" for app in APPS}
+    | {f"maximize_app:{app}" for app in APPS}
+    | {"switch_desktop:next", "switch_desktop:previous"}
+    | {"snap_window:left", "snap_window:right"}
+)
 
 
 def compound_label(action: str, app: str, direction: str) -> str | None:
-    if action in ("focus_or_launch_app", "minimize_app"):
+    if action in ("focus_or_launch_app", "minimize_app", "maximize_app"):
         return f"{action}:{app}"
-    if action == "switch_desktop":
+    if action in ("switch_desktop", "snap_window"):
         return f"{action}:{direction}"
     return None
 
@@ -59,9 +80,16 @@ def load_learned_seeds() -> dict[str, list[str]]:
     if not LEARNED_SEEDS_PATH.exists():
         return {}
     try:
-        return json.loads(LEARNED_SEEDS_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(LEARNED_SEEDS_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        label: [s for s in seeds if isinstance(s, str)]
+        for label, seeds in raw.items()
+        if label in _VALID_LABELS and isinstance(seeds, list)
+    }
 
 
 def _load_state() -> dict:

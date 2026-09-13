@@ -63,6 +63,16 @@ INTENTS: dict[str, list[str]] = {
         "open my d drive",
         "open d drive",
     ],
+    "focus_or_launch_app:terminal": [
+        "open the terminal",
+        "open terminal",
+        "open windows terminal",
+        "bring up the terminal",
+    ],
+    "minimize_app:terminal": [
+        "minimize the terminal",
+        "close the terminal",
+    ],
     "minimize_app:chrome": [
         "minimize chrome",
         "close chrome",
@@ -90,6 +100,30 @@ INTENTS: dict[str, list[str]] = {
         "go to the previous desktop",
         "previous desktop",
     ],
+    "snap_window:left": [
+        "snap left",
+        "snap this window to the left",
+        "snap to the left",
+    ],
+    "snap_window:right": [
+        "snap right",
+        "snap this window to the right",
+        "snap to the right",
+    ],
+    # System/media controls -- no app or direction of their own, so no
+    # compound label; each is its own bare intent. maximize_app is
+    # deliberately NOT seeded here at all (LLM-fallback only, for now)
+    # -- one seed per registered app would be the same cost as
+    # minimize_app's seeds for a much less frequently used action; not
+    # worth paying at every startup unless it proves common enough to
+    # promote (seed_promotion.py already recognizes the label if it does).
+    "volume_up": ["turn the volume up", "volume up", "louder"],
+    "volume_down": ["turn the volume down", "volume down", "quieter"],
+    "toggle_mute": ["mute", "mute the volume", "unmute"],
+    "media_play_pause": ["play", "pause", "play music", "pause the music"],
+    "media_next_track": ["next track", "skip this track", "next song"],
+    "media_previous_track": ["previous track", "go back a track", "previous song"],
+    "lock_workstation": ["lock my computer", "lock the screen", "lock windows"],
     # Meta intents -- handled specially in main.py (they toggle the
     # listener's own state), not routed through actions.py's allowlist.
     # Dual meaning, resolved in main.py by context: said mid-session,
@@ -111,6 +145,28 @@ INTENTS: dict[str, list[str]] = {
         "enable listening",
         "wake up",
         "come back online",
+    ],
+    # Dictation mode -- only meaningful within an open session (see
+    # main.py's start_dictation handling); said via push-to-talk it's
+    # declined with a clarifying message instead. A phrasing this list
+    # doesn't cover still falls back to the LLM, which also knows about
+    # start_dictation now (llm_intent.py) -- confirmed directly that an
+    # unmatched dictation-start phrase used to reach an LLM with no
+    # notion of dictation at all and get resolved as something unrelated.
+    # Exiting dictation is deliberately NOT done via this matcher at all
+    # once dictation is active -- main.py checks the raw transcript
+    # against a small fixed phrase set instead, since fuzzy-matching an
+    # exit condition against free-form dictated prose risks an
+    # unexpected early exit.
+    "start_dictation": [
+        "take dictation",
+        "start dictation",
+        "begin dictation",
+        "dictate this",
+        "start dictating",
+        "let's dictate",
+        "i want to dictate something",
+        "take a note",
     ],
 }
 

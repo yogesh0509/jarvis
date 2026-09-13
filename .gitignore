@@ -5,6 +5,9 @@
 __pycache__/
 *.pyc
 
+# pytest
+.pytest_cache/
+
 # Model weights -- large binaries, fetched by hand (see README's Setup
 # section for exact fetch commands per model). Never commit these.
 models/

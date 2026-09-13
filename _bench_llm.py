@@ -13,51 +13,14 @@ import time
 from llama_cpp import Llama
 from llama_cpp.llama_grammar import LlamaGrammar
 
-MODEL_PATH = r"D:\jarvis\models\qwen2.5-1.5b-instruct-gguf\qwen2.5-1.5b-instruct-q4_k_m.gguf"
+from llm_intent import MODEL_PATH, SCHEMA, _system_prompt
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": [
-                "focus_or_launch_app",
-                "minimize_app",
-                "switch_desktop",
-                "focus_vscode_repo",
-                "count_app_windows",
-                "count_files_in_folder",
-                "none",
-            ],
-        },
-        "app": {
-            "type": "string",
-            "enum": ["chrome", "discord", "vscode", "file_explorer", "settings", "local_disk_d", "none"],
-        },
-        "direction": {"type": "string", "enum": ["next", "previous", "none"]},
-        "repo": {"type": "string"},
-    },
-    "required": ["action", "app", "direction", "repo"],
-}
-
-SYSTEM_PROMPT = """You turn a spoken command into a structured action. Respond with ONLY a JSON object, no other text.
-
-Fields:
-- action: one of focus_or_launch_app, minimize_app, switch_desktop, focus_vscode_repo, count_app_windows, count_files_in_folder, none
-- app: the app involved (chrome, discord, vscode, file_explorer, settings, local_disk_d), or "none" if not applicable
-- direction: for switch_desktop only, "next" or "previous", else "none"
-- repo: for focus_vscode_repo only, the repository/folder name mentioned, else ""
-
-If the command doesn't match any action, set action to "none".
-
-Examples:
-"open chrome" -> {"action": "focus_or_launch_app", "app": "chrome", "direction": "none", "repo": ""}
-"can you minimize discord for me" -> {"action": "minimize_app", "app": "discord", "direction": "none", "repo": ""}
-"go to the next desktop" -> {"action": "switch_desktop", "app": "none", "direction": "next", "repo": ""}
-"switch to the bdk wallet window in vscode" -> {"action": "focus_vscode_repo", "app": "vscode", "direction": "none", "repo": "bdk_wallet"}
-"open my d drive" -> {"action": "focus_or_launch_app", "app": "local_disk_d", "direction": "none", "repo": ""}
-"what's the weather like" -> {"action": "none", "app": "none", "direction": "none", "repo": ""}
-"""
+SYSTEM_PROMPT = _system_prompt()
+# ^ Imported straight from llm_intent.py rather than duplicated here --
+# this file drifted out of sync with the live schema/prompt once
+# already (missing the "reply" field entirely) before this. Recomputed
+# per run (not a fixed string) since _system_prompt() bakes in the
+# current date/time now, same as the live path.
 
 TEST_UTTERANCES = [
     "open chrome",  # baseline -- embedding matcher already handles this
@@ -75,15 +38,17 @@ TEST_UTTERANCES = [
     "switch over to the hashstack window in vs code",
     "how many chrome windows do i have open right now",
     "how many files are in this folder",
-    "what's the weather like today",  # should map to none
-    "thank you",  # should map to none
+    "what's the weather like today",  # should map to none + a spoken reply
+    "what time is it",  # should map to none + the actual current time
+    "thank you",  # should map to none + a short acknowledgement
+    "tell me a joke",  # should map to none + something in character
 ]
 
 
 def main():
     print("Loading model...")
     t0 = time.time()
-    llm = Llama(model_path=MODEL_PATH, n_ctx=2048, n_threads=4, n_threads_batch=4, verbose=False)
+    llm = Llama(model_path=str(MODEL_PATH), n_ctx=2048, n_threads=4, n_threads_batch=4, verbose=False)
     print(f"  loaded in {time.time() - t0:.1f}s")
 
     grammar = LlamaGrammar.from_json_schema(json.dumps(SCHEMA), verbose=False)
@@ -97,7 +62,7 @@ def main():
         ],
         grammar=grammar,
         temperature=0.0,
-        max_tokens=100,
+        max_tokens=220,  # matches llm_intent.infer() -- enough for a short spoken reply plus JSON scaffolding
     )
     print(f"  warmup done in {time.time() - t0:.2f}s")
 
@@ -112,7 +77,7 @@ def main():
             ],
             grammar=grammar,
             temperature=0.0,
-            max_tokens=100,
+            max_tokens=220,  # matches llm_intent.infer() -- enough for a short spoken reply plus JSON scaffolding
         )
         elapsed = time.time() - t0
         total += elapsed

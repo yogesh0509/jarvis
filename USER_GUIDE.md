@@ -65,19 +65,35 @@ covered gets a brief "not sure how to do that yet" reply instead of
 being ignored, and (see section 4) it's spoken back to you now, not just
 shown in the window.
 
-**Apps** -- Chrome, Discord, VS Code, File Explorer, Settings, the D:
-drive:
-- "open chrome" / "bring up discord" / "switch to vs code" -- brings it
-  forward if already open on this desktop, launches a fresh one
-  otherwise
+**Apps.** Six are hand-curated for precise matching (Chrome, Discord, VS
+Code, File Explorer, Settings, the D: drive, and Windows Terminal), and
+many more are found automatically at startup by scanning your Start
+Menu -- Office apps, OneDrive, git tools, PowerShell, and whatever else
+you have installed, restart Jarvis to pick up anything newly installed:
+- "open chrome" / "bring up discord" / "open excel" -- brings it forward
+  if already open on this desktop, launches a fresh one otherwise
 - "minimize chrome" / "close discord" -- **"close" always means
   minimize**, never actually quitting or closing the app
+- "maximize chrome" -- the other half of minimize
 - "how many chrome windows are open" -- counts across every desktop
+- If you name an app that genuinely isn't installed/registered, it says
+  so honestly ("I don't have Photoshop registered, sir") rather than
+  guessing at the closest thing it does have.
 
 **Desktops:**
 - "switch to the next desktop" / "go to the previous desktop" -- next/
   previous only; a specific number ("desktop 2") isn't supported yet and
   gets an honest "I can only do next/previous, sir" instead of guessing
+- "snap this window to the left" / "snap right" -- Windows' own
+  half-screen snap, not a virtual-desktop change; whatever currently has
+  focus, no app name needed
+
+**System controls (no app name needed -- act on the whole system or
+whatever has focus):**
+- "turn the volume up" / "turn it down" / "mute"
+- "play" / "pause" / "skip this track" / "previous track"
+- "lock my computer" -- the one system control worth a heads-up: it
+  genuinely locks your screen (Win+L), the same as any other lock
 
 **VS Code, by name:**
 - "switch to the bdk_wallet window in vscode" -- jumps to whichever open
@@ -87,10 +103,25 @@ drive:
 - "how many files are in this folder" -- reads whatever folder the
   currently-focused File Explorer window is showing
 
+**Small talk and general questions.** Anything that isn't a command at
+all -- a greeting, "what time is it", "tell me a joke" -- gets an
+in-character spoken reply instead of a flat "I don't understand".
+Genuinely offline: no weather, news, or live search, and it says so
+honestly rather than making something up. It also remembers the last
+app an action touched for one turn, so "open chrome" then "minimize it"
+works without repeating the app name.
+
+**Dictation.** "take dictation" (only within an open conversation --
+say "hey jarvis" first) switches to typing out whatever you say next,
+word for word, into whatever window currently has focus -- notes,
+messages, a document, wherever your cursor is. Say "stop dictation" to
+go back to normal commands. See section 4a for the details.
+
 **Nothing destructive exists in the current command set** -- every
-action either brings something forward, minimizes it, switches desktops,
-or reads something back to you. Nothing deletes, sends, or closes
-without minimizing first.
+action either brings something forward, minimizes/maximizes it, snaps
+or switches desktops, adjusts volume/media, locks the screen, or reads
+something back to you. Nothing deletes, sends, or closes an app without
+minimizing first.
 
 ## 4. A typical wake-word interaction, start to finish
 
@@ -117,6 +148,43 @@ While a conversation is open, if it doesn't understand what you said (or
 it's not something it knows how to do), it says so out loud and keeps
 listening for your next command -- the conversation doesn't end because
 of a command it didn't understand.
+
+**How long it takes.** Common phrasings (the ones in section 3) resolve
+almost instantly. A phrasing it hasn't seen before falls back to a small
+local AI model to figure out what you meant -- normally a couple of
+seconds, occasionally longer, and noticeably longer than that for the
+*first* fallback after Jarvis has just started or come back from deep
+sleep (it's loading that model fresh). The moment it's heard you, it
+prints and speaks an acknowledgment (**"One moment, sir"**) before that
+fallback runs, specifically so a longer wait doesn't look like it's gone
+unresponsive -- if you don't hear or see anything at all after speaking,
+something's actually wrong (see section 8), but a "one moment" followed
+by a pause is normal.
+
+**Interrupting it.** If a reply is running long and you want to cut it
+off and say something else, hold Right Ctrl -- push-to-talk always
+stops whatever Jarvis is currently saying, immediately, then starts
+listening for your new command.
+
+### 4a. Dictation mode
+
+Say **"take dictation"** (or "start dictating", "let's dictate
+something") inside an open conversation. From then on, whatever you say
+is typed out, word for word, into whatever window currently has
+focus -- switch focus to a document, a chat window, a notes app, before
+or while dictating, and that's where it goes. It stays in this mode
+across as many sentences as you like, same pause-to-segment behavior as
+a normal conversation. Say **"stop dictation"** (or "end dictation",
+"done dictating") to leave it and go back to normal commands.
+
+Dictation isn't matched against any command at all while it's
+active -- it's typed as-is, so a dictated sentence that happens to
+mention "open chrome" just gets typed, not executed. The only way out
+is that exact stop phrase, checked directly against what you said rather
+than guessed at, so it won't misfire on dictated text that merely
+sounds similar. Push-to-talk still works normally even while dictating,
+as a reliable way out if you forget the stop phrase or just want a quick
+command without leaving dictation mode for your other utterances.
 
 ## 5. The four states -- and what each one actually means
 
@@ -269,6 +337,10 @@ today won't know about the command yet:
 ```
 jarvis start      # launch it (only needed if it's not already running)
 jarvis status     # what's it doing right now
+jarvis stats      # usage counts, timings + last 20 utterances -- see section 8
+jarvis debug      # toggle detailed output in the window (see section 8)
+jarvis debug on   # ...or set it explicitly
+jarvis debug off
 jarvis pause      # mic off, stop listening entirely
 jarvis resume     # bring it back
 jarvis quit       # stop it completely
@@ -285,13 +357,72 @@ rather not rely on the short command, the long form still works from
 `D:\jarvis`: `.venv\Scripts\python.exe jarvisctl.py <command>`, or
 `.venv\Scripts\python.exe main.py` to start it directly.)
 
-## 8. Checking in on it
+## 8. Reading the window
 
-The console window itself is the running commentary now -- every
-command it heard, every action it took, every pause/resume/session
-open-and-close appears there as it happens, oldest at the top. Scroll
-up in that window any time, or ask it directly with `jarvis status`
-(section 7) for just the current state without scrolling back.
+The window is a live display, not a scrolling log. Three things never
+move: a coloured band across the top, and a status strip plus a second
+band across the bottom.
+
+```
+  (colour band)
+  03:42:07  > open chrome for me
+              > focus_or_launch_app   0.95 |||||||||-
+              < Already up on this desktop, sir.
+
+  (colour band)
+  * SESSION OPEN   ...||||..    up 0:14:22   .37 cmds  .4 llm
+  (colour band)
+```
+
+**The status strip** shows what state it's in, a live microphone meter,
+how long it's been running, and running counts.
+
+**The colour is the state**, and it's the same colour your monitor-sync
+lights pick up -- so the room tells you what it's doing without you
+looking at the screen at all:
+
+| Colour | Meaning |
+|---|---|
+| Deep red | Armed, waiting for "hey jarvis" |
+| Cyan | Conversation open |
+| Bright cyan, pulsing with your voice | Recording what you're saying |
+| Amber | Thinking (the local AI fallback) |
+| Gold flash | Done |
+| Red flash | A problem, or it declined |
+| Near-black | Low power (models unloaded after 30 min idle) |
+| Grey | Paused |
+
+**Each thing you say occupies one block**, not three lines. What it
+heard appears the instant it's transcribed; the line underneath is then
+rewritten in place as it works out what you meant -- a spinner with a
+running seconds count while the local AI is thinking, then the action it
+settled on. The bar after the number is how confident it was: a full
+gold bar is a certain match, a short red one means it was guessing.
+
+**Sounds, not just words.** A short rising blip the instant it catches
+"hey jarvis" -- that lands well before it says "Yes, sir?", so you know
+it heard you straight away. A soft click when it's understood a command,
+a low double-note when it declines, and a spin-down sweep when it shuts
+off.
+
+### When something looks wrong
+
+`jarvis stats` gives a running summary since it last started: how many
+utterances it's heard, broken down by how each was resolved (an instant
+match, the local AI fallback, a chat reply, dictated text, declined,
+...), plus **how long each stage is taking** (typical, slow, and worst
+case for transcription, matching, the AI fallback and the action
+itself), plus the last 20 utterances with timestamps.
+
+`jarvis debug` turns on the detail the display normally hides -- the
+exact parsed command, match scores, stream warnings, full error traces.
+It takes effect immediately, with no restart, so you can turn it on the
+moment something starts misbehaving and catch the *next* occurrence.
+`jarvis debug off` puts it away again.
+
+You never lose anything by leaving debug off: **everything is written to
+`logs\session.jsonl` regardless**, one line per event. The window is
+just a view of it.
 
 ## Quick reference
 
@@ -301,8 +432,13 @@ up in that window any time, or ask it directly with `jarvis status`
 | See what you can say | Section 3 above |
 | End the conversation | Say "power down" (or just stop talking for ~4 min) |
 | Give one command without the wake word | Hold Right Ctrl, speak, let go |
+| Cut off a reply that's running long | Hold Right Ctrl -- stops it mid-sentence |
+| Type out what you say, word for word | "take dictation" (in a conversation); "stop dictation" to leave |
 | Stop it from listening at all | Hold Right Ctrl + say "stop listening", or `jarvis pause` |
 | Bring it back after pausing | Hold Right Ctrl + say "start listening", or `jarvis resume` |
 | Check what it's doing | `jarvis status`, or look at the console window |
+| Check usage counts / timings / recent history | `jarvis stats` |
+| See the detail behind a misbehaviour | `jarvis debug on` (then `off`) |
+| Find out what it actually did, after the fact | `logs\session.jsonl` |
 | Shut it down completely | `jarvis quit` (or close its window) |
 | Get it running again after quitting | `jarvis start` -- also happens automatically at login or laptop wake |

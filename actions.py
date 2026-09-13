@@ -11,6 +11,7 @@ grammar output still can't reference an unregistered app, since this
 layer does its own `if app_key not in APPS` check).
 """
 
+import ctypes
 import os
 import subprocess
 import time
@@ -22,6 +23,7 @@ import win32con
 import win32gui
 import win32process
 
+import phrases
 from apps_registry import APPS
 from virtual_desktop import is_window_on_current_desktop
 
@@ -76,6 +78,18 @@ def _force_foreground(hwnd: int) -> None:
     caused Chrome to end up focused-but-behind VS Code visually. Not
     worth the side effect given AttachThreadInput alone should suffice
     here.)
+
+    AttachThreadInput can itself legitimately fail -- confirmed
+    directly: "(5, 'AttachThreadInput', 'Access is denied.')" attaching
+    to a differently-privileged foreground window (an elevated process,
+    the secure desktop, ...). That crashed the whole caller before this
+    try/except existed -- caught by main.py's crash-recovery, but still
+    a real command failing mid-flight over something that should just
+    degrade. Never raises now: falls back to a plain SetForegroundWindow
+    (works often enough on its own even without the attach dance), and
+    failing that, BringWindowToTop -- worst case the window is merely
+    visible (already ensured above via ShowWindow) rather than truly
+    focused.
     """
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -87,18 +101,27 @@ def _force_foreground(hwnd: int) -> None:
 
     attached_fg = attached_target = False
     try:
-        if fg_thread and fg_thread != current_thread:
-            win32process.AttachThreadInput(current_thread, fg_thread, True)
-            attached_fg = True
-        if target_thread != current_thread:
-            win32process.AttachThreadInput(current_thread, target_thread, True)
-            attached_target = True
-        win32gui.SetForegroundWindow(hwnd)
-    finally:
-        if attached_fg:
-            win32process.AttachThreadInput(current_thread, fg_thread, False)
-        if attached_target:
-            win32process.AttachThreadInput(current_thread, target_thread, False)
+        try:
+            if fg_thread and fg_thread != current_thread:
+                win32process.AttachThreadInput(current_thread, fg_thread, True)
+                attached_fg = True
+            if target_thread != current_thread:
+                win32process.AttachThreadInput(current_thread, target_thread, True)
+                attached_target = True
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached_fg:
+                win32process.AttachThreadInput(current_thread, fg_thread, False)
+            if attached_target:
+                win32process.AttachThreadInput(current_thread, target_thread, False)
+    except Exception:
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            try:
+                win32gui.BringWindowToTop(hwnd)
+            except Exception:
+                pass
 
 
 def focus_or_launch_app(app_key: str) -> str:
@@ -111,12 +134,12 @@ def focus_or_launch_app(app_key: str) -> str:
     which is not what "open X" should silently do to you).
     """
     if app_key not in APPS:
-        return f"I don't have \"{app_key}\" registered, sir."
+        return phrases.pick("app_not_registered", app=app_key)
 
     windows = _find_app_windows(app_key, current_desktop_only=True)
     if windows:
         _force_foreground(windows[0])
-        return "Already up on this desktop, sir -- bringing it forward."
+        return phrases.pick("focus_already_here")
 
     was_running_elsewhere = bool(_find_app_windows(app_key, current_desktop_only=False))
 
@@ -127,20 +150,36 @@ def focus_or_launch_app(app_key: str) -> str:
         if windows:
             _force_foreground(windows[0])
             if was_running_elsewhere:
-                return "That's open on another desktop, sir -- opened a fresh one here instead."
-            return "Wasn't running. Fired it up for you."
-    return "Told it to open, sir, but I haven't spotted its window yet."
+                return phrases.pick("focus_other_desktop")
+            return phrases.pick("focus_launched")
+    return phrases.pick("focus_launched_no_window")
 
 
 def minimize_app(app_key: str) -> str:
     if app_key not in APPS:
-        return f"I don't have \"{app_key}\" registered, sir."
+        return phrases.pick("app_not_registered", app=app_key)
     windows = _find_app_windows(app_key, current_desktop_only=True)
     if not windows:
-        return "That's not open on this desktop, sir -- nothing to minimize."
+        return phrases.pick("minimize_nothing")
     for hwnd in windows:
         win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-    return "Done, sir."
+    return phrases.pick("minimize_ok")
+
+
+def maximize_app(app_key: str) -> str:
+    """
+    Same shape as minimize_app -- only ever acts on an already-open
+    window (current desktop only), never launches a fresh one just to
+    maximize it.
+    """
+    if app_key not in APPS:
+        return phrases.pick("app_not_registered", app=app_key)
+    windows = _find_app_windows(app_key, current_desktop_only=True)
+    if not windows:
+        return phrases.pick("maximize_nothing")
+    for hwnd in windows:
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+    return phrases.pick("maximize_ok")
 
 
 def focus_vscode_repo(repo_name: str) -> str:
@@ -168,12 +207,12 @@ def focus_vscode_repo(repo_name: str) -> str:
 
     win32gui.EnumWindows(_enum, None)
     if not found:
-        return f"I don't see a VS Code window open for {repo_name}, sir."
+        return phrases.pick("vscode_no_window", repo=repo_name)
 
     current_desktop = [hwnd for hwnd in found if is_window_on_current_desktop(hwnd)]
     target = current_desktop or found
     _force_foreground(target[0])
-    return f"Switching to {repo_name}, sir."
+    return phrases.pick("vscode_switching", repo=repo_name)
 
 
 def switch_desktop(direction: str) -> str:
@@ -192,19 +231,80 @@ def switch_desktop(direction: str) -> str:
     win32api.keybd_event(vk_arrow, 0, win32con.KEYEVENTF_KEYUP, 0)
     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
     win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
-    return f"Switching to the {direction} desktop, sir."
+    return phrases.pick("switch_desktop", direction=direction)
+
+
+def snap_window(direction: str) -> str:
+    """
+    Simulates Windows' own built-in Win+Left/Right snap shortcut --
+    same synthetic-key approach as switch_desktop, and for the same
+    reason: a documented, built-in OS behavior, not anything bespoke.
+    Always acts on whatever currently has focus, same as the real
+    shortcut does -- no app parameter, nothing to target.
+    """
+    vk_arrow = win32con.VK_LEFT if direction == "left" else win32con.VK_RIGHT
+    win32api.keybd_event(win32con.VK_LWIN, 0, 0, 0)
+    win32api.keybd_event(vk_arrow, 0, 0, 0)
+    time.sleep(0.05)
+    win32api.keybd_event(vk_arrow, 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
+    return phrases.pick("snap", direction=direction)
+
+
+def _tap_media_key(vk_code: int) -> None:
+    win32api.keybd_event(vk_code, 0, 0, 0)
+    win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+
+def volume_up() -> str:
+    _tap_media_key(win32con.VK_VOLUME_UP)
+    return phrases.pick("volume_up")
+
+
+def volume_down() -> str:
+    _tap_media_key(win32con.VK_VOLUME_DOWN)
+    return phrases.pick("volume_down")
+
+
+def toggle_mute() -> str:
+    _tap_media_key(win32con.VK_VOLUME_MUTE)
+    return phrases.pick("mute")
+
+
+def media_play_pause() -> str:
+    _tap_media_key(win32con.VK_MEDIA_PLAY_PAUSE)
+    return phrases.pick("play_pause")
+
+
+def media_next_track() -> str:
+    _tap_media_key(win32con.VK_MEDIA_NEXT_TRACK)
+    return phrases.pick("next_track")
+
+
+def media_previous_track() -> str:
+    _tap_media_key(win32con.VK_MEDIA_PREV_TRACK)
+    return phrases.pick("prev_track")
+
+
+def lock_workstation() -> str:
+    """
+    user32!LockWorkStation -- the documented, direct API for this
+    (used by Win+L itself), rather than simulating that key combo.
+    """
+    ctypes.windll.user32.LockWorkStation()
+    return phrases.pick("lock")
 
 
 def count_app_windows(app_key: str) -> str:
     """Counts across all desktops -- "how many X are open" is naturally system-wide, not scoped to the current desktop."""
     if app_key not in APPS:
-        return f"I don't have \"{app_key}\" registered, sir."
+        return phrases.pick("app_not_registered", app=app_key)
     count = len(_find_app_windows(app_key, current_desktop_only=False))
     if count == 0:
-        return "None open right now, sir."
+        return phrases.pick("count_none")
     if count == 1:
-        return "One window open, sir."
-    return f"{count} windows open, sir."
+        return phrases.pick("count_one")
+    return phrases.pick("count_many", count=count)
 
 
 def count_files_in_active_explorer_folder() -> str:
@@ -218,29 +318,52 @@ def count_files_in_active_explorer_folder() -> str:
     # between this call and the next -- GetClassName throws on either
     # (crashed the listener thread once with "Invalid window handle").
     if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):
-        return "No File Explorer window is focused right now, sir."
+        return phrases.pick("explorer_not_focused")
     if win32gui.GetClassName(fg_hwnd) != "CabinetWClass":
-        return "No File Explorer window is focused right now, sir."
+        return phrases.pick("explorer_not_focused")
     try:
         shell = win32com.client.Dispatch("Shell.Application")
         for window in shell.Windows():
             if window.HWND == fg_hwnd:
                 path = window.Document.Folder.Self.Path
                 count = sum(1 for entry in os.scandir(path) if entry.is_file())
-                return f"{count} files in that folder, sir."
+                return phrases.pick("folder_count", count=count)
     except Exception:
         pass
-    return "Couldn't read that folder, sir."
+    return phrases.pick("folder_unreadable")
 
 
 ACTIONS = {
     "focus_or_launch_app": focus_or_launch_app,
     "minimize_app": minimize_app,
+    "maximize_app": maximize_app,
     "focus_vscode_repo": focus_vscode_repo,
     "switch_desktop": switch_desktop,
+    "snap_window": snap_window,
     "count_app_windows": count_app_windows,
     "count_files_in_folder": count_files_in_active_explorer_folder,
+    "volume_up": volume_up,
+    "volume_down": volume_down,
+    "toggle_mute": toggle_mute,
+    "media_play_pause": media_play_pause,
+    "media_next_track": media_next_track,
+    "media_previous_track": media_previous_track,
+    "lock_workstation": lock_workstation,
 }
+
+# Actions that take no parameter at all -- system/media controls that
+# always act on the whole system or whatever currently has focus, never
+# a specific registered app. Shared between dispatch_llm_action and
+# parse_fast_path_intent so the two stay in sync automatically.
+_NO_PARAM_ACTIONS = (
+    "volume_up",
+    "volume_down",
+    "toggle_mute",
+    "media_play_pause",
+    "media_next_track",
+    "media_previous_track",
+    "lock_workstation",
+)
 
 
 def dispatch_llm_action(parsed: dict) -> str:
@@ -252,30 +375,33 @@ def dispatch_llm_action(parsed: dict) -> str:
     convention, so main.py doesn't need its own if/elif per action.
     """
     action = parsed["action"]
-    if action in ("focus_or_launch_app", "minimize_app", "count_app_windows"):
+    if action in ("focus_or_launch_app", "minimize_app", "maximize_app", "count_app_windows"):
         return ACTIONS[action](parsed["app"])
-    if action == "switch_desktop":
+    if action in ("switch_desktop", "snap_window"):
         return ACTIONS[action](parsed["direction"])
     if action == "focus_vscode_repo":
         return ACTIONS[action](parsed["repo"])
-    if action == "count_files_in_folder":
+    if action == "count_files_in_folder" or action in _NO_PARAM_ACTIONS:
         return ACTIONS[action]()
-    return "I understood that as something to do, sir, but I'm not sure how to actually do it yet."
+    return phrases.pick("unknown_action")
 
 
 def parse_fast_path_intent(label: str) -> dict | None:
     """
     Converts a compound embedding-matcher label ("focus_or_launch_app:chrome",
-    "switch_desktop:next") into the same dict shape llm_intent.infer()
+    "switch_desktop:next") -- or, for a no-parameter action, a bare
+    label ("volume_up") -- into the same dict shape llm_intent.infer()
     produces, so both paths dispatch through dispatch_llm_action()
-    uniformly. Returns None for labels that aren't compound (meta
-    intents like disable_listening, handled separately in main.py).
+    uniformly. Returns None for labels that aren't one of these shapes
+    (meta intents like disable_listening, handled separately in main.py).
     """
+    if label in _NO_PARAM_ACTIONS:
+        return {"action": label, "app": "none", "direction": "none", "repo": ""}
     if ":" not in label:
         return None
     action, param = label.split(":", 1)
-    if action in ("focus_or_launch_app", "minimize_app"):
+    if action in ("focus_or_launch_app", "minimize_app", "maximize_app"):
         return {"action": action, "app": param, "direction": "none", "repo": ""}
-    if action == "switch_desktop":
+    if action in ("switch_desktop", "snap_window"):
         return {"action": action, "app": "none", "direction": param, "repo": ""}
     return None

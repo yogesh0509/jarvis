@@ -6,6 +6,7 @@ some third-party libraries lean on for extra features we don't need.
 """
 
 import ctypes
+import threading
 from ctypes import wintypes
 
 import comtypes
@@ -43,12 +44,26 @@ class IVirtualDesktopManager(IUnknown):
     ]
 
 
-_manager = None
+_thread_local = threading.local()
 
 
 def _get_manager():
-    global _manager
-    if _manager is None:
+    """
+    Thread-local, not a shared global -- a raw comtypes interface
+    pointer can't safely cross threads without marshalling (each COM
+    apartment gets its own proxy), and this genuinely gets called from
+    more than one thread: the listener thread, and a fresh worker
+    thread spawned per push-to-talk press (main.py's on_release). A
+    global cache bit us for exactly this: a manager created on one
+    thread and reused from another silently returned False for a
+    window that actually was on the current desktop -- indistinguishable,
+    from the caller's side, from this module's real fail-closed case
+    (see is_window_on_current_desktop's docstring). One
+    CoCreateInstance per thread that ever calls in here costs a few ms,
+    once, and sidesteps the whole class of bug rather than trying to
+    detect and recover from a poisoned pointer.
+    """
+    if not hasattr(_thread_local, "manager"):
         comtypes.CoInitialize()
         # This is an in-process COM server (twinapi/shell), not a local
         # out-of-process one -- CLSCTX_LOCAL_SERVER fails with "Class
@@ -56,12 +71,12 @@ def _get_manager():
         # loudly on its own here, it just means every subsequent call
         # would silently need a fallback -- which is exactly why the
         # per-window fallback below fails *closed*, not open).
-        _manager = comtypes.CoCreateInstance(
+        _thread_local.manager = comtypes.CoCreateInstance(
             CLSID_VirtualDesktopManager,
             interface=IVirtualDesktopManager,
             clsctx=comtypes.CLSCTX_INPROC_SERVER,
         )
-    return _manager
+    return _thread_local.manager
 
 
 def is_window_on_current_desktop(hwnd: int) -> bool:

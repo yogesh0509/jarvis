@@ -20,6 +20,14 @@ here via Python's own HTTPS client, PowerShell's is not).
 speak() is fire-and-forget (runs on a background thread) so a state
 transition line never blocks the listener loop or the control server
 while it's being read out.
+
+interrupt() lets push-to-talk (main.py's on_press) cut off whatever's
+currently playing -- barge-in, so a long reply doesn't have to be
+waited out. See interrupt()'s and _write_audio_interruptible()'s
+docstrings for the two real races/gotchas this went through before
+landing on its current design (cross-thread stream access, and a
+one-chunk-per-sentence Piper quirk that made a naive per-chunk check
+nearly useless).
 """
 
 import threading
@@ -29,6 +37,8 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+
+import hud
 from piper.voice import PiperVoice
 from piper.config import SynthesisConfig
 
@@ -62,22 +72,90 @@ _speaking_count = 0
 _speaking_count_lock = threading.Lock()
 _ECHO_TAIL_SECONDS = 0.3
 
+# Barge-in: push-to-talk (main.py's on_press) can cut off whatever's
+# currently playing. Each speak() call gets its own monotonic id,
+# assigned synchronously in _begin_speaking() (same lock, same "no
+# window" reasoning as _speaking_count below) -- interrupt() records a
+# *threshold* id to cut short, rather than just flipping a shared
+# boolean.
+#
+# A single shared flag was tried first and had a real race: _speak_now
+# used to clear it right before starting its own synthesis loop (to
+# wipe any *stale* flag left over from a previous interrupted
+# utterance), but that same clear could fire *after* a genuine
+# interrupt() call aimed at the utterance currently loading the voice
+# model (_get_voice() runs before the lock/loop, so there's a window
+# where an utterance is "in flight" but hasn't reached that clear yet)
+# -- confirmed directly: an interrupt() issued during that window got
+# silently erased, and the "interrupted" reply played out in full.
+#
+# An exact-match single id was tried next and had a *different* real
+# race, this one about several speak() calls queued up close together
+# (e.g. testing rapid press/release cycles): each interrupt() call
+# only recorded the single latest id, so an older, still-queued call
+# (blocked waiting for _playback_lock, not yet even started) would see
+# a *later* id had since overwritten the one meant for it, never
+# noticed anything was wrong, and played out in full -- confirmed
+# directly, a burst of interrupted calls left a growing backlog that
+# took many seconds to unwind instead of cutting off immediately.
+#
+# A threshold fixes both: any utterance id at or below the last
+# interrupt() call's snapshot counts as interrupted, whether it's
+# mid-playback, still loading the voice, or hasn't even started yet.
+_next_utterance_id = 0
+_interrupted_up_to_id = 0
+
 
 def is_speaking() -> bool:
     with _speaking_count_lock:
         return _speaking_count > 0
 
 
-def _begin_speaking() -> None:
-    global _speaking_count
+def _begin_speaking() -> int:
+    global _speaking_count, _next_utterance_id
     with _speaking_count_lock:
         _speaking_count += 1
+        _next_utterance_id += 1
+        return _next_utterance_id
 
 
 def _end_speaking() -> None:
     global _speaking_count
     with _speaking_count_lock:
         _speaking_count = max(0, _speaking_count - 1)
+
+
+def interrupt() -> None:
+    """
+    Signals whatever's currently playing to stop, and clears the
+    speaking count right away so is_speaking() drops without waiting
+    for _speak_now's own cleanup. Safe to call even when nothing is
+    playing (a no-op).
+
+    Deliberately does NOT touch _output_stream itself -- only ever
+    bookkeeping here (fast, no audio I/O, safe to call from any
+    thread). A first version called stream.abort()/.start() directly
+    from here, i.e. from whatever thread calls interrupt() (main.py's
+    on_press, on the keyboard hook's thread) -- and that raced with the
+    *other* thread that's actually mid-write() on the same stream
+    (_speak_now's worker thread, inside _write_audio): confirmed
+    directly, a rapid interrupt-while-writing cycle left the stream
+    permanently wedged, hanging every subsequent write() forever, not
+    just the interrupted one. PortAudio/sounddevice streams aren't
+    documented as safe to abort() from a thread other than the one
+    driving them. _speak_now below does its own abort()/start() from
+    inside its own loop instead -- the one thread that's actually
+    calling write() on this stream -- once it notices the id set here.
+    """
+    global _interrupted_up_to_id, _speaking_count
+    with _speaking_count_lock:
+        # Everything issued so far (there's normally at most one in
+        # flight, but see _interrupted_up_to_id's comment for why a
+        # threshold rather than just "the current one" matters) --
+        # never regresses since _next_utterance_id only grows, so a
+        # later speak() call's id is always safely above this.
+        _interrupted_up_to_id = _next_utterance_id
+        _speaking_count = 0
 
 
 def _get_voice() -> PiperVoice:
@@ -145,7 +223,46 @@ def _write_audio(data: np.ndarray, samplerate: int) -> None:
         stream.write(data)
 
 
-def _speak_now(text: str) -> None:
+_INTERRUPT_CHECK_SECONDS = 0.15  # see _write_audio_interruptible
+
+
+def _write_audio_interruptible(data: np.ndarray, samplerate: int, utterance_id: int) -> bool:
+    """
+    Writes `data` in small slices, checking the interrupt threshold
+    between each, instead of one blocking write() for the whole thing.
+    Returns True if cut short partway through (caller must stop
+    immediately -- do not write anything more of this utterance), False
+    if it completed normally.
+
+    Needed because Piper doesn't chunk by any small fixed size -- it
+    yields whatever it considers one unit, which for an ordinary
+    single-sentence reply is often the *entire* sentence as one chunk
+    (confirmed directly: a 20-word sentence came back as a single ~5s
+    chunk). Checking the interrupt flag only *between* voice.synthesize()'s
+    own chunks, as a first version of this did, meant an interrupt
+    couldn't take effect until that whole multi-second chunk had
+    already been handed to stream.write() -- i.e. never, in practice,
+    for most replies. Slicing here instead bounds the worst-case delay
+    between an interrupt and audio actually stopping to about
+    _INTERRUPT_CHECK_SECONDS, regardless of Piper's own chunk size.
+    """
+    slice_len = max(1, int(_INTERRUPT_CHECK_SECONDS * samplerate))
+    for start in range(0, len(data), slice_len):
+        if utterance_id <= _interrupted_up_to_id:
+            return True
+        _write_audio(data[start : start + slice_len], samplerate)
+    return False
+
+
+def _speak_now(text: str, utterance_id: int) -> None:
+    # Bail before doing anything at all (no voice load, no lock wait) if
+    # this utterance was already interrupted before it even got a
+    # chance to start -- see _interrupted_up_to_id's comment for the
+    # backlog scenario this specifically covers.
+    if utterance_id <= _interrupted_up_to_id:
+        _end_speaking()
+        return
+
     voice = _get_voice()
     # One lock so overlapping speak() calls queue up rather than
     # talking over each other -- state transitions are infrequent
@@ -153,16 +270,41 @@ def _speak_now(text: str) -> None:
     try:
         with _playback_lock:
             primed = False
+            interrupted = False
             for chunk in voice.synthesize(text, syn_config=_SYN_CONFIG):
+                if utterance_id <= _interrupted_up_to_id:
+                    interrupted = True
+                    break
                 if not primed:
                     silence = np.zeros(int(_PRIMING_SECONDS * chunk.sample_rate), dtype=np.float32)
-                    _write_audio(silence.reshape(-1, 1), chunk.sample_rate)
+                    if _write_audio_interruptible(silence.reshape(-1, 1), chunk.sample_rate, utterance_id):
+                        interrupted = True
+                        break
                     primed = True
-                _write_audio(chunk.audio_float_array.reshape(-1, 1), chunk.sample_rate)
-            time.sleep(_ECHO_TAIL_SECONDS)
+                if _write_audio_interruptible(chunk.audio_float_array.reshape(-1, 1), chunk.sample_rate, utterance_id):
+                    interrupted = True
+                    break
+
+            if interrupted or utterance_id <= _interrupted_up_to_id:
+                # Abort from *this* thread only -- the one that's
+                # actually been calling write() on this stream -- never
+                # from interrupt()'s caller thread (see interrupt()'s
+                # docstring for why that's unsafe). abort() drops
+                # whatever's still buffered for output instead of
+                # letting it drain, which is the actual "cut off" the
+                # user asked for; PortAudio then requires start() again
+                # before the stream will accept more writes.
+                if _output_stream is not None:
+                    try:
+                        _output_stream.abort()
+                        _output_stream.start()
+                    except Exception:
+                        pass
+            else:
+                time.sleep(_ECHO_TAIL_SECONDS)
     except Exception:
-        traceback.print_exc()
-        print("Couldn't get a word out there, sir -- audio output seems to be having trouble.")
+        hud.line("Couldn't get a word out there -- audio output is having trouble.", "warn")
+        hud.note(traceback.format_exc())
     finally:
         _end_speaking()
 
@@ -173,8 +315,51 @@ def speak(text: str, blocking: bool = False) -> None:
     right before the process exits (quit) -- otherwise the process can
     end before a background thread gets to actually play it.
     """
-    _begin_speaking()
+    utterance_id = _begin_speaking()
     if blocking:
-        _speak_now(text)
+        _speak_now(text, utterance_id)
     else:
-        threading.Thread(target=_speak_now, args=(text,), daemon=True).start()
+        threading.Thread(target=_speak_now, args=(text, utterance_id), daemon=True).start()
+
+
+# --- non-verbal cues (earcons.py) ------------------------------------
+# Short tones share the voice's playback path rather than opening their
+# own device: same output stream (earcons are generated at the Piper
+# medium voice's 22050Hz precisely so it never has to be re-opened),
+# same lock so a cue can't play over a spoken reply, and crucially the
+# same _begin_speaking/_end_speaking accounting so the always-on session
+# listener stays muted for their duration too. See earcons.py's module
+# docstring for why that last part isn't optional.
+_EARCON_TAIL_SECONDS = 0.08  # shorter than _ECHO_TAIL_SECONDS -- a 60ms
+# tone has far less room decay behind it than a spoken sentence.
+
+
+def _play_samples_now(samples: np.ndarray, samplerate: int, utterance_id: int) -> None:
+    try:
+        if utterance_id <= _interrupted_up_to_id:
+            return
+        with _playback_lock:
+            if utterance_id <= _interrupted_up_to_id:
+                return
+            _write_audio(samples.reshape(-1, 1), samplerate)
+            time.sleep(_EARCON_TAIL_SECONDS)
+    except Exception:
+        # A cue failing is never worth surfacing, let alone crashing a
+        # caller over -- it's decoration on top of an action that
+        # already happened.
+        pass
+    finally:
+        _end_speaking()
+
+
+def play_samples(samples: np.ndarray, samplerate: int, blocking: bool = False) -> None:
+    """
+    Play raw float32 mono samples as a non-verbal cue. Mirrors speak()'s
+    contract: fire-and-forget by default, blocking=True where ordering
+    against a following speak() matters or the process is about to exit.
+    """
+    utterance_id = _begin_speaking()
+    if blocking:
+        _play_samples_now(samples, samplerate, utterance_id)
+    else:
+        threading.Thread(target=_play_samples_now, args=(samples, samplerate, utterance_id), daemon=True).start()
