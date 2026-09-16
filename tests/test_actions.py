@@ -6,6 +6,8 @@ covered here; dispatch_llm_action is tested against a monkeypatched
 ACTIONS table so no real window is touched.
 """
 
+import pytest
+
 import actions
 import phrases
 
@@ -79,10 +81,35 @@ def test_parse_fast_path_intent_unknown_compound_action_returns_none():
 
 def test_dispatch_llm_action_routes_app_actions(monkeypatch):
     calls = []
-    monkeypatch.setitem(actions.ACTIONS, "focus_or_launch_app", lambda app: calls.append(("focus", app)) or "ok")
-    result = actions.dispatch_llm_action({"action": "focus_or_launch_app", "app": "chrome", "direction": "none", "repo": ""})
+    monkeypatch.setitem(actions.ACTIONS, "minimize_app", lambda app: calls.append(("minimize", app)) or "ok")
+    result = actions.dispatch_llm_action({"action": "minimize_app", "app": "chrome", "direction": "none", "repo": ""})
     assert result == "ok"
-    assert calls == [("focus", "chrome")]
+    assert calls == [("minimize", "chrome")]
+
+
+def test_dispatch_llm_action_routes_focus_or_launch_app_with_hint_text(monkeypatch):
+    # focus_or_launch_app is the one action dispatch_llm_action calls
+    # with two arguments -- the app key, and the raw utterance text as
+    # an optional window-selection hint (see actions.focus_or_launch_app's
+    # hint_text parameter). The `text` argument defaults to "" so every
+    # call site that doesn't have one (or predates this) keeps working.
+    calls = []
+    monkeypatch.setitem(
+        actions.ACTIONS, "focus_or_launch_app", lambda app, hint_text: calls.append((app, hint_text)) or "ok"
+    )
+    result = actions.dispatch_llm_action(
+        {"action": "focus_or_launch_app", "app": "chrome", "direction": "none", "repo": ""},
+        "bring up the chrome with the football stream",
+    )
+    assert result == "ok"
+    assert calls == [("chrome", "bring up the chrome with the football stream")]
+
+
+def test_dispatch_llm_action_defaults_hint_text_to_empty_string(monkeypatch):
+    calls = []
+    monkeypatch.setitem(actions.ACTIONS, "focus_or_launch_app", lambda app, hint_text: calls.append(hint_text) or "ok")
+    actions.dispatch_llm_action({"action": "focus_or_launch_app", "app": "chrome", "direction": "none", "repo": ""})
+    assert calls == [""]
 
 
 def test_dispatch_llm_action_routes_switch_desktop(monkeypatch):
@@ -125,13 +152,41 @@ def test_dispatch_llm_action_routes_snap_window(monkeypatch):
     assert calls == ["right"]
 
 
+# Actions special-cased in dispatch_llm_action to receive `text` as a
+# free-text hint even though they stay in _NO_PARAM_ACTIONS for
+# parse_fast_path_intent's sake -- see that function's own docstring.
+_TEXT_HINT_ACTIONS = ("describe_screen", "move_to_monitor")
+
+
 def test_dispatch_llm_action_routes_no_param_actions_with_no_args(monkeypatch):
     for label in actions._NO_PARAM_ACTIONS:
+        if label in _TEXT_HINT_ACTIONS:
+            continue
         calls = []
         monkeypatch.setitem(actions.ACTIONS, label, lambda calls=calls: calls.append(True) or "ok")
         result = actions.dispatch_llm_action({"action": label, "app": "none", "direction": "none", "repo": ""})
         assert result == "ok"
         assert calls == [True]
+
+
+@pytest.mark.parametrize("label", _TEXT_HINT_ACTIONS)
+def test_dispatch_llm_action_routes_text_hint_actions_with_hint_text(monkeypatch, label):
+    calls = []
+    monkeypatch.setitem(actions.ACTIONS, label, lambda hint_text: calls.append(hint_text) or "ok")
+    result = actions.dispatch_llm_action(
+        {"action": label, "app": "none", "direction": "none", "repo": ""},
+        "what's on my laptop screen",
+    )
+    assert result == "ok"
+    assert calls == ["what's on my laptop screen"]
+
+
+@pytest.mark.parametrize("label", _TEXT_HINT_ACTIONS)
+def test_dispatch_llm_action_defaults_text_hint_actions_to_empty_string(monkeypatch, label):
+    calls = []
+    monkeypatch.setitem(actions.ACTIONS, label, lambda hint_text: calls.append(hint_text) or "ok")
+    actions.dispatch_llm_action({"action": label, "app": "none", "direction": "none", "repo": ""})
+    assert calls == [""]
 
 
 def test_dispatch_llm_action_unknown_action_declines_gracefully():

@@ -43,7 +43,7 @@ def test_placeholder_sets_are_consistent_within_a_pool():
 # Placeholders substituted with lowercase text (an app key, a repo
 # name, "next"/"left"). A variant leading with one renders as a
 # fragment. {count} is exempt -- "3 windows open, sir." is a sentence.
-_TEXT_PLACEHOLDERS = {"app", "repo", "direction"}
+_TEXT_PLACEHOLDERS = {"app", "repo", "direction", "monitor"}
 
 
 def test_no_variant_starts_with_a_lowercase_placeholder():
@@ -127,6 +127,13 @@ def test_frequent_action_confirmations_are_not_all_sir():
         ("snap", {"direction": "left"}),
         ("count_many", {"count": 3}),
         ("folder_count", {"count": 12}),
+        ("screen_summary_known", {"app": "Chrome", "title": "New Tab", "monitor": "your monitor"}),
+        ("screen_summary_unknown", {"title": "Some Window", "monitor": "your laptop screen"}),
+        ("screen_other_summary", {"monitor": "your laptop screen", "summary": "two Chrome and VS Code"}),
+        ("screen_named_summary", {"monitor": "your monitor", "summary": "Discord"}),
+        ("screen_empty", {"monitor": "your laptop screen"}),
+        ("move_monitor_ok", {"monitor": "your monitor"}),
+        ("move_monitor_already_there", {"monitor": "your laptop screen"}),
     ],
 )
 def test_call_sites_render_cleanly(key, kwargs):

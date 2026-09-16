@@ -69,6 +69,11 @@ INTENTS: dict[str, list[str]] = {
         "open windows terminal",
         "bring up the terminal",
     ],
+    "focus_or_launch_app:spotify": [
+        "open spotify",
+        "bring up spotify",
+        "switch to spotify",
+    ],
     "minimize_app:terminal": [
         "minimize the terminal",
         "close the terminal",
@@ -124,6 +129,9 @@ INTENTS: dict[str, list[str]] = {
     "media_next_track": ["next track", "skip this track", "next song"],
     "media_previous_track": ["previous track", "go back a track", "previous song"],
     "lock_workstation": ["lock my computer", "lock the screen", "lock windows"],
+    "describe_screen": ["what's on my screen", "what's on screen right now", "what am I looking at"],
+    "now_playing": ["what's playing", "what's currently playing", "what song is this", "what's on spotify"],
+    "move_to_monitor": ["move this to my laptop", "move this to my monitor", "move this to the other screen"],
     # Meta intents -- handled specially in main.py (they toggle the
     # listener's own state), not routed through actions.py's allowlist.
     # Dual meaning, resolved in main.py by context: said mid-session,

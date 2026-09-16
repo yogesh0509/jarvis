@@ -36,6 +36,8 @@ def matcher():
         ("mute", "toggle_mute"),
         ("next track", "media_next_track"),
         ("lock my computer", "lock_workstation"),
+        ("what's on my screen", "describe_screen"),
+        ("what am I looking at right now", "describe_screen"),
     ],
 )
 def test_known_phrases_match_expected_intent(matcher, phrase, expected_intent):

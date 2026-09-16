@@ -32,7 +32,7 @@ from faster_whisper import WhisperModel
 from openwakeword.model import Model as WakeWordModel
 
 from intent_matcher import IntentMatcher
-from actions import dispatch_llm_action, parse_fast_path_intent
+from actions import dispatch_llm_action, llm_screen_context, parse_fast_path_intent
 from vad import SileroVAD
 from tts import VOICE as tts_voice, speak, is_speaking, interrupt as interrupt_speech
 import earcons
@@ -117,6 +117,232 @@ def _is_dictation_stop_phrase(text: str) -> bool:
     return text.strip().lower().rstrip(".,!?") in _DICTATION_STOP_PHRASES
 
 
+# --- pre-LLM transcript gate -------------------------------------------
+#
+# Ships OFF by default -- this only *logs* what it would have rejected
+# (see the "transcript_would_reject" event at its call site in
+# _handle_transcript_inner) without changing what actually gets
+# dispatched, until TRANSCRIPT_GATE_ENFORCED is flipped to True by hand.
+#
+# Why gate at all: logs/session.jsonl and llm_usage_log.jsonl showed
+# that *every* logged LLM-fallback resolution at the time this was
+# written was a hallucinated transcript that still burned a full
+# ~3-30s LLM call and got confidently dispatched as a real action
+# ("or been grown for me" -> minimize chrome, "hey job is" -> open
+# chrome, ...). Text-only heuristics (a denylist, a length floor) catch
+# only a small fraction of these -- most are fluent-sounding multi-word
+# phrases indistinguishable from a real command by their words alone.
+# The signal that actually catches them is acoustic: Whisper's own
+# per-segment no_speech_prob/avg_logprob/compression_ratio, already
+# computed by faster-whisper for its own internal temperature-fallback
+# decision (see _transcribe) and, until now, discarded immediately
+# after being reduced to the single `confident` bool that main.py used
+# *only* to gate seed-promotion logging, never dispatch. That is a
+# reversal of a documented decision (see the `confident` computation's
+# own comment below) -- recorded here, not silently changed.
+#
+# Why only gate the LLM-bound branch, never the fast embedding-match
+# path: a >=0.80 cosine match against a seeded phrase is its own
+# evidence a real command was heard, and must keep dispatching
+# regardless of whatever this predicate would say. This is also what
+# keeps the false-rejection blast radius small: the worst case is "a
+# phrase the embedding matcher already couldn't place is now also
+# refused a slow guess", not "a legitimate short fast-path command like
+# 'mute' stops working" -- those never reach this function at all.
+TRANSCRIPT_GATE_ENFORCED = False
+
+# faster-whisper's own defaults for when its internal temperature-
+# fallback loop considers a decode to have failed (compression_ratio_
+# threshold / log_prob_threshold / no_speech_threshold) -- reused here
+# rather than invented, since a segment that already reads as a failure
+# to the transcriber itself is not evidence worth dispatching an action
+# on.
+_REJECT_NO_SPEECH_PROB = 0.6
+_REJECT_AVG_LOGPROB = -1.0
+_REJECT_COMPRESSION_RATIO = 2.4
+
+# Deliberately NOT a minimum-word-count rule anywhere in this gate --
+# "mute", "louder", "play", "pause", "lock" are all legitimate one-word
+# seeded fast-path commands (intent_matcher.INTENTS); a word-count floor
+# would make Jarvis selectively deaf to exactly its shortest, most
+# common commands. Checked as an exact match on the whole normalized
+# transcript, never a substring -- substring matching would eat "thank
+# you, now open chrome" (confirmed as a real failure mode to avoid, not
+# a hypothetical one).
+_HALLUCINATION_DENYLIST = {
+    "you",
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "thank you for watching",
+    "bye",
+    "okay",
+    "ok",
+    "yeah",
+    "uh",
+    "um",
+    "hmm",
+    "so",
+    "and",
+    "the",
+    "music",
+    "subscribe",
+}
+
+
+def _normalize_transcript(text: str) -> str:
+    """Module-level, matching _is_dictation_stop_phrase's normalization convention."""
+    return " ".join(text.lower().strip(" .,!?").split())
+
+
+def _should_reject_transcript(text: str, quality: dict) -> "str | None":
+    """
+    Module-level (not nested in main()) so this is testable without
+    starting the app -- see test_main.py's docstring for why that
+    matters here specifically: it's the one piece of gating logic that
+    must be independently verifiable, not just plumbing.
+
+    Returns a short machine-readable reason to reject, or None to
+    proceed to the LLM fallback as normal. `quality` is the dict
+    _transcribe returns alongside the text (no_speech_prob, avg_logprob,
+    compression_ratio -- see its definition).
+    """
+    normalized = _normalize_transcript(text)
+    if not normalized:
+        return "empty"
+
+    if quality.get("no_speech_prob", 0.0) >= _REJECT_NO_SPEECH_PROB:
+        return "no_speech_prob"
+    if quality.get("avg_logprob", 0.0) <= _REJECT_AVG_LOGPROB:
+        return "avg_logprob"
+    if quality.get("compression_ratio", 0.0) >= _REJECT_COMPRESSION_RATIO:
+        return "compression_ratio"
+
+    if normalized in _HALLUCINATION_DENYLIST:
+        return "denylist"
+    if normalized in ("hey jarvis", "jarvis"):
+        return "wake_echo"
+
+    return None
+
+
+# --- interrogative-question guard ---------------------------------------
+#
+# The embedding matcher's seeds are all imperative commands ("open
+# chrome", "minimize discord", "lock my computer") -- an utterance that
+# instead ASKS about the same state sits close enough to the imperative
+# seed in embedding space to false-positive against it with high
+# confidence and get dispatched as if it were the command. Confirmed
+# directly against the real matcher, every one a real action with a real
+# side effect:
+#   "is my computer locked"                              -> lock_workstation        0.870
+#   "is chrome open"                                      -> focus_or_launch_app:chrome 0.931
+#   "is discord minimized"                                -> minimize_app:discord    0.932
+#   "how many chrome windows do i have open right now"    -> focus_or_launch_app:chrome 0.803
+# That last one is a genuinely answerable query --
+# count_app_windows exists specifically for it -- so the fast-path
+# collision was silently stealing a real question from the LLM, which
+# resolves it correctly given the chance.
+#
+# _QUERY_SHAPED_ACTIONS is the exclusion list: actions whose entire
+# purpose IS to answer a question. Declining those would break the
+# feature they exist for. "none"/"no_match"/"start_dictation" are also
+# excluded -- they carry no side effect to guard against.
+_QUERY_SHAPED_ACTIONS = frozenset(
+    {
+        "describe_screen",
+        "now_playing",
+        "count_app_windows",
+        "count_files_in_folder",
+        "none",
+        "no_match",
+        "start_dictation",
+    }
+)
+
+# Deliberately does NOT include "can"/"could"/"would"/"will" -- those are
+# the codebase's own seeded polite-request phrasing ("can you open
+# chrome for me", "can you minimize discord for me") and must keep
+# dispatching normally; they are commands, not questions, despite the
+# grammatical resemblance. Confirmed directly: including them would
+# have broken two of the matcher's own highest-confidence real seeds.
+_INTERROGATIVE_OPENERS = {
+    "is",
+    "are",
+    "am",
+    "was",
+    "were",
+    "does",
+    "did",
+    "do",
+    "what",
+    "what's",
+    "whats",
+    "which",
+    "who",
+    "who's",
+    "whos",
+    "where",
+    "when",
+    "why",
+    "how",
+}
+
+
+def _looks_interrogative(text: str) -> bool:
+    """
+    Module-level (not nested in main()) so this is testable without
+    starting the app. Deliberately checks only the transcript's first
+    word -- a cheap, high-precision signal (see _INTERROGATIVE_OPENERS'
+    comment for what it was tuned against), not a general question
+    detector.
+    """
+    words = _normalize_transcript(text).split()
+    return bool(words) and words[0] in _INTERROGATIVE_OPENERS
+
+
+def _is_dangerous_interrogative_match(action: str, text: str) -> bool:
+    """Shared by both the fast-path override and the final pre-dispatch check below."""
+    return action not in _QUERY_SHAPED_ACTIONS and _looks_interrogative(text)
+
+
+# --- "move" vs switch_desktop guard --------------------------------------
+#
+# A second, unrelated false-positive class: "move this (window) to the
+# next desktop" resolves to switch_desktop:next at 0.940 confidence --
+# the matcher has no seed for moving a window across desktops (that
+# action doesn't exist yet; when it does, this guard still matters,
+# since "move" phrasing should never silently become "switch which
+# desktop I'm viewing" instead of moving the window). Ships and applies
+# regardless of whether a move-to-desktop action exists: right now, the
+# wrong behaviour is switching your desktop and leaving the window
+# behind, with no error at all -- worth declining honestly instead.
+def _looks_like_a_move_request(text: str) -> bool:
+    return "move" in _normalize_transcript(text).split()
+
+
+# --- deictic gate for LLM screen context ---------------------------------
+#
+# actions.llm_screen_context() costs real prefill tokens on every LLM
+# fallback call it's included in (measured directly: +0.51s median,
+# +0.49s min-to-min, for a ~25-token context line, at the ~50 tok/s
+# prefill this project's hardware sees -- see README's decision log).
+# Most commands never need it: "open chrome" doesn't care what's
+# currently focused. Gated on whether the utterance actually references
+# what's on screen at all ("minimize this", "what's this page about",
+# "move that to the other screen") -- validated against real commands:
+# every genuine deictic phrasing fires, and every ordinary app/desktop/
+# media command that actually reaches the LLM does not. A few phrasings
+# fire spuriously ("what time is it", "skip this track") but all of
+# those are seeded FAST-PATH commands that never reach the LLM at all,
+# so the gate firing on them costs nothing.
+_DEICTIC_WORDS = {"this", "that", "it", "here", "current", "focused", "screen", "window", "looking"}
+
+
+def _looks_deictic(text: str) -> bool:
+    return bool(set(_normalize_transcript(text).split()) & _DEICTIC_WORDS)
+
+
 # Human-readable labels for _record_stat's categories, in a fixed
 # display order -- a category with no entries yet just doesn't print,
 # rather than every category always showing a "0".
@@ -136,6 +362,7 @@ _STAT_CATEGORY_LABELS = [
     ("meta", "meta (pause/resume/dictation control)"),
     ("declined", "declined (e.g. desktop number)"),
     ("no_match", "no match at all"),
+    ("rejected", "rejected as noise/misheard"),
     ("off_duty", "heard while off duty"),
     ("empty", "heard nothing intelligible"),
 ]
@@ -282,7 +509,13 @@ def main():
     def _load_whisper():
         nonlocal whisper_model
         whisper_source = str(WHISPER_LOCAL_DIR) if WHISPER_LOCAL_DIR.is_dir() else WHISPER_MODEL_SIZE
-        whisper_model = WhisperModel(whisper_source, device="cpu", compute_type="int8")
+        # cpu_threads explicit (maps to CTranslate2's intra_threads) --
+        # left at the library default (0, meaning "let CTranslate2
+        # choose") this machine's logical-core count could oversubscribe
+        # its physical cores, which matters more now that the LLM
+        # prewarm (llm_intent.prewarm, see below) may be running
+        # concurrently on the same 4 physical cores.
+        whisper_model = WhisperModel(whisper_source, device="cpu", compute_type="int8", cpu_threads=4)
         list(whisper_model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")[0])
 
     def _load_matcher():
@@ -293,6 +526,63 @@ def main():
         _load_whisper()
         _load_matcher()
 
+    # llama.cpp mmaps the GGUF's weights by default (use_mmap=True) --
+    # they're file-backed, evictable pages, not committed RAM, so holding
+    # the LLM resident is mostly free. The real cost unloading it was
+    # "saving" is the ~13-27s one-time prompt-prefill cost measured on
+    # this project's hardware (see llm_intent.py/README's decision log),
+    # which unconditional unloading was forcing the very next command
+    # after every deep-sleep or pause/resume cycle to pay again -- deep
+    # sleep fires after 30 idle minutes, which is exactly the state
+    # you're in right before the *next* thing you say. Kept False by
+    # default; flip to True to go back to unloading the LLM alongside
+    # Whisper/the matcher if RAM pressure on a given machine makes that
+    # the better trade -- Whisper (~500MB) and the matcher are unloaded
+    # either way, unaffected by this flag. Shutdown always unloads the
+    # LLM regardless (see _shutdown() below) -- the mmap'd pages don't
+    # need to survive the process exiting.
+    UNLOAD_LLM_ON_DEEP_SLEEP = False
+
+    def _start_llm_prewarm(reason: str, delay: float = 0.0) -> None:
+        """
+        Fires llm_intent.prewarm() on a background daemon thread. Not
+        loading the model -- constructing the Llama object is only
+        ~1.5s -- but *using* it once so the KV cache holds the system
+        prompt's prefix, which is where the measured ~13-27s cold cost
+        actually is (see llm_intent.prewarm's docstring). No-ops
+        immediately (no thread started, nothing logged) if a prewarm is
+        already running or already warm, so this is safe to call
+        speculatively and often (e.g. from _ensure_heavy_models_loaded,
+        which runs on every utterance as a defense-in-depth check).
+
+        Never awaited: if a real command needs the LLM before this
+        finishes, llm_intent.infer() simply blocks on the same internal
+        lock prewarm holds (llm_intent._lock) and gets the benefit of
+        whatever prefill already happened by then -- worst case is
+        today's cold cost, not worse.
+        """
+        if llm_intent.prewarm_state() in ("warming", "warm"):
+            return
+
+        def _run():
+            if delay:
+                time.sleep(delay)
+            try:
+                llm_intent.prewarm()
+            except Exception:
+                # Must never propagate -- this runs on a daemon thread
+                # with nothing to catch it, and a stuck "warming" state
+                # would otherwise silently disable every future prewarm
+                # attempt this process's life (see the early-return
+                # above). llm_intent.prewarm() already guards its own
+                # body and sets prewarm_state to "failed" on error, so
+                # reaching this except is itself unexpected -- logged as
+                # such rather than assumed impossible.
+                _log_event("llm_prewarm_error", reason=reason, traceback=traceback.format_exc())
+
+        threading.Thread(target=_run, name=f"llm-prewarm-{reason}", daemon=True).start()
+        _log_event("llm_prewarm_started", reason=reason)
+
     def _unload_heavy_models():
         nonlocal whisper_model, matcher
         if whisper_model is None:
@@ -300,10 +590,12 @@ def main():
         whisper_model = None
         matcher = None
         # llm_intent lazy-loads itself independently (only on first actual
-        # fallback use, not at startup -- most sessions may never need it),
-        # but once loaded it should still be swept up by deep sleep/pause.
-        llm_intent.unload()
-        hud.line("Dropping the heavy models to save memory.", "system")
+        # fallback use, not at startup -- most sessions may never need
+        # it) -- see UNLOAD_LLM_ON_DEEP_SLEEP above for why it's no
+        # longer swept up here by default the way Whisper/the matcher are.
+        if UNLOAD_LLM_ON_DEEP_SLEEP:
+            llm_intent.unload()
+        hud.line("Dropping the transcription models to save memory.", "system")
         _log_event("models_unloaded")
 
     def _ensure_heavy_models_loaded():
@@ -320,6 +612,12 @@ def main():
             hud.resolve("back at full power", "system")
             hud.end_flash()
             _log_event("wake_up")
+            # Safety net, not the primary path -- with UNLOAD_LLM_ON_DEEP_SLEEP
+            # False (the default) the LLM was never actually dropped, so
+            # prewarm_state() is almost always already "warm" here and
+            # this no-ops instantly. Matters if that flag is ever flipped
+            # back to True, or the LLM was unloaded for some other reason.
+            _start_llm_prewarm("wake")
 
     hud.banner()
     with hud.boot_step("acoustic frontend", f"silero vad \u00b7 {SAMPLE_RATE}Hz \u00b7 {int(FRAME_SECONDS * 1000)}ms frames"):
@@ -573,6 +871,7 @@ def main():
                 stream = _create_stream()
             hud.set_state(hud.ARMED)
             speak(phrases.pick("resume"))
+            _start_llm_prewarm("resume")  # safety net -- see _ensure_heavy_models_loaded's identical call
         else:
             hud.set_state(hud.OFFLINE)
             if stream is not None:
@@ -614,38 +913,83 @@ def main():
     # apps, desktop navigation, window actions, query phrasing, and the
     # user's actual repo names (for VS Code repo-switching in Phase 5).
     TRANSCRIBE_HOTWORDS = (
-        "Chrome Discord Visual Studio Code VS Code File Explorer Settings "
+        "Chrome Discord Visual Studio Code VS Code File Explorer Settings Spotify "
         "local disk D desktop virtual desktop next desktop previous desktop "
-        "minimize focus switch open close "
+        "minimize focus switch open close laptop monitor screen "
         "how many files folder windows "
         "bdk wallet bdk cli Hashstack djed shu programming bitcoin bitshala"
     )
 
     # Segment-level confidence, gated on separately from the transcript
-    # text itself -- used only to decide whether an LLM-fallback
-    # resolution is trustworthy enough to log as a seed-promotion
-    # candidate (seed_promotion.py), never to change what gets dispatched.
+    # text itself. Originally used *only* to decide whether an
+    # LLM-fallback resolution was trustworthy enough to log as a
+    # seed-promotion candidate (seed_promotion.py) -- that comment used
+    # to say "never to change what gets dispatched", but that stance is
+    # reversed as of the pre-LLM transcript gate above
+    # (_should_reject_transcript/TRANSCRIPT_GATE_ENFORCED), which reuses
+    # this same signal (via the quality dict _transcribe returns) to
+    # decide whether to attempt the LLM fallback at all. Two consumers,
+    # two separate thresholds now: seed-promotion's LOW_CONFIDENCE_*
+    # below (unchanged) and the gate's _REJECT_* constants above (a
+    # stricter bar -- a transcript can be too shaky to promote into a
+    # permanent seed while still being clear enough to act on once).
     # Whisper can hallucinate literal fragments of TRANSCRIBE_HOTWORDS
     # from near-silence (see that constant's comment) -- confirmed
-    # directly in llm_usage_log.jsonl: two near-duplicate hallucinated
-    # entries were one utterance away from being promoted into a
-    # permanent bad fast-path seed before this existed.
+    # directly in llm_usage_log.jsonl: nine consecutive entries were all
+    # hallucinations, each burning a full LLM call, and two near-
+    # duplicates were one utterance away from being promoted into a
+    # permanent bad fast-path seed before the seed-promotion guard
+    # existed. That evidence is what motivated reversing the "never
+    # change what gets dispatched" stance above.
     LOW_CONFIDENCE_NO_SPEECH_PROB = 0.6
     LOW_CONFIDENCE_AVG_LOGPROB = -1.0
 
-    def _transcribe(audio: np.ndarray) -> "tuple[str, bool]":
+    # Peak-normalization gain cap -- see _transcribe's comment. Real
+    # speech at a sane mic level rarely needs more than 3-4x; a cap of
+    # 8x keeps the original benefit (boosting a quieter-but-fully-
+    # captured utterance) while no longer amplifying pure room noise
+    # (peak ~0.01, i.e. ~100x) up to full scale.
+    _MAX_NORMALIZE_GAIN = 8.0
+
+    def _transcribe(audio: np.ndarray) -> "tuple[str, bool, dict]":
         # Peak-normalize before transcribing -- helps quieter (but fully
         # captured) utterances regardless of how the mic/VAD are tuned.
+        # Gain is capped (see _MAX_NORMALIZE_GAIN above), not the
+        # uncapped 1/peak this used to be: an uncapped gain amplifies
+        # *any* buffer to full scale, including several seconds of
+        # ambient room noise with a peak near zero -- which is exactly
+        # the kind of input that used to trip Whisper's internal
+        # temperature-fallback loop (see the `temperature=0.0` note
+        # below). Measured directly: uncapped, 3s of white noise
+        # transcribed as "how many files folder windows bdk wallet bdk"
+        # and took 42+ seconds.
         peak = np.max(np.abs(audio))
         if peak > 1e-4:
-            audio = audio / peak
+            gain = min(1.0 / peak, _MAX_NORMALIZE_GAIN)
+            audio = audio * gain
         segments, _ = whisper_model.transcribe(
             audio,
             language="en",
             beam_size=5,
+            # Single greedy pass, not faster-whisper's default 6-entry
+            # temperature ladder (0.0/0.2/0.4/0.6/0.8/1.0). That ladder
+            # exists to recover from degenerate long-form decodes by
+            # re-running the *entire* beam_size=5 search at each
+            # temperature whenever compression_ratio/log_prob/no_speech
+            # thresholds trip -- on noisy short command audio this is
+            # almost pure cost: condition_on_previous_text=False (below)
+            # already removes the main driver of those degenerate
+            # decodes. Measured directly: the same 3s white-noise clip
+            # that took 42+ seconds under the old default ladder took
+            # ~2.5s here, with clean speech unaffected either way (it
+            # never enters the fallback loop in the first place).
+            temperature=0.0,
             condition_on_previous_text=False,
             vad_filter=False,
             hotwords=TRANSCRIBE_HOTWORDS,
+            # Nothing downstream reads segment start/end times -- timestamp
+            # tokens were pure decode overhead for this project's use.
+            without_timestamps=True,
         )
         segments = list(segments)
         text = " ".join(seg.text.strip() for seg in segments).strip()
@@ -653,9 +997,23 @@ def main():
             seg.no_speech_prob < LOW_CONFIDENCE_NO_SPEECH_PROB and seg.avg_logprob > LOW_CONFIDENCE_AVG_LOGPROB
             for seg in segments
         )
-        return text, confident
+        # Worst-case (most failure-like) value across segments in each
+        # case -- one bad segment in a multi-segment utterance is enough
+        # to make the whole transcript suspect. Consumed by
+        # _should_reject_transcript (the pre-LLM gate) and logged
+        # unconditionally below so real thresholds can be tuned from
+        # actual usage rather than guessed.
+        quality = {
+            "no_speech_prob": max((seg.no_speech_prob for seg in segments), default=1.0),
+            "avg_logprob": min((seg.avg_logprob for seg in segments), default=-999.0),
+            "compression_ratio": max((seg.compression_ratio for seg in segments), default=0.0),
+            "max_temperature": max((seg.temperature for seg in segments), default=0.0),
+            "n_segments": len(segments),
+            "peak": float(peak),
+        }
+        return text, confident, quality
 
-    def _handle_transcript(text: str, confident: bool, via_session: bool) -> bool:
+    def _handle_transcript(text: str, confident: bool, quality: dict, via_session: bool) -> bool:
         """
         Thin wrapper whose only job is to guarantee the open-ended
         "thinking" colour is released no matter which of the dozen-odd
@@ -664,11 +1022,11 @@ def main():
         never clears.
         """
         try:
-            return _handle_transcript_inner(text, confident, via_session)
+            return _handle_transcript_inner(text, confident, quality, via_session)
         finally:
             hud.end_flash()
 
-    def _handle_transcript_inner(text: str, confident: bool, via_session: bool) -> bool:
+    def _handle_transcript_inner(text: str, confident: bool, quality: dict, via_session: bool) -> bool:
         """Returns True if this call should close an open session."""
         state["last_activity"] = time.time()
 
@@ -676,6 +1034,14 @@ def main():
             hud.line("Nothing intelligible there.", "dim")
             _record_stat("empty", text)
             return False
+
+        # Logged on *every* non-empty utterance, not just rejected ones --
+        # this is the dataset TRANSCRIPT_GATE_ENFORCED's threshold gets
+        # tuned from (see that constant's comment): reading back which
+        # no_speech_prob/avg_logprob values corresponded to a real
+        # fast_path/llm_action outcome versus obvious noise, from actual
+        # usage rather than a guess.
+        _log_event("transcript", text=text, confident=confident, **quality)
 
         # Immediate, unconditional echo the moment transcription is
         # done -- printed before any matching/dispatch happens, so
@@ -711,9 +1077,9 @@ def main():
             _record_stat("dictated", text)
             return False
 
-        _t0 = time.time()
+        _t0 = time.perf_counter()
         result = matcher.match(text)
-        _record_timing("match", time.time() - _t0)
+        _record_timing("match", time.perf_counter() - _t0)
 
         # "disable_listening" is context-dependent: mid-session it just
         # closes the session (wake word opens a new one later); said via
@@ -746,6 +1112,7 @@ def main():
 
         via_llm = False
         llm_seconds = 0.0
+        llm_cold = False
         # "start_dictation" is converted here rather than left to
         # parse_fast_path_intent (actions.py) -- it's a meta intent with
         # nothing in ACTIONS to dispatch it to, same category as
@@ -761,28 +1128,89 @@ def main():
         else:
             parsed = parse_fast_path_intent(result.intent) if result.intent else None
 
-        if parsed is None and result.intent is None:
+        # Interrogative guard, fast-path half -- discard a fast-path
+        # match that looks like a question rather than a command,
+        # so the utterance gets a real shot at the LLM fallback (which
+        # has full context and a real grammar, not a bare cosine
+        # score, and can often resolve it correctly -- see
+        # _INTERROGATIVE_OPENERS' comment for the "how many chrome
+        # windows" example) instead of silently dispatching the wrong
+        # side-effecting action. Tracked separately from result.intent
+        # so the later "matched X but nothing is wired up for it"
+        # message (meant for a real plumbing gap) doesn't fire here by
+        # mistake -- this is a deliberate override, not a missing action.
+        _interrogative_override = parsed is not None and _is_dangerous_interrogative_match(parsed["action"], text)
+        if _interrogative_override:
+            parsed = None
+
+        if parsed is None and (result.intent is None or _interrogative_override):
+            # Pre-LLM garbage gate -- see TRANSCRIPT_GATE_ENFORCED's
+            # comment for the full rationale and why it only applies to
+            # this branch. Logged either way (as "transcript_rejected"
+            # once actually enforced, "transcript_would_reject" while
+            # only observing) so the threshold can be validated against
+            # real usage before it's allowed to change behaviour.
+            reject_reason = _should_reject_transcript(text, quality)
+            if reject_reason is not None:
+                _log_event(
+                    "transcript_rejected" if TRANSCRIPT_GATE_ENFORCED else "transcript_would_reject",
+                    text=text,
+                    reason=reject_reason,
+                    enforced=TRANSCRIPT_GATE_ENFORCED,
+                    **quality,
+                )
+                if TRANSCRIPT_GATE_ENFORCED:
+                    hud.resolve("didn't catch that " + DOT + " ignored", "dim")
+                    hud.note(
+                        f"rejected: {reject_reason} {DOT} no_speech={quality['no_speech_prob']:.2f} "
+                        f"logprob={quality['avg_logprob']:.2f} cr={quality['compression_ratio']:.2f}"
+                    )
+                    if not via_session:
+                        earcons.play("decline")
+                    _record_stat("rejected", text, reject_reason)
+                    return False
+
             # Fast embedding match couldn't confidently place this --
             # fall back to the local LLM before giving up. Only reached
-            # for phrasing the seed list doesn't cover, so this is the
-            # occasional ~2.5-3s-to-30s path (see llm_intent.py's system
-            # prompt for why it's not always at the low end), not the
-            # common case. Spoken cue fired *before* the (possibly long)
-            # call, not after -- confirmed directly this was needed:
-            # with nothing said or printed between "Heard: ..." above
-            # and the eventual reply, a slow fallback read as Jarvis
-            # having stopped responding rather than still thinking.
-            # state["last_app"] (one turn of pronoun memory) lets
-            # "minimize it" resolve without naming the app again -- see
-            # llm_intent.infer's context_app.
+            # for phrasing the seed list doesn't cover. llm_intent.prewarm
+            # (kicked off in the background at boot/wake/resume -- see
+            # _start_llm_prewarm) means this is usually already warm by
+            # the time real use gets here; llm_cold below records whether
+            # this particular call actually paid the cold prefill cost,
+            # for the "resolved" log below. Spoken cue fired *before* the
+            # (possibly long) call, not after -- confirmed directly this
+            # was needed: with nothing said or printed between "Heard:
+            # ..." above and the eventual reply, a slow fallback read as
+            # Jarvis having stopped responding rather than still
+            # thinking. state["last_app"] (one turn of pronoun memory)
+            # lets "minimize it" resolve without naming the app again --
+            # see llm_intent.infer's context_app. screen_context (see
+            # _looks_deictic's comment for the cost/benefit) additionally
+            # lets "minimize this"/"what's this page about" work without
+            # state["last_app"] having been set at all.
             hud.begin_flash(hud.THINKING)
             hud.pending("consulting local model", spinner=True)
             speak(phrases.pick("thinking"))
-            _t0 = time.time()
-            parsed = llm_intent.infer(text, context_app=state["last_app"])
-            llm_seconds = time.time() - _t0
+            llm_cold = llm_intent.call_count() == 0
+            screen_context = llm_screen_context() if _looks_deictic(text) else None
+            _t0 = time.perf_counter()
+            parsed = llm_intent.infer(text, context_app=state["last_app"], screen_context=screen_context)
+            llm_seconds = time.perf_counter() - _t0
             _record_timing("llm", llm_seconds)
             via_llm = True
+
+            if parsed is not None and parsed["action"] == "no_match":
+                # The LLM's own abstain (llm_intent.py's "no_match" rule)
+                # -- it decided this doesn't read like a real command
+                # rather than being forced to guess one. Treated the same
+                # as the pre-LLM gate's rejection above: no speech (an
+                # abstain must never sound like a reply), a quiet HUD
+                # note, never logged as a seed-promotion candidate.
+                hud.resolve(f"didn't catch that {DOT} local llm declined  {llm_seconds:.1f}s", "dim")
+                if not via_session:
+                    earcons.play("decline")
+                _record_stat("rejected", text, "llm_abstain")
+                return False
 
         if parsed is not None and parsed["action"] == "start_dictation":
             if not via_session:
@@ -813,6 +1241,35 @@ def main():
             earcons.play("decline")
             speak(phrases.pick("desktop_number_declined"))
             _record_stat("declined", text, "desktop_number")
+            return False
+
+        # "Move this (window) to the next desktop" resolves to
+        # switch_desktop:next at high confidence (0.94 -- confirmed
+        # directly) -- there's no action yet that moves a window across
+        # desktops, so without this, saying "move" switches which
+        # desktop *you're* viewing and silently leaves the window right
+        # where it was. Checked against the resolved action, same as
+        # the number guard above, so it catches the LLM path too.
+        if parsed is not None and parsed["action"] == "switch_desktop" and _looks_like_a_move_request(text):
+            hud.resolve("declined " + DOT + " move not supported", "warn")
+            earcons.play("decline")
+            speak(phrases.pick("move_window_declined"))
+            _record_stat("declined", text, "move_not_supported")
+            return False
+
+        # Interrogative guard, final half -- catches whatever the LLM
+        # fallback itself resolved to (via_llm's own grammar/rules
+        # usually get this right, but "never trust a single layer" is
+        # the project's own standing principle, and this is a cheap
+        # symmetric check) and the case where the fast-path override
+        # above fired but result.intent was already None (so the "was
+        # this dangerous" question still needs asking once more against
+        # whatever the LLM produced).
+        if parsed is not None and _is_dangerous_interrogative_match(parsed["action"], text):
+            hud.resolve("declined " + DOT + " sounded like a question", "warn")
+            earcons.play("decline")
+            speak(phrases.pick("declined_question"))
+            _record_stat("declined", text, "interrogative")
             return False
 
         if parsed is not None and parsed["action"] == "none":
@@ -866,6 +1323,7 @@ def main():
             parsed=parsed,
             score=None if via_llm else round(result.score, 3),
             llm_seconds=round(llm_seconds, 2) if via_llm else None,
+            llm_cold=llm_cold if via_llm else None,
         )
 
         # Remembered *before* dispatch, not after -- so it reflects what was
@@ -882,9 +1340,9 @@ def main():
             state["last_app"] = "vscode"
 
         earcons.play("understood")
-        _t0 = time.time()
-        message = dispatch_llm_action(parsed)
-        _record_timing("action", time.time() - _t0)
+        _t0 = time.perf_counter()
+        message = dispatch_llm_action(parsed, text)
+        _record_timing("action", time.perf_counter() - _t0)
         hud.reply(message)
         speak(message)
         _record_stat("llm_action" if via_llm else "fast_path", text, parsed["action"])
@@ -957,8 +1415,10 @@ def main():
             try:
                 with _processing_lock:
                     _ensure_heavy_models_loaded()
-                    text, confident = _transcribe(audio)
-                    _handle_transcript(text, confident, via_session=False)
+                    _t0 = time.perf_counter()
+                    text, confident, quality = _transcribe(audio)
+                    _record_timing("transcribe", time.perf_counter() - _t0)
+                    _handle_transcript(text, confident, quality, via_session=False)
             except Exception:
                 # Traceback goes to the structured log and to the HUD
                 # only in debug mode -- a raw stack trace dumped into the
@@ -1145,9 +1605,11 @@ def main():
                         # its definition above for why.
                         with _processing_lock:
                             _ensure_heavy_models_loaded()  # defense in depth -- see _set_enabled's mode reset for the actual fix
-                            text, confident = _transcribe(audio)
+                            _t0 = time.perf_counter()
+                            text, confident, quality = _transcribe(audio)
+                            _record_timing("transcribe", time.perf_counter() - _t0)
                             vad.reset()
-                            should_close = _handle_transcript(text, confident, via_session=True)
+                            should_close = _handle_transcript(text, confident, quality, via_session=True)
                         state["mode"] = "wake" if should_close else "session_listening"
                         hud.set_state(hud.ARMED if should_close else hud.SESSION)
                         session_silence_run = 0
@@ -1179,6 +1641,18 @@ def main():
 
     listener_thread = threading.Thread(target=listener_loop, daemon=True)
     listener_thread.start()
+
+    # Delayed slightly so the LLM's native-backend import and the
+    # subsequent ~13-27s prefill (see llm_intent.prewarm) don't compete
+    # for this machine's 4 physical cores against the wake-word/VAD
+    # frames the listener thread just started processing, or against
+    # Piper still synthesizing the boot announcement above. This does
+    # NOT reintroduce the eager-llama_cpp-import cost that was
+    # deliberately moved out of startup (see llm_intent._get_llm's
+    # comment) -- the import still only happens here, on a background
+    # daemon thread, well after the process is already fully armed and
+    # listening; time-to-armed is unaffected.
+    _start_llm_prewarm("boot", delay=2.0)
 
     def _shutdown():
         state["stop"] = True
@@ -1241,6 +1715,9 @@ def main():
                         reply = "Wake-word armed (deep sleep)"
                     else:
                         reply = "Wake-word armed (awake)"
+                    # Purely observational -- see llm_intent.prewarm_state's
+                    # docstring; the LLM fallback works regardless of this.
+                    reply += f" {DOT} LLM {llm_intent.prewarm_state()}"
                 elif command == "stats":
                     reply = _format_stats(state["stats"])
                 elif command == "pause":

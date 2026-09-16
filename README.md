@@ -60,11 +60,11 @@ main.py              orchestrator: audio streams, wake word, VAD, session
                       state machine, control server, single-instance guard
 actions.py           the execution layer -- every allowlisted action as a
                       plain Python function; the only thing ever dispatched to
-apps_registry.py     the registered-apps table -- 7 hand-curated entries
+apps_registry.py     the registered-apps table -- 8 hand-curated entries
                       (chrome/discord/vscode/file_explorer/settings/
-                      local_disk_d/terminal) plus whatever app_discovery.py
-                      finds; the actual security boundary for "open/
-                      minimize apps in general"
+                      local_disk_d/terminal/spotify) plus whatever
+                      app_discovery.py finds; the actual security boundary
+                      for "open/minimize apps in general"
 app_discovery.py     scans the Start Menu at startup to expand apps_registry's
                       table automatically -- never overrides a curated entry
 intent_matcher.py    fast path: local sentence-embedding similarity match
@@ -72,6 +72,16 @@ local_embedder.py    ONNX inference for bge-small-en-v1.5 (bypasses fastembed's
                       HF auto-download entirely)
 llm_intent.py         fallback path: local Qwen2.5-1.5B-Instruct via
                       llama-cpp-python, grammar-constrained JSON output
+monitors.py           physical-display identification -- laptop vs external
+                      monitor, via QueryDisplayConfig (not the primary-monitor
+                      flag, which is backwards for this) -- and the spoken-
+                      mention resolver ("my laptop screen", "the other screen")
+window_context.py    window ranking for "which one did you mean" when several
+                      windows of the same app are open -- title-hint matching,
+                      monitor bias, recency, and a cycle-on-repeat tracker
+app_titles.py         turns a raw window title into something worth saying
+                      out loud, per app (VS Code/Chrome/Spotify/Discord) --
+                      pure string functions, no win32
 seed_promotion.py    logs LLM-resolved phrases; promotes frequent ones into
                       the fast path on request (manual, not automatic -- see
                       "Known limitations" below)
@@ -95,6 +105,10 @@ launch.ps1           the actual `main.py` launch command (see "Terminal
 _bench_llm.py        standalone latency/accuracy benchmark for llm_intent.py
                       -- not part of the live pipeline, run by hand after
                       changing the model/prompt/schema
+_spike_desktop_move.py  one-off verification that MoveWindowToDesktop
+                      works on a window this process doesn't own -- kept
+                      as the record of why move-to-desktop was dropped
+                      (E_ACCESSDENIED, see "Screen and window context")
 requirements.txt      pinned dependencies (excl. llama-cpp-python, see Setup)
 models/               model weights (gitignored -- see "Fetching the models")
 tests/               pytest suite -- no audio device, no models,
@@ -280,8 +294,8 @@ degrades gracefully instead of silently going deaf.
 
 Built a pystray-based tray icon first (enable/disable toggle + quit), but
 removed it entirely in favor of a local control socket
-(`127.0.0.1:47123`); `jarvisctl.py status|pause|resume|quit` is a
-one-shot client. `jarvis.cmd` forwards those straight through and handles
+(`127.0.0.1:47123`); `jarvisctl.py status|stats|debug|pause|resume|quit`
+is a one-shot client. `jarvis.cmd` forwards those straight through and handles
 `start` itself (`wt.exe -F -p Jarvis` -- `jarvisctl.py` can only talk to
 an already-running instance, it can't launch a fresh one). `pause`/
 `resume` close/reopen the main listening stream (`stream.stop()`/
@@ -302,6 +316,23 @@ detection and the mic keep running regardless, so "hey jarvis" still
 works and reloads them on demand (a couple seconds' delay on that first
 command back). A RAM optimization, not a privacy one -- nothing about
 what's listened to or when changes.
+
+**Update, reversed for the LLM specifically:** this used to sweep up
+`llm_intent`'s loaded model too (`llm_intent.unload()`, called from the
+same `_unload_heavy_models`), on the theory that anything loaded should
+be swept up uniformly. Measurement showed that's the wrong trade for the
+LLM: `llama-cpp-python` mmaps the GGUF's weights by default
+(`use_mmap=True`), so they're file-backed, evictable pages, not
+committed RAM -- holding it resident is nearly free. What unloading it
+was actually "saving" was forcing the *next* command after every deep
+sleep or pause/resume cycle to re-pay the ~13-27s cold prompt-prefill
+cost documented below, at exactly the moment (right after 30 idle
+minutes, or right after resuming) it's most likely to land on a real
+command. `main.py`'s `UNLOAD_LLM_ON_DEEP_SLEEP` (default `False`) now
+keeps the LLM loaded through deep sleep and pause/resume -- Whisper and
+the matcher are unaffected, unloaded either way -- with a background
+prewarm (see below) re-arming it after boot/wake/resume as a safety net
+regardless. Shutdown still always unloads it.
 
 ### Transcription accuracy
 
@@ -367,10 +398,11 @@ regardless, including a check that an action's *required* parameter isn't
 "didn't understand," not dispatched with a guaranteed-to-fail parameter)
 -- never trust a single layer, especially not an LLM's, even a
 grammar-constrained one. Benchmarked standalone first (`_bench_llm.py`,
-16/17 correct on a realistic paraphrase set) before wiring in; accepted
-~2.5-2.8s steady-state latency per call as the cost of the occasional
-fallback, in exchange for the common case staying near-instant on the
-fast path. Both the model weights *and the `llama_cpp` import itself* are
+16/17 correct on a realistic paraphrase set) before wiring in. **The
+"~2.5-2.8s steady-state" figure once recorded here was wrong** -- see
+the latency subsection below for the corrected numbers and why the old
+benchmark never actually measured a cold call. Both the model weights
+*and the `llama_cpp` import itself* are
 lazy -- importing `llm_intent` at `main.py`'s startup used to eagerly
 load `llama_cpp`'s native backend regardless of whether a session ever
 needed the fallback, adding several seconds to every single startup;
@@ -427,6 +459,127 @@ exists** -- deferred until an action with real side effects
 non-destructive by construction ("close" means minimize, never actually
 closing/quitting anything, per explicit user instruction).
 
+### Latency: what the ">30s" actually was, and what changed
+
+User-reported "the LLM fallback sometimes takes 30+ seconds" turned out
+to be two mostly-independent problems, both hidden by a benchmark that
+had been measuring the wrong thing.
+
+**It was never model *loading*.** `Llama(model_path=...)` construction
+measured 1.5-1.8s. The 30+ seconds is prompt **prefill** -- ingesting the
+system prompt's own tokens before the model can generate anything --
+measured at ~48-55 tok/s on this project's reference hardware (an
+11th-gen 4-core/8-thread laptop CPU, AVX2/FMA/F16C/OpenMP all present in
+the build). At the original prompt's 1292 tokens that's ~26-32s, paid by
+whichever call is first to actually run one: the first call after
+process start, and -- before the change below -- the first call after
+every deep-sleep unload or pause/resume cycle too. Subsequent calls in
+the same process reuse `llama-cpp-python`'s implicit KV-prefix cache and
+dropped to ~4-5s. `_bench_llm.py` used to call a warmup completion
+*before* timing anything, so every number it ever reported was a
+warm-cache hit -- that's the origin of the "~2.5-2.8s steady-state"
+figure that stood in this file (and in `llm_intent.py`'s own docstring)
+until this section replaced it; it never measured what production
+actually paid on a cold call. `_bench_llm.py` now times the cold call
+explicitly, separately from the warm average, and reports prompt/
+completion token counts from the API's own `usage` field.
+
+**The fix that matters most: prefill less.** The prompt (`llm_intent.py`'s
+`SYSTEM_PROMPT_TEMPLATE`) interpolated the *entire* `apps_registry.APPS`
+table -- curated entries plus everything `app_discovery.py`'s Start Menu
+scan finds, 40 apps on the reference machine -- into both the prompt
+prose and the GBNF grammar's `app` enum. That cost ~190 of the prompt's
+1292 tokens (~4s of prefill) for apps most machines will never be asked
+about by voice, and it was actively harmful, not just slow: constrained
+decoding *forces* a pick from whatever's in the enum, so a garbled
+transcript that vaguely resembles a discovered junk entry
+(`idle_python_3_12_64_bit`, `blackmagic_raw_speed_test`, ...) gets that
+entry confidently selected rather than refused -- confirmed directly in
+`llm_usage_log.jsonl` ("maximize obvious code" -> `idle_python_3_12_64_bit`).
+`llm_intent.LLM_APP_KEYS` now narrows the LLM's reach to
+`apps_registry.CURATED_APP_KEYS` (the 7 hand-curated entries) for both
+the prompt text and the enum -- a deliberate, real regression: an app
+registered only via discovery is no longer reachable through the *LLM*
+fallback (fast-path voice commands are unaffected either way, and
+`actions.py`'s own `APPS` check is unaffected -- an LLM-picked app
+still has to be a real registry entry regardless of which list produced
+it). Combined with trimming 14 few-shot examples down to the ones that
+each demonstrate something no other example does, and writing them in
+compact JSON (no spaces -- the model tends to mirror an example's own
+formatting, and this measurably shortened warm-call completions too),
+the prompt dropped from 1292 tokens to ~750-800 -- roughly 40% less
+prefill, i.e. cold calls around 13-15s instead of ~30s, at the same
+CPU. Every cut was re-validated against `_bench_llm.py`'s test set (now
+also checking each utterance's *action* against an expected value,
+rather than leaving a human to eyeball raw JSON) before being kept, and
+two real regressions the first draft introduced were caught and fixed
+this way before shipping: a missing `maximize_app` demonstration, and a
+"not registered" decline that needed its wording tightened so the model
+reliably emits `action: "none"` rather than an app action with `app:
+"none"` for a specifically-named app that isn't on the list.
+
+**Background prewarm, not less blocking.** Shrinking the prompt reduces
+the cold cost, it doesn't remove it. `llm_intent.prewarm()` runs one real
+inference (a canned utterance, result discarded) purely to populate the
+KV cache with the system prompt's prefix, from a background daemon
+thread `main.py` starts ~2s after the listener thread does (so it
+doesn't compete with wake-word/VAD setup or the boot announcement still
+being spoken), and again on wake-from-deep-sleep and resume-from-pause
+as a safety net. This is a refinement of the lazy-`llama_cpp`-import
+decision above, not a reversal of it -- the import still only happens
+inside `_get_llm()`, called from a background thread well after the
+process is already armed and listening, so time-to-armed is unaffected.
+A dedicated lock (`llm_intent._lock`) serializes `infer()` against an
+in-flight `prewarm()` -- deliberately *not* the same lock that guards
+transcription (`main.py`'s `_processing_lock`), since a prewarm holding
+that lock for its full duration would stall a push-to-talk press before
+it even got to transcribe the audio.
+
+**A pre-LLM garbage gate, and letting the model abstain.** `_transcribe`
+already computed `no_speech_prob`/`avg_logprob` per segment but, per this
+file's own earlier claim, used them "only to decide whether an
+LLM-fallback resolution is trustworthy enough to log as a seed-promotion
+candidate, never to change what gets dispatched." That stance is
+reversed: `logs/session.jsonl` and `llm_usage_log.jsonl` showed *every*
+LLM-fallback resolution logged at the time of this change was a
+hallucinated transcript that still burned a full LLM call and got
+confidently dispatched as a real action ("or been grown for me" ->
+minimize chrome, "hey job is" -> open chrome, ...). `main._should_reject_transcript`
+now gates the LLM-bound branch specifically (never the fast
+embedding-match path -- a >=0.80 cosine match is its own evidence and
+still dispatches regardless) using that same acoustic signal, plus
+faster-whisper's own failure thresholds for `compression_ratio`, and a
+small exact-match denylist/wake-echo check. It ships **disabled by
+default** (`main.TRANSCRIPT_GATE_ENFORCED = False`) -- it only logs what
+it would have rejected until enabled by hand after reviewing a few days
+of real `transcript_would_reject` events in `logs/session.jsonl` and
+confirming none of them also produced a real dispatched outcome for the
+same utterance elsewhere. Separately, the schema gained a third top-level
+outcome, `no_match` (alongside a real action and the existing small-talk
+`"none"`), so the model can structurally abstain instead of being forced
+to either pick a real action or write a chat reply for input that reads
+like noise -- `validate_parsed` force-empties `reply` on this outcome
+regardless of what the model wrote, since an abstain must never become
+speech.
+
+**Whisper's own temperature-fallback loop was a second, independent
+>30s source**, and not one this project had previously diagnosed:
+faster-whisper's default `temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]`
+re-runs the *entire* `beam_size=5` search at every temperature whenever
+`compression_ratio`/`log_prob`/`no_speech` thresholds trip on a decode --
+measured directly at 42+ seconds for 3 seconds of white noise, versus
+~2.2s for the same duration of clean speech. `condition_on_previous_text`
+(already `False` here) removes the main driver of the degenerate
+long-form decodes that ladder exists to recover from, so on this
+project's <=7.2s single-utterance command audio it was mostly pure
+worst-case cost. `_transcribe` now passes `temperature=0.0` (single
+greedy decode) and `without_timestamps=True` (nothing here reads segment
+timing). The peak-amplitude normalization mentioned above also gained a
+gain cap (8x) -- uncapped, `audio / peak` amplifies pure room noise up to
+full scale exactly as readily as quiet real speech, which is what was
+feeding Whisper the input that tripped the fallback loop in the first
+place.
+
 ### Virtual-desktop awareness
 
 `focus_or_launch_app` only counts a window as "already up" if it's on
@@ -445,6 +598,209 @@ and the original fail-*open* exception handler silently masked that
 total failure as "yes, on this desktop" for every window; fixed to fail
 *closed* instead (worst case is a redundant extra window opened, versus
 silently hijacking the user's active desktop).
+
+### Screen and window context
+
+**Ranking, not `windows[0]`** (`window_context.py`, `monitors.py`) --
+`focus_or_launch_app` used to bring forward whatever `EnumWindows`
+happened to enumerate first when several windows of the same app were
+open, with no notion of which monitor you're looking at, which window
+you used most recently, or any word you actually said to disambiguate.
+`window_context.rank_windows` scores candidates lexicographically --
+a title hint you spoke (`window_context.extract_hints`) dominates
+everything; then whether the window is actually visible right now
+(a minimized match loses to a visible one); then whether it's on the
+monitor currently in use; then Z-order as a recency proxy (Windows
+maintains Z-order by activation, so "topmost matching window" is a
+free, accurate-enough MRU with no message-pump/event-hook machinery
+needed). Repeating the same request within 12s cycles to the
+next-best candidate instead of asking a clarifying question out loud
+(`window_context.CycleTracker`) -- the candidate list is frozen on the
+first request of a cycle and never re-ranked on a repeat, deliberately:
+focusing a window changes its Z-order, so re-ranking between calls
+would put the just-focused window back on top and make "the other one"
+oscillate between the same two windows forever instead of advancing.
+Generic across every registered app, not special-cased for Chrome.
+
+**Monitor identification** (`monitors.py`) -- `EnumDisplayMonitors`'
+primary-monitor flag is *not* a usable "which one is the laptop"
+heuristic: confirmed live on the reference two-screen machine, the
+*external* monitor is Windows' primary, not the internal panel.
+`QueryDisplayConfig`'s `outputTechnology` (`DISPLAYCONFIG_OUTPUT_
+TECHNOLOGY_INTERNAL` vs HDMI/DisplayPort/DVI) is the real signal, reached
+via raw `ctypes` since pywin32 doesn't wrap it -- no new dependency.
+Fails closed to neutral `screen_1`/`screen_2` names if the query is
+unavailable (a VM, RDP, an unusual driver) rather than guessing which
+screen is the laptop; a wrong guess there is the worst kind of wrong,
+since "move this to my monitor" silently landing on the laptop instead
+reads as doing the opposite of what was asked. `resolve_monitor_mention`
+(the word -> monitor-key resolver for "my laptop screen"/"the other
+screen") deliberately declines numbered screens ("screen 2") outright --
+`EnumDisplayMonitors`' enumeration order carries no user-facing meaning
+at all, confirmed live: it doesn't even agree with the primary flag,
+let alone a left-to-right reading a user would expect.
+
+**`describe_screen` speaks a description, not raw data**
+(`actions.py`, `app_titles.py`) -- the first version read window titles
+and registry keys straight into speech ("local_disk_d", "main.py
+(Working Tree) (main.py) - jarvis - Visual Studio Code"), and ignored
+any screen named in the utterance entirely. `app_titles.py` is a set of
+pure per-app title parsers (VS Code's `[WSL: ...]`/`(Working Tree)`
+noise, Chrome's `- Google Chrome`/unread-count prefixes and the PWA
+case that carries no suffix at all, Spotify's idle-vs-playing shape),
+validated against titles captured live, never raising -- a parser bug
+degrades to the raw trimmed title rather than taking the action down.
+With no screen named, the reply covers the focused window plus a
+one-line summary of the other screen; with one named, it groups that
+screen's contents by app ("Chrome, two VS Code, and Discord") rather
+than reading out every title -- following the same "never speak the raw
+identifier back" precedent `count_app_windows` and
+`count_files_in_folder` already set (neither speaks the app name or
+folder path, just a count). The screen parameter is plumbed as a lexical
+hint from the raw utterance (the same mechanism `focus_or_launch_app`
+already uses for its window hint), not a new LLM schema field -- zero
+prompt-token cost, and it works identically on the fast path and the
+LLM path.
+
+**A pre-existing false-positive class, found while testing this: the
+matcher confuses a question for its matching command.** All imperative
+seeds ("open chrome", "lock my computer") sit close enough in embedding
+space to the same phrase asked as a *question* that "is chrome open"
+(0.931), "is my computer locked" (0.870), and "how many chrome windows
+do i have open right now" (0.803, silently stealing a real
+`count_app_windows` query from the LLM) all confidently dispatch as if
+they were commands. `main.py`'s interrogative guard checks the
+*resolved* action (catching the LLM path too) against a small opener-
+word list, with an explicit exclusion for actions whose entire purpose
+IS to answer a question (`describe_screen`, `now_playing`,
+`count_app_windows`, `count_files_in_folder`). On trigger from the fast
+path specifically, the match is discarded rather than declined outright
+-- the utterance still gets a real shot at the LLM fallback, which
+often resolves it correctly (the `count_app_windows` example above).
+Deliberately excludes "can"/"could"/"would" from the opener list: those
+are the matcher's own seeded polite-request phrasing ("can you open
+chrome for me") and must keep dispatching normally despite the
+grammatical resemblance to a question.
+
+**A second, unrelated guard**: "move this (window) to the next desktop"
+resolves to `switch_desktop:next` at 0.940 -- there's no action that
+moves a window across desktops, so unguarded, saying "move" silently
+switches which desktop *you're* viewing and leaves the window exactly
+where it was, with no error at all. Declined by checking for "move" in
+the transcript whenever the resolved action is `switch_desktop`.
+
+**Spotify** (`apps_registry.py`) -- curated by hand, same reason as
+`terminal`: this machine's install is the MSIX/Store build
+(`SpotifyAB.SpotifyMusic`), not a classic Start Menu `.lnk` shortcut, so
+`app_discovery.py`'s scan structurally can't see it. `window_class` is
+`Chrome_WidgetWin_1` (Spotify's desktop client is CEF-based, same as
+Chrome/Discord/VS Code), so the exe-name check in `_matches_app` is what
+actually disambiguates it. The `WindowsApps\Spotify.exe` stub resolves
+to `SpotifyMigrator.exe`, not the real client -- confirmed the `spotify:`
+URI is registered in `HKEY_CLASSES_ROOT` and launches the real client
+directly, same shape as `settings`' `start ms-settings:`. `now_playing`
+("what's playing") reads Spotify's own window title, which only ever
+carries "Artist - Track" while something is actually playing -- there's
+no way to tell "paused" apart from "nothing queued" from the title
+alone, so both degrade to the same honest "can't tell" reply rather than
+guessing. **This, not the registry entry, was the risky half of adding
+Spotify**: before seeding, "what's playing" resolved to `media_play_pause`
+at 0.868 and "what song is this" to `media_previous_track` at 0.831 --
+asking the question would have paused or rewound the music. The
+interrogative guard above and the new seeds both had to land before this
+shipped.
+
+**Screen context in the LLM prompt, gated on need** (`main.py`,
+`llm_intent.py`) -- the one-turn `context_app` memory (`state["last_app"]`)
+only remembers the last app an action *touched*, not what you're
+*looking at*, so "minimize this"/"what's this page about" had no way to
+resolve. `actions.llm_screen_context()` (a terse cousin of
+`describe_screen` -- plain text for the model, not a spoken reply)
+fills that gap, but it costs real prefill tokens on every call it's
+included in: measured directly, an interleaved A/B (n=12/arm, so
+machine-load drift hits both sides equally) gave a median 2.02s -> 2.53s,
+min-to-min +0.49s, for a 25-token context line -- matching the ~50 tok/s
+prefill rate exactly. Injected only when `main._looks_deictic` finds one
+of a small set of reference words (`this`/`that`/`it`/`here`/`current`/
+`focused`/`screen`/`window`/`looking`) in the utterance, validated
+against real commands: every genuine deictic phrasing fires, and every
+ordinary app/desktop/media command that actually reaches the LLM does
+not (a few phrasings fire spuriously, like "skip this track", but those
+are seeded fast-path commands that never reach the LLM regardless, so
+the gate firing on them is free). When present, it merges into the
+*same* second system message `context_app` already uses -- never a
+third message -- since llama-cpp-python's KV-prefix reuse keys off the
+stable first system message staying in the same position every call;
+splitting context across more messages multiplies the number of
+distinct prefixes ever seen without buying anything.
+
+**Moving windows across monitors, and why desktops were dropped**
+(`actions.py`, `monitors.py`) -- `move_to_monitor` ("move this to my
+laptop screen") is the first thing in this codebase that mutates window
+geometry at all; everything before it only ever showed/hid/foregrounded
+a window (`ShowWindow`, `SetForegroundWindow`, `BringWindowToTop`).
+
+*Geometry, not a synthetic key chord.* `switch_desktop`/`snap_window`
+both simulate the OS's own keyboard shortcut on principle -- but there
+is no shortcut that means "the laptop" or "the monitor" regardless of
+physical arrangement, and confirmed live, the reference machine's two
+screens are stacked *vertically* and overlap horizontally, so even
+`Win+Shift+Left/Right` would be geometrically ambiguous here. A named
+target has to be addressed by `SetWindowPos` into the target's
+`work_rect` (`monitors.plan_move_rect` -- pure, proportional remap,
+preserving relative position/size rather than clipping or fixing pixel
+size, the same thing Windows' own shortcut does). A deliberate
+deviation from the synthetic-key precedent, not an oversight.
+
+*A maximized window is restored, moved, and re-maximized* --
+`SetWindowPos` directly on a maximized window snaps it straight back to
+the monitor it re-maximizes onto, a well-known multi-monitor trap.
+**A real race hit here during testing, not just a theoretical one**:
+`ShowWindow`/`SetWindowPos` only ever *post* a request to a window's
+message queue, they don't wait for a cross-process window to actually
+act on it -- calling `ShowWindow(SW_MAXIMIZE)` immediately after
+`SetWindowPos`, with no wait for the reposition to land first, let
+Windows decide which monitor to re-maximize onto based on wherever the
+window *still* was, so the whole sequence reported success while the
+window silently stayed on the original screen. Fixed by polling for
+each step's effect to actually be observable (a placement/monitor
+check with a short retry budget) before trusting it and moving to the
+next step, rather than a single immediate check.
+
+*Never claims success without checking* -- the final reply is chosen
+only after re-reading the window's actual landed monitor and comparing
+it to the target, same fail-closed convention as everything else
+correctness-adjacent in this project. A minimized foreground window is
+declined outright rather than moved -- its placement can't be verified
+against a real monitor (the iconic sentinel rect maps to none), and
+it's a near-dead path regardless: confirmed live, minimizing a window
+takes the OS foreground away from it entirely (focus falls through to
+whatever was behind it), so "the foreground window is minimized" isn't
+really a reachable state outside a genuine race.
+
+*Moving to another virtual desktop was spiked and dropped.*
+`IVirtualDesktopManager::MoveWindowToDesktop` and `GetWindowDesktopId`
+were declared in `virtual_desktop.py` from Phase 5 onward but never
+called by anything. Verified directly with `_spike_desktop_move.py`
+(kept in the repo as the record of why, same "re-validation tool"
+convention as `_bench_llm.py`): spawning a real console window (which
+on this machine is owned by `WindowsTerminal.exe`, not `cmd.exe` --
+Windows Terminal is the default console host) and calling
+`MoveWindowToDesktop` on it raised `E_ACCESSDENIED`
+(`(-2147024891, 'Access is denied.', ...)`) even from a normal,
+unelevated process moving a window it doesn't own. There is also no
+keyboard-shortcut fallback to fall back to here (unlike the monitor
+case) -- Windows publishes `Win+Ctrl+D`/`Win+Ctrl+F4`/`Win+Ctrl+Left/
+Right` for creating/closing/switching desktops, and nothing for moving
+a window between them; the only supported gesture is dragging in Task
+View. Reaching for `IVirtualDesktopManagerInternal` (the undocumented
+interface some third-party tools use for this) was considered and
+rejected -- the same "no reverse-engineered interfaces" stance already
+applied to desktop *detection* in this project applies here too. A
+guard against the resulting false-positive was still worth shipping on
+its own: "move this to the next desktop" resolves to `switch_desktop:
+next` at 0.940 confidence, which would otherwise switch the user's
+desktop and silently leave the window exactly where it was.
 
 ### Voice replies and terminal theming
 
@@ -737,6 +1093,23 @@ bypassing `wt.exe`, to isolate launcher from program):
 
 ## Known limitations / open items
 
+- **No UI Automation / Accessibility API integration.** Everything this
+  project knows about a window's content comes from its title string
+  (`app_titles.py`) -- it can say what VS Code file or Chrome tab you're
+  on, but it can't read Chrome's actual URL, a document's text, or
+  anything a title doesn't already carry. UIA is reachable from this
+  codebase's existing dependencies with no new install (raw `comtypes`
+  already used by `virtual_desktop.py` can load `UIAutomationCore.dll`
+  directly), but was deliberately not pursued: `IUIAutomationElement`
+  exposes on the order of 80 methods where `IVirtualDesktopManager` has
+  3, and a wrong hand-written vtable declaration doesn't raise a
+  catchable exception the way a COM error does -- it calls whatever
+  function pointer happens to sit at that offset, a hard crash in the
+  one process that must not lose its listener thread over it. Revisit
+  only if a concrete need survives everything title-based context
+  already covers, and only via the `uiautomation` PyPI package (a
+  maintained, tested vtable binding) rather than hand-declared
+  `COMMETHOD`s.
 - **`logs/session.jsonl` is never rotated or pruned.** One line per
   event, so realistically kilobytes per day -- but it grows without
   bound across a long-running install. Delete it whenever; nothing reads
@@ -751,14 +1124,19 @@ bypassing `wt.exe`, to isolate launcher from program):
 
 - **The session listener blocks synchronously while handling one
   command.** Transcription + action dispatch (up to ~5s for a cold app
-  launch that has to wait for a window to appear, ~2.5-3s for an LLM
-  fallback) runs inline in the same thread that watches for the next
+  launch that has to wait for a window to appear; a warm LLM fallback is
+  a few seconds, a cold one -- first call in a process, before the
+  background prewarm finishes, or after the pre-LLM gate's rejection
+  path -- more like 13-15s post-shrink, see the latency subsection
+  above) runs inline in the same thread that watches for the next
   utterance. Nothing is lost during this window -- incoming audio still
-  queues and gets processed once the thread frees up -- but Jarvis is
-  genuinely unresponsive-feeling for that stretch. Fixing this properly
-  means the session state machine tracking an in-flight command while
-  still watching for the next utterance concurrently; not done, since it
-  is a real restructuring of the state machine, not a contained fix.
+  queues (`audio_q`, unbounded) and gets processed once the thread frees
+  up, though nothing currently trims that backlog if a very long dispatch
+  lets it grow -- but Jarvis is genuinely unresponsive-feeling for that
+  stretch. Fixing this properly means the session state machine tracking
+  an in-flight command while still watching for the next utterance
+  concurrently; not done, since it is a real restructuring of the state
+  machine, not a contained fix.
 - **"Hey jarvis" occasionally not registering for a stretch right after
   boot** was reported once; the persistent push-to-talk stream fix
   addresses one plausible contributor (the same device cold-open glitch
@@ -798,10 +1176,12 @@ quit/restart -- comes back wake-word-armed regardless of what it was
 doing before sleep.
 
 **Command-line control**: `jarvis.cmd`, with `D:\jarvis` on the user
-`PATH`. Forwards `status`/`pause`/`resume`/`quit` straight to
-`jarvisctl.py`'s control-socket client; `start` is handled directly in
-the batch file since `jarvisctl.py` can only talk to an already-running
-instance.
+`PATH`. Forwards `status`/`stats`/`debug`/`pause`/`resume`/`quit`
+straight to `jarvisctl.py`'s control-socket client; `start` is handled
+directly in the batch file since `jarvisctl.py` can only talk to an
+already-running instance. `status` now also appends the LLM's
+warm/cold state (`LLM warm` / `LLM cold` / `LLM warming`) -- purely
+observational, see `llm_intent.prewarm_state`'s docstring.
 
 ## Status
 

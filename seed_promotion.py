@@ -1,8 +1,9 @@
 """
 Phase 5: auto-promotes frequently-seen LLM-fallback utterances into
 the fast embedding-matcher path, so a phrasing that started out
-needing the ~2.5-3s LLM detour becomes instant once it's proven to be
-something the user actually says regularly. Manual, on demand only --
+needing the LLM detour -- several seconds warm, ~13-27s cold (see
+llm_intent.py) -- becomes instant once it's proven to be something the
+user actually says regularly. Manual, on demand only --
 run directly (`python seed_promotion.py`), not wired into main.py's
 startup at all: embedding a bigger seed list adds measurable startup
 time, and the user would rather trigger this by hand when they know a

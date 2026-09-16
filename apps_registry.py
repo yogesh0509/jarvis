@@ -76,6 +76,32 @@ _CURATED_APPS = {
         "window_class": "CASCADIA_HOSTING_WINDOW_CLASS",
         "launch_command": "start wt.exe",
     },
+    "spotify": {
+        # Curated by hand for the same reason as terminal above --
+        # confirmed directly: this machine's Spotify is the MSIX/Store
+        # build (SpotifyAB.SpotifyMusic), not a classic Start Menu .lnk
+        # shortcut, so app_discovery.py's scan can't see it either.
+        # window_class is Chrome_WidgetWin_1 -- Spotify's desktop client
+        # is CEF-based, same as Chrome/Discord/VS Code -- so the exe
+        # name check in _matches_app is what actually disambiguates it,
+        # same as every other Electron/CEF entry here.
+        # The WindowsApps\Spotify.exe stub resolves to SpotifyMigrator.exe,
+        # not the real client, so launching by exe path is unreliable;
+        # "spotify:" is confirmed registered in HKEY_CLASSES_ROOT and
+        # launches the real client directly, same shape as settings'
+        # "start ms-settings:".
+        "process_names": ["Spotify.exe"],
+        "window_class": "Chrome_WidgetWin_1",
+        "launch_command": "start spotify:",
+    },
 }
 
 APPS = {**discover_apps(_CURATED_APPS), **_CURATED_APPS}
+
+# The curated subset alone, exposed publicly so other modules can narrow
+# to it without reaching into the private _CURATED_APPS -- llm_intent.py
+# uses this to keep the LLM fallback's app enum small (see its own
+# comment for why: prompt-prefill cost, and a constrained decoder that
+# gets handed 30+ discovered junk names as valid choices for a garbled
+# transcript will pick one of them rather than refuse).
+CURATED_APP_KEYS = tuple(_CURATED_APPS.keys())

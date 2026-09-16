@@ -96,12 +96,15 @@ any action with real side effects like delete/send).
 |---|---|
 | `main.py` | orchestrator: audio streams, wake word, VAD, session state machine, control server, single-instance guard |
 | `actions.py` | execution layer — every allowlisted action as a plain function; the only thing ever dispatched to |
-| `apps_registry.py` | registered-apps table (7 curated entries) + whatever `app_discovery.py` finds — the actual security boundary for "open/minimize apps in general" |
+| `apps_registry.py` | registered-apps table (8 curated entries) + whatever `app_discovery.py` finds — the actual security boundary for "open/minimize apps in general" |
 | `app_discovery.py` | scans the Start Menu at startup to expand the registry; never overrides a curated entry |
 | `intent_matcher.py` | fast path: local sentence-embedding similarity match (cosine threshold 0.80) |
 | `local_embedder.py` | ONNX inference for `bge-small-en-v1.5`, bypasses fastembed's HF auto-download |
-| `llm_intent.py` | fallback path: local Qwen2.5-1.5B-Instruct via `llama-cpp-python`, grammar-constrained JSON output; model + `llama_cpp` import are both lazy |
+| `llm_intent.py` | fallback path: local Qwen2.5-1.5B-Instruct via `llama-cpp-python`, grammar-constrained JSON output; model + `llama_cpp` import are both lazy; also runs a background prewarm (see `main.py`'s `_start_llm_prewarm`) |
 | `seed_promotion.py` | logs LLM-resolved phrases; promotes frequent ones into the fast path (manual only) |
+| `monitors.py` | physical-display identification (laptop vs external — `QueryDisplayConfig`, not the primary-monitor flag) and spoken-mention resolution ("my laptop screen", "the other screen") |
+| `window_context.py` | ranks candidate windows when several of the same app are open — title-hint matching, monitor bias, recency, cycle-on-repeat |
+| `app_titles.py` | per-app window-title cleanup for spoken replies (VS Code/Chrome/Spotify/Discord) — pure string functions, no win32 |
 | `vad.py` | Silero VAD wrapper — carries recurrent state, so never share one instance across independent audio streams |
 | `virtual_desktop.py` | `IVirtualDesktopManager` COM wrapper (current-desktop check); thread-local, `CLSCTX_INPROC_SERVER` |
 | `tts.py` | Piper TTS playback, mic-mute-while-speaking (count-based, not boolean), persistent output stream with device-failure recovery |

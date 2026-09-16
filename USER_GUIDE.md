@@ -65,11 +65,12 @@ covered gets a brief "not sure how to do that yet" reply instead of
 being ignored, and (see section 4) it's spoken back to you now, not just
 shown in the window.
 
-**Apps.** Six are hand-curated for precise matching (Chrome, Discord, VS
-Code, File Explorer, Settings, the D: drive, and Windows Terminal), and
-many more are found automatically at startup by scanning your Start
-Menu -- Office apps, OneDrive, git tools, PowerShell, and whatever else
-you have installed, restart Jarvis to pick up anything newly installed:
+**Apps.** Eight are hand-curated for precise matching (Chrome, Discord,
+VS Code, File Explorer, Settings, the D: drive, Windows Terminal, and
+Spotify), and many more are found automatically at startup by scanning
+your Start Menu -- Office apps, OneDrive, git tools, PowerShell, and
+whatever else you have installed, restart Jarvis to pick up anything
+newly installed:
 - "open chrome" / "bring up discord" / "open excel" -- brings it forward
   if already open on this desktop, launches a fresh one otherwise
 - "minimize chrome" / "close discord" -- **"close" always means
@@ -79,6 +80,12 @@ you have installed, restart Jarvis to pick up anything newly installed:
 - If you name an app that genuinely isn't installed/registered, it says
   so honestly ("I don't have Photoshop registered, sir") rather than
   guessing at the closest thing it does have.
+- **Several windows of the same app open?** "bring up chrome" picks the
+  one on your current monitor, prefers one already visible over a
+  minimized one, and favours whichever you used most recently. Name what
+  you're after ("the chrome window with the football stream", "the
+  GitHub one") to be specific, or just repeat the command within a few
+  seconds to cycle to the next one instead of the same window every time.
 
 **Desktops:**
 - "switch to the next desktop" / "go to the previous desktop" -- next/
@@ -102,6 +109,28 @@ whatever has focus):**
 **Read-only questions:**
 - "how many files are in this folder" -- reads whatever folder the
   currently-focused File Explorer window is showing
+- "what's playing" / "what song is this" -- reads Spotify's currently
+  playing track; if Spotify's open but paused (or nothing's cued up),
+  it says so honestly rather than guessing at a track
+
+**Screens.** Have a laptop plus an external monitor? Jarvis knows which
+is which:
+- "what's on my screen" -- describes whatever's focused, plus a quick
+  note on what's on the other screen
+- "what's on my laptop screen" / "what's on the monitor" / "what's on my
+  other screen" -- describes that screen specifically, grouped by app
+  rather than reading out every window title
+- "move this to my laptop screen" / "move this to the monitor" / "move
+  this to the other screen" -- sends whatever's currently focused to
+  that screen, resizing it to fit proportionally; a maximized window
+  stays maximized, just on the new screen
+- Numbered screens ("screen 2") aren't supported -- there's no reliable
+  way to know which physical screen a number would mean, so it declines
+  honestly and asks you to say "laptop" or "monitor" instead. The same
+  goes for moving a window to a different *virtual desktop* (not a
+  physical screen) -- Windows itself doesn't provide a safe way to do
+  that, so it's not supported, only switching which desktop you're
+  viewing is
 
 **Small talk and general questions.** Anything that isn't a command at
 all -- a greeting, "what time is it", "tell me a joke" -- gets an
@@ -118,10 +147,10 @@ messages, a document, wherever your cursor is. Say "stop dictation" to
 go back to normal commands. See section 4a for the details.
 
 **Nothing destructive exists in the current command set** -- every
-action either brings something forward, minimizes/maximizes it, snaps
-or switches desktops, adjusts volume/media, locks the screen, or reads
-something back to you. Nothing deletes, sends, or closes an app without
-minimizing first.
+action either brings something forward, minimizes/maximizes/moves it,
+snaps or switches desktops, adjusts volume/media, locks the screen, or
+reads something back to you. Nothing deletes, sends, or closes an app
+without minimizing first.
 
 ## 4. A typical wake-word interaction, start to finish
 
@@ -348,7 +377,11 @@ jarvis quit       # stop it completely
 
 `status` reports one of the four states by name -- `Wake-word armed
 (awake)`, `Wake-word armed (deep sleep)`, `Conversation open`, or
-`Paused (mic off)` -- matching the diagram in section 5 exactly.
+`Paused (mic off)` -- matching the diagram in section 5 exactly, plus
+whether the local AI fallback is warmed up yet (`LLM warm` / `LLM
+warming` / `LLM cold`) -- purely informational, it answers on any
+setting, this just tells you whether the next AI-fallback answer will
+be near-instant or take a few seconds longer for the one-time warm-up.
 
 (Under the hood, `jarvis` is a small command file in `D:\jarvis` that
 forwards to `jarvisctl.py`, plus a `start` option that tool can't offer

@@ -125,6 +125,110 @@ PHRASES = {
         "Nothing from File Explorer in focus, sir.",
         "I'd need a File Explorer window in focus for that.",
     ),
+    "screen_unknown": (
+        "I can't tell what's in focus right now, sir.",
+        "Nothing I can make out has focus at the moment.",
+        "I'm not seeing a usable window in focus, sir.",
+    ),
+    "screen_summary_known": (
+        'You\'re on {app}, sir -- "{title}", on {monitor}.',
+        'That has your attention: {app}, "{title}", on {monitor}.',
+        'That\'s {app}, sir: "{title}", on {monitor}.',
+    ),
+    "screen_summary_unknown": (
+        'Something called "{title}" has focus, sir -- on {monitor}, though I don\'t have it registered.',
+        'I see "{title}" in focus, on {monitor} -- not one of my registered apps, sir.',
+        'You\'re looking at "{title}", sir, on {monitor} -- unregistered, so I can\'t say much more.',
+    ),
+    "screen_other_summary": (
+        "Over on {monitor}: {summary}.",
+        "Meanwhile, {monitor} has {summary}.",
+        "And on {monitor}, {summary}.",
+    ),
+    "screen_named_summary": (
+        "Over on {monitor}: {summary}.",
+        "On {monitor}, sir: {summary}.",
+        "That's {monitor} for you: {summary}.",
+    ),
+    "screen_empty": (
+        "Nothing open on {monitor} right now, sir.",
+        "Nothing's showing on {monitor} at the moment.",
+        "I don't see anything on {monitor}, sir.",
+    ),
+    "screen_unnamed": (
+        "I can't tell which screen you mean, sir -- try 'laptop' or 'monitor'.",
+        "That screen doesn't have a name I recognise, sir -- laptop or monitor works, though.",
+        "I don't have a name for that one, sir. Laptop, or monitor?",
+    ),
+    "screen_ambiguous": (
+        "I'm not sure which screen you mean, sir -- try naming it, like 'the monitor' or 'my laptop'.",
+        "There's more than one 'other' screen, sir -- could you be specific?",
+        "Which one, sir? Name it and I'll have a look.",
+    ),
+    "screen_single": (
+        "There's only the one screen, sir.",
+        "Just the one screen here, sir -- nowhere else to look.",
+        "I've only got the one screen to report on, sir.",
+    ),
+    "now_playing_track": (
+        "That's {track}, sir.",
+        "You've got {track} on, sir.",
+        "Playing now: {track}.",
+    ),
+    "now_playing_unknown": (
+        "Spotify's open, sir, but I can't tell what's queued up.",
+        "It's open, but nothing seems to be playing right now, sir.",
+        "Spotify's up, sir, but it doesn't look like anything's playing.",
+    ),
+    "now_playing_not_open": (
+        "Spotify's not open, sir.",
+        "I don't see Spotify running, sir.",
+        "Nothing's playing -- Spotify isn't open, sir.",
+    ),
+    "now_playing_no_spotify": (
+        "I don't have Spotify registered, sir.",
+        "Spotify isn't something I have on file, sir.",
+    ),
+    "move_monitor_ok": (
+        "Over on {monitor} now, sir.",
+        "Sent it to {monitor}.",
+        "There it is, on {monitor}, sir.",
+    ),
+    "move_monitor_already_there": (
+        "That's already on {monitor}, sir.",
+        "It's already there -- on {monitor}.",
+        "Nowhere to send it, sir -- it's on {monitor} already.",
+    ),
+    "move_monitor_unnamed": (
+        "I can't tell which screen you mean, sir -- try 'laptop' or 'monitor'.",
+        "That screen doesn't have a name I recognise, sir -- laptop or monitor works, though.",
+        "I don't have a name for that one, sir. Laptop, or monitor?",
+    ),
+    "move_monitor_unclear": (
+        "I'm not sure which screen you mean, sir -- try naming it, like 'the monitor' or 'my laptop'.",
+        "Which screen, sir? Name it and I'll send it over.",
+        "Not sure where to send it, sir -- laptop, or monitor?",
+    ),
+    "move_monitor_single": (
+        "There's only the one screen, sir -- nowhere else to send it.",
+        "Just the one screen here, sir.",
+        "Nowhere else to put it, sir -- only the one screen.",
+    ),
+    "move_monitor_minimized": (
+        "That one's minimised, sir -- nothing to move.",
+        "It's tucked away already, sir -- I'd need it visible first.",
+        "Can't move a minimised window, sir.",
+    ),
+    "move_monitor_failed": (
+        "That didn't take, sir -- it's still where it was.",
+        "Something went wrong there, sir -- it didn't move.",
+        "No luck moving that one, sir.",
+    ),
+    "move_monitor_no_window": (
+        "I can't tell what's in focus right now, sir.",
+        "Nothing I can make out has focus at the moment.",
+        "I'm not seeing a usable window in focus, sir.",
+    ),
     "folder_count": ("{count} files in that folder, sir.", "{count} files.", "That's {count} files, sir."),
     "folder_unreadable": (
         "Couldn't read that folder, sir.",
@@ -160,6 +264,16 @@ PHRASES = {
         "I can only switch to the next or previous desktop for now, sir, not a specific number.",
         "Next or previous only, sir -- I can't jump to a numbered desktop yet.",
         "I don't do numbered desktops yet, sir. Next and previous, though.",
+    ),
+    "declined_question": (
+        "That sounded like a question, sir, not a command -- I've left it alone.",
+        "That read as a question to me, sir, so I didn't act on it.",
+        "Sounded like you were asking, not telling, sir. Nothing done.",
+    ),
+    "move_window_declined": (
+        "I can't move a window to another desktop yet, sir -- only switch which one you're viewing.",
+        "Moving a window between desktops isn't something I can do yet, sir.",
+        "I don't have a way to send a window to another desktop yet, sir -- only switch to it.",
     ),
     "dictation_start": (
         'Go ahead, sir -- typing whatever you say. Say "stop dictation" when you\'re done.',
