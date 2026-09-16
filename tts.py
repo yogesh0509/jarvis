@@ -70,6 +70,15 @@ _playback_lock = threading.Lock()
 # flag reflects it" for the listener to slip through.
 _speaking_count = 0
 _speaking_count_lock = threading.Lock()
+# Decrements owed to calls that interrupt() already accounted for. Every
+# in-flight speak()/play_samples() runs _end_speaking() in a finally, so
+# zeroing _speaking_count in interrupt() (as this used to do) left those
+# finallys to land on a count that by then belonged to a *newer*
+# utterance -- is_speaking() could read False while audio was genuinely
+# playing, which is exactly the hole the count exists to close (the
+# always-on session listener hearing its own reply back). Bank them here
+# and swallow precisely that many later decrements instead.
+_pending_stale_ends = 0
 _ECHO_TAIL_SECONDS = 0.3
 
 # Barge-in: push-to-talk (main.py's on_press) can cut off whatever's
@@ -120,8 +129,15 @@ def _begin_speaking() -> int:
 
 
 def _end_speaking() -> None:
-    global _speaking_count
+    global _speaking_count, _pending_stale_ends
     with _speaking_count_lock:
+        # Order doesn't matter: interrupt() banked N owed decrements, and
+        # exactly N of the next N+M _end_speaking() calls get swallowed,
+        # so the M calls issued after the interrupt still net out to zero
+        # whichever finally happens to run first.
+        if _pending_stale_ends > 0:
+            _pending_stale_ends -= 1
+            return
         _speaking_count = max(0, _speaking_count - 1)
 
 
@@ -147,7 +163,7 @@ def interrupt() -> None:
     inside its own loop instead -- the one thread that's actually
     calling write() on this stream -- once it notices the id set here.
     """
-    global _interrupted_up_to_id, _speaking_count
+    global _interrupted_up_to_id, _speaking_count, _pending_stale_ends
     with _speaking_count_lock:
         # Everything issued so far (there's normally at most one in
         # flight, but see _interrupted_up_to_id's comment for why a
@@ -155,6 +171,9 @@ def interrupt() -> None:
         # never regresses since _next_utterance_id only grows, so a
         # later speak() call's id is always safely above this.
         _interrupted_up_to_id = _next_utterance_id
+        # Not a plain `= 0`: see _pending_stale_ends' comment. Each call
+        # counted here still owes an _end_speaking() from its own finally.
+        _pending_stale_ends += _speaking_count
         _speaking_count = 0
 
 

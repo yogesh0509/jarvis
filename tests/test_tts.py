@@ -16,11 +16,13 @@ def _reset_tts_state():
     tts._speaking_count = 0
     tts._next_utterance_id = 0
     tts._interrupted_up_to_id = 0
+    tts._pending_stale_ends = 0
     tts._output_stream = None
     yield
     tts._speaking_count = 0
     tts._next_utterance_id = 0
     tts._interrupted_up_to_id = 0
+    tts._pending_stale_ends = 0
     tts._output_stream = None
 
 
@@ -118,6 +120,55 @@ def test_interrupt_never_touches_the_output_stream_itself():
     tts.interrupt()
 
     assert calls == []
+    assert tts.is_speaking() is False
+
+
+def test_a_reply_issued_after_an_interrupt_keeps_its_own_speaking_count():
+    """
+    interrupt() used to zero _speaking_count outright -- but every call
+    it cut short still runs _end_speaking() in its own finally, and those
+    stale decrements then landed on a count that by then belonged to a
+    *newer* utterance. is_speaking() read False while audio was genuinely
+    playing, which is precisely the hole the count exists to close: the
+    always-on session listener hearing its own reply back through the mic
+    and acting on it as a fresh command.
+    """
+    tts._begin_speaking()  # an earcon, in flight
+    tts._begin_speaking()  # the spoken reply behind it, in flight
+    assert tts.is_speaking() is True
+
+    tts.interrupt()  # push-to-talk barge-in
+    assert tts.is_speaking() is False
+
+    # The reply for the command that barge-in was making room for.
+    tts._begin_speaking()
+    assert tts.is_speaking() is True
+
+    # Only now do the two interrupted workers reach their own finally.
+    tts._end_speaking()
+    tts._end_speaking()
+    assert tts.is_speaking() is True, "a stale finally must not un-mute the listener mid-reply"
+
+    tts._end_speaking()  # the new reply genuinely finishes
+    assert tts.is_speaking() is False
+
+
+def test_stale_end_accounting_nets_out_whatever_order_the_finallys_run_in():
+    # Nothing orders an interrupted worker's finally against a newer
+    # speak() -- both are daemon threads. The accounting has to hold
+    # either way round, so interleave them the other way here.
+    tts._begin_speaking()
+    tts._begin_speaking()
+    tts.interrupt()
+
+    tts._end_speaking()  # one stale finally lands first...
+    tts._begin_speaking()  # ...then a new utterance starts
+    assert tts.is_speaking() is True
+
+    tts._end_speaking()  # the second stale finally
+    assert tts.is_speaking() is True
+
+    tts._end_speaking()  # the new utterance finishes
     assert tts.is_speaking() is False
 
 

@@ -63,6 +63,11 @@ ACTING = "acting"
 ERROR = "error"
 ASLEEP = "asleep"
 OFFLINE = "offline"
+# Dictation is a real runtime state, not a flavour of SESSION: while it's
+# on, nothing said is matched against an intent at all -- it's typed. It
+# used to share SESSION's cyan, so the one state where "power down" does
+# NOT close the conversation looked exactly like the one where it does.
+DICTATING = "dictating"
 
 _STATES = {
     DORMANT: ((60, 16, 10), "STANDBY"),
@@ -74,6 +79,7 @@ _STATES = {
     ERROR: ((255, 42, 31), "PROBLEM"),
     ASLEEP: ((26, 8, 5), "LOW POWER"),
     OFFLINE: ((70, 70, 78), "OFF DUTY"),
+    DICTATING: ((120, 190, 120), "DICTATING"),
 }
 
 # Foreground accents for scrolling content, independent of the state

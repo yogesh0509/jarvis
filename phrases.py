@@ -291,8 +291,27 @@ PHRASES = {
         "I'll be here, sir.",
         "Closing up.",
     ),
+    # Spoken when a conversation closes itself after the idle timeout,
+    # rather than on a closing phrase. Distinct from "session_close" so
+    # it can say *why* it closed -- and spoken at all because the guide
+    # promises every state change is, and this edge was silent (earcon
+    # only) despite being on the documented state diagram.
+    "session_timeout": (
+        "Quiet for a while, sir -- I'll close up.",
+        "Nothing for a few minutes, sir. Closing the conversation.",
+        "I'll stand by, sir -- say \"hey jarvis\" when you need me.",
+    ),
     "pause": ("Going quiet, sir.", "Mic off, sir.", "Standing down."),
     "resume": ("Back online, sir.", "Listening again.", "Back with you, sir."),
+    # "wake up"/"start listening" are ordinary things to say mid-
+    # conversation, and they're seeds for enable_listening -- so they
+    # used to fire a full resume (spoken "Back online, sir.", HUD slammed
+    # to ARMED) when nothing was paused. Acknowledge instead.
+    "already_listening": (
+        "Already listening, sir.",
+        "I'm right here, sir.",
+        "Never stopped, sir.",
+    ),
     "sleep": (
         "Easing into low power mode, sir.",
         "Powering down the heavy circuits, sir.",

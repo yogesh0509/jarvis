@@ -171,7 +171,12 @@ without minimizing first.
    listening", "that's enough for now", "we're done", "go to sleep", or
    similar -- and the conversation closes.
 6. **If you just walk away instead of saying a closing phrase**, it'll
-   close the conversation on its own after about 4 minutes of silence.
+   close the conversation on its own after about 4 minutes of silence,
+   and say so as it does. "Silence" there means silence it actually
+   heard: time while it's speaking, or while you're holding Right Ctrl,
+   doesn't count toward it, so in a noisy room the real wait can be
+   longer than four minutes. A push-to-talk command counts as using it
+   and starts the four minutes over.
 
 While a conversation is open, if it doesn't understand what you said (or
 it's not something it knows how to do), it says so out loud and keeps
@@ -208,12 +213,20 @@ a normal conversation. Say **"stop dictation"** (or "end dictation",
 
 Dictation isn't matched against any command at all while it's
 active -- it's typed as-is, so a dictated sentence that happens to
-mention "open chrome" just gets typed, not executed. The only way out
-is that exact stop phrase, checked directly against what you said rather
-than guessed at, so it won't misfire on dictated text that merely
-sounds similar. Push-to-talk still works normally even while dictating,
-as a reliable way out if you forget the stop phrase or just want a quick
-command without leaving dictation mode for your other utterances.
+mention "open chrome" just gets typed, not executed. **That includes
+the closing phrases**: say "power down" while dictating and it gets
+typed out like anything else, rather than closing the conversation.
+
+The stop phrase is checked directly against what you said rather than
+guessed at, so it won't misfire on dictated text that merely sounds
+similar. It's the normal way out, but not the only one -- dictation also
+ends if the conversation times out on silence, if you pause Jarvis
+(either way), or if it hits an internal error and resets itself. Coming
+back from any of those leaves you in ordinary command mode, never still
+dictating. Push-to-talk also works normally while dictating, as a
+reliable escape hatch if you forget the stop phrase, or just to slip in
+a quick command without leaving dictation mode for your other
+utterances.
 
 ## 5. The four states -- and what each one actually means
 
@@ -254,6 +267,14 @@ on and off yourself, two ways:
    at all until you deliberately resume it (voice via push-to-talk, or
    the command line).
 
+   Pausing also drops the transcription models, the same ones deep sleep
+   drops -- there's no point holding half a gigabyte resident for a mic
+   that's switched off. Resuming quietly loads them again in the
+   background, so a second or two after "Back online, sir" it's genuinely
+   back to normal rather than only looking it. You don't have to wait for
+   that or do anything about it; if you speak first, it just loads them
+   then instead.
+
 **d) Fully quit.** Stops completely -- not paused, not asleep, just not
 running ("Powering down. Goodbye, sir" -- said before it actually
 exits, not after, so it doesn't get cut off). See section 6 for how,
@@ -261,8 +282,9 @@ and what happens afterward.
 
 ### State diagram
 
-(Renders in VS Code's built-in Markdown preview -- open this file and
-press Ctrl+Shift+V.)
+(Renders on GitHub as-is. For VS Code's Markdown preview
+(Ctrl+Shift+V) you need a Mermaid extension -- "Markdown Preview Mermaid
+Support" is the usual one; without it the block shows as plain text.)
 
 ```mermaid
 stateDiagram-v2
@@ -277,8 +299,15 @@ stateDiagram-v2
             DeepSleep --> Awake : "hey jarvis"\nor push-to-talk
         }
 
+        state ConversationOpen {
+            [*] --> TakingCommands
+            TakingCommands --> Dictating : "take dictation"
+            Dictating --> TakingCommands : "stop dictation"
+        }
+
         WakeArmed --> ConversationOpen : say "hey jarvis"
-        ConversationOpen --> WakeArmed : closing phrase\n("power down" etc.)\nor ~4 min silence
+        TakingCommands --> WakeArmed : closing phrase\n("power down" etc.)
+        ConversationOpen --> WakeArmed : ~4 min of silence
 
         WakeArmed --> Paused : Right Ctrl + "stop listening"\nor "jarvis pause"
         ConversationOpen --> Paused : Right Ctrl + "stop listening"\nor "jarvis pause"
@@ -298,6 +327,14 @@ stateDiagram-v2
         it comes back wake-word-armed, awake.
     end note
 ```
+
+**Why Dictating is drawn inside the conversation, not beside it.** It's
+a mode *within* an open conversation, and the edge out of it is
+deliberately narrow: only the exact "stop dictation" phrase leads back
+to taking commands. A closing phrase said while dictating gets typed
+out, not acted on -- which is exactly why it's worth drawing as its own
+state rather than leaving it implied. The silence timeout, pausing, and
+push-to-talk all still behave normally from inside it (see section 4a).
 
 **Why quit-and-restart instead of just freezing in place through
 sleep?** Audio devices are a known weak spot across a real sleep/wake
@@ -375,13 +412,22 @@ jarvis resume     # bring it back
 jarvis quit       # stop it completely
 ```
 
-`status` reports one of the four states by name -- `Wake-word armed
-(awake)`, `Wake-word armed (deep sleep)`, `Conversation open`, or
-`Paused (mic off)` -- matching the diagram in section 5 exactly, plus
-whether the local AI fallback is warmed up yet (`LLM warm` / `LLM
-warming` / `LLM cold`) -- purely informational, it answers on any
-setting, this just tells you whether the next AI-fallback answer will
-be near-instant or take a few seconds longer for the one-time warm-up.
+`status` reports the state by name -- `Wake-word armed (awake)`,
+`Wake-word armed (deep sleep)`, `Conversation open`, `Dictation
+(conversation open)`, or `Paused (mic off)` -- matching the diagram in
+section 5, plus whether the local AI fallback is warmed up yet (`LLM
+warm` / `LLM warming` / `LLM cold`, or `LLM failed` if the warm-up hit
+an error). That last part is purely informational and it answers on any
+setting; it just tells you whether the next AI-fallback answer will be
+near-instant or take a few seconds longer for the one-time warm-up. A
+failed warm-up isn't fatal either -- the fallback still works, it just
+loads when it's first needed.
+
+If it ever adds `listener stalled Ns` on the end, that's the one status
+worth acting on: it means the part of Jarvis that listens hasn't run for
+a while. Give it a moment (a slow AI fallback can legitimately hold
+things up for half a minute), and if it persists, `jarvis quit` and
+start it again.
 
 (Under the hood, `jarvis` is a small command file in `D:\jarvis` that
 forwards to `jarvisctl.py`, plus a `start` option that tool can't offer
@@ -419,10 +465,11 @@ looking at the screen at all:
 | Deep red | Armed, waiting for "hey jarvis" |
 | Cyan | Conversation open |
 | Bright cyan, pulsing with your voice | Recording what you're saying |
+| Green | Dictating -- what you say is being typed, not matched |
 | Amber | Thinking (the local AI fallback) |
 | Gold flash | Done |
 | Red flash | A problem, or it declined |
-| Near-black | Low power (models unloaded after 30 min idle) |
+| Near-black | Low power (models unloaded -- 30 min idle, or paused) |
 | Grey | Paused |
 
 **Each thing you say occupies one block**, not three lines. What it
@@ -466,7 +513,7 @@ just a view of it.
 | End the conversation | Say "power down" (or just stop talking for ~4 min) |
 | Give one command without the wake word | Hold Right Ctrl, speak, let go |
 | Cut off a reply that's running long | Hold Right Ctrl -- stops it mid-sentence |
-| Type out what you say, word for word | "take dictation" (in a conversation); "stop dictation" to leave |
+| Type out what you say, word for word | "take dictation" (in a conversation); "stop dictation" to leave -- closing phrases get typed, not obeyed |
 | Stop it from listening at all | Hold Right Ctrl + say "stop listening", or `jarvis pause` |
 | Bring it back after pausing | Hold Right Ctrl + say "start listening", or `jarvis resume` |
 | Check what it's doing | `jarvis status`, or look at the console window |

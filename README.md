@@ -290,6 +290,110 @@ one"), and resetting to a known-good `wake` state instead of letting the
 thread die, so any *future* unhandled exception (this one or a new one)
 degrades gracefully instead of silently going deaf.
 
+### State-machine audit against the documented diagram
+
+`USER_GUIDE.md` section 5 draws the runtime as a state diagram, and that
+diagram was treated as the spec in an audit of what the code actually
+does. Eleven divergences; the ones worth recording here are the ones
+whose symptoms were visible but unattributable.
+
+**`jarvis quit` reported failure on success.** The control loop sent
+`"powering down, sir"` and then called `_announce_and_shutdown()` while
+still inside the connection's `with` block. `jarvisctl.py` reads until
+EOF on a socket built with `timeout=3`, and that timeout governs every
+`recv()`, not just the connect -- while the goodbye reliably runs longer:
+a blocking spin-down earcon, Piper synthesis and playback, then
+`llm_intent.unload()`. So the client's second `recv()` timed out,
+`socket.timeout` came out as an `OSError`, and a perfectly clean quit
+printed "Can't reach jarvis -- is it running?" and exited 1, throwing
+away the reply it had already received. Sitting right on the 3s boundary
+is what made it intermittent. The announcement now happens after the
+connection closes. `jarvis pause` had the same shape for a different
+reason -- its unload waits on `_processing_lock`, which an in-flight LLM
+fallback can hold for up to 30s -- so that unload moved to a background
+thread, leaving the mic close (the part that actually matters) synchronous.
+
+**A sleep/wake cycle could leave nothing running, silently.** Nothing
+sequences "Jarvis Quit On Sleep" against "Jarvis Restart On Wake", and
+the quit blocks on audio against an audio stack Windows is already
+suspending -- so the outgoing process was routinely still alive when the
+incoming one started, whereupon it hit the single-instance mutex and
+called `sys.exit(0)`. Exit code 0, so Task Scheduler logged a success,
+and under `wt.exe` the message flashed in a window that closed itself.
+Result: no Jarvis until the next logon, with nothing anywhere saying so.
+Fixed at both ends -- `_acquire_single_instance_lock` now waits out an
+incumbent (`SINGLE_INSTANCE_WAIT_SECONDS`, logging a stand-down when it
+does give up) and the wake task got a 15s delay. The three tasks are now
+committed under `scheduler/` too; they had existed only in the live Task
+Scheduler database, so a documented behaviour had no artifact in the repo.
+
+**Pausing mid-conversation could reopen the conversation on resume.**
+The listener's end-of-utterance `state["mode"]` write was dedented out of
+`_processing_lock`, and `_set_enabled`'s own reset sat outside it too. A
+pause landing mid-transcription set mode to `"wake"`, and the listener
+then put it straight back to `"session_listening"` -- and
+`_set_enabled(True)` never touched mode, so the next `jarvis resume` came
+back into an open conversation nobody opened, acting on ambient speech
+with no wake word said. The comment on that reset says it exists
+precisely to stop this; the race defeated it. The listener's write is now
+inside the lock and conditional on `state["enabled"]`, and `_set_enabled`
+writes `enabled` before `mode` so both threads agree on `"wake"`
+whichever goes second. Deliberately not solved by taking the lock across
+all of `_set_enabled`: pause is the privacy control, and the mic has to
+shut when asked, not once the model finishes thinking.
+
+**Jarvis could hear its own "One moment, sir" and loop on it.** The
+`is_speaking()` mute is evaluated when a chunk is *dequeued*, not when it
+was captured, and `audio_q` is unbounded -- so a 3-30s LLM fallback banks
+every frame recorded during it, including the "One moment, sir" spoken
+before the call. Drained afterwards at machine speed, that backlog is
+harmless only while a reply is still playing. On the paths that end
+without speaking at all -- the LLM's own abstain, an empty transcript, a
+dictated line -- the mute is already lifted, VAD fires on Jarvis's own
+voice, and it transcribes itself as the next command, which misses the
+fast path, says "One moment, sir" again, and abstains again. Fixed with
+`_drain_audio_queue()` after every blocking section, on resume, and after
+a stream reopen. This is the same class of bug as the runaway
+desktop-switching that motivated the mute in the first place, just
+reached by a different route.
+
+**Every pause landed in deep sleep, however brief.** Pausing unloads
+Whisper and the matcher; nothing loaded them again. So `jarvis status`
+answered "Wake-word armed (deep sleep)" seconds after a deliberate
+resume, the HUD said `ARMED` at the same moment (it hardcoded that rather
+than using `_restore_steady_state`, which already knew better), and the
+next command paid the reload and announced "Back at full power, sir" -- a
+line that is supposed to mean "you left me alone for half an hour". The
+diagram has Paused returning to WakeArmed *awake*, so a quiet background
+reload now restores that. Neither acoustic model was being reset across
+the pause gap either, despite every other transition into `"wake"` doing
+so; that now happens too, flagged for the listener thread rather than
+done from the control thread, which would race a `speech_prob()` call.
+
+**Smaller, same audit:** dictation was a real state with no name anywhere
+-- not in the diagram, not in `jarvis status`, not in the HUD colour
+table -- despite being the one state where a closing phrase gets *typed*
+rather than obeyed. `enable_listening` ignored `via_session` while
+`disable_listening` honoured it, so "wake up" mid-conversation fired a
+full resume. The 4-minute idle close was the only state change that
+happened in silence. A partly-failed model load wedged permanently,
+because `whisper_model` stayed non-`None` and the `is None` retry check
+never fired again. `_reopen_input_stream` handed a live stream back even
+if a pause had landed mid-reopen. And `tts.interrupt()` zeroed
+`_speaking_count` outright, so an interrupted worker's `finally` later
+decremented a count belonging to a newer utterance -- `is_speaking()`
+reading False while audio was genuinely playing, which is exactly the
+hole that count exists to close.
+
+**What let all of this survive:** `_set_enabled` and the state machine had
+no test coverage at all. `tests/test_state_machine.py` now drives the real
+closure (same technique `tests/test_audio_callbacks.py` uses -- run `main()`
+far enough with everything heavy faked, capture the frame, bail) and
+asserts the two invariants the audit turned up: `not enabled` implies mode
+`"wake"`, and mode `"wake"` implies dictation is off. `_status_line` was
+lifted out to module level to make the state *naming* testable the same
+way `_format_stats` already was.
+
 ### Command-line control (`jarvisctl.py`), not a tray icon
 
 Built a pystray-based tray icon first (enable/disable toggle + quit), but
@@ -1152,10 +1256,18 @@ bypassing `wt.exe`, to isolate launcher from program):
 
 ## Autostart, sleep, and command-line control
 
-Three Task Scheduler entries, registered once via PowerShell
-(`Register-ScheduledTask` + `New-CimInstance -CimClass
-MSFT_TaskEventTrigger` for the event-based ones -- `New-ScheduledTaskTrigger`
-has no built-in event-log trigger type):
+Three Task Scheduler entries, now committed as XML templates under
+`scheduler/` with a `register_tasks.ps1` that fills in the machine's user
+and paths and registers all three (`schtasks /create /xml /f`). They were
+originally registered by hand via PowerShell (`Register-ScheduledTask` +
+`New-CimInstance -CimClass MSFT_TaskEventTrigger` for the event-based
+ones -- `New-ScheduledTaskTrigger` has no built-in event-log trigger
+type) and lived only in the live Task Scheduler database, which meant the
+sleep/wake behaviour documented here had no backing artifact anywhere in
+the repo: not reviewable, not reproducible, and not an obvious place to
+look when a wake left nothing running. **Nothing in the Python code
+observes power events at all** -- no `WM_POWERBROADCAST`, no console
+control handler, no `atexit`. These three tasks are the whole mechanism.
 
 - **"Jarvis Voice Control"** -- `AtLogOn` trigger for the current user.
   Action: `wt.exe -F -p Jarvis`.
@@ -1165,7 +1277,19 @@ has no built-in event-log trigger type):
   running."
 - **"Jarvis Restart On Wake"** -- event trigger on System log, Provider
   `Microsoft-Windows-Power-Troubleshooter`, Event ID 1 (resume from
-  sleep). Action: same themed launch as the logon task.
+  sleep). Action: same themed launch as the logon task, after a 15s
+  `<Delay>`. The delay is load-bearing: nothing sequences this against
+  the quit above, and the quit blocks on audio against a stack Windows is
+  already tearing down, so without it the incoming process regularly lost
+  the race to the single-instance mutex and stood down -- exit code 0,
+  recorded as a success, no Jarvis until the next logon. `main.py` waits
+  out an incumbent as well now; both, because the failure is invisible
+  from outside.
+
+Note that the lid itself is never observed by anything: the chain is lid
+-> Windows initiates sleep -> Kernel-Power 42 -> task. A machine on
+modern standby, or set to "do nothing" on lid close, may never emit
+event 42, and then none of this fires.
 
 **Why quit-on-sleep/restart-on-wake instead of riding through suspend:**
 audio devices are a known weak point across a real sleep/wake cycle (the
@@ -1180,8 +1304,14 @@ doing before sleep.
 straight to `jarvisctl.py`'s control-socket client; `start` is handled
 directly in the batch file since `jarvisctl.py` can only talk to an
 already-running instance. `status` now also appends the LLM's
-warm/cold state (`LLM warm` / `LLM cold` / `LLM warming`) -- purely
-observational, see `llm_intent.prewarm_state`'s docstring.
+warm/cold state (`LLM warm` / `LLM cold` / `LLM warming` / `LLM failed`)
+-- purely observational, see `llm_intent.prewarm_state`'s docstring --
+and `listener stalled Ns` if the listener thread's heartbeat is older
+than `LISTENER_STALL_SECONDS`. That last one exists because the crash
+containment above keeps the *process* alive through a dead listener, so
+the socket would otherwise keep answering "Wake-word armed" while
+nothing was listening at all: containment without a liveness signal just
+moves where the silence comes from.
 
 ## Status
 

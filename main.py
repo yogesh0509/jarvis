@@ -414,6 +414,53 @@ def _format_stats(stats: dict) -> str:
     return "\n".join(lines)
 
 
+# A listener thread that is merely busy looks identical to a dead one
+# from the control socket, so this has to clear the worst *legitimate*
+# block: a cold LLM fallback is documented at 3-30s, with transcription
+# ahead of it. A genuinely dead thread never recovers, so erring long
+# costs nothing but a slightly later diagnosis.
+LISTENER_STALL_SECONDS = 60.0
+
+
+def _status_line(
+    enabled: bool,
+    mode: str,
+    whisper_loaded: bool,
+    dictating: bool,
+    llm_state: str,
+    seconds_since_listener_beat: float = 0.0,
+) -> str:
+    """
+    The `jarvis status` reply, as a pure function of the state it
+    reports. Module-level (not nested in main()) so this is testable
+    without starting the app -- same reasoning as _format_stats and
+    _should_reject_transcript above, and it earns it here because this is
+    the string someone reads *when they already suspect something is
+    wrong*. Every state the process can actually be in needs a name, and
+    every name it can print needs to be reachable.
+    """
+    if not enabled:
+        name = "Paused (mic off)"
+    elif mode in ("session_listening", "session_recording"):
+        # Dictation used to report as a plain "Conversation open", hiding
+        # the one state in which a closing phrase does *not* close the
+        # conversation -- it gets typed out instead.
+        name = "Dictation (conversation open)" if dictating else "Conversation open"
+    elif not whisper_loaded:
+        name = "Wake-word armed (deep sleep)"
+    else:
+        name = "Wake-word armed (awake)"
+
+    line = f"{name} {DOT} LLM {llm_state}"
+    if seconds_since_listener_beat > LISTENER_STALL_SECONDS:
+        # The listener loop has crash containment, but a thread that dies
+        # anyway leaves this socket answering cheerfully while nothing is
+        # listening at all -- the precise failure that containment was
+        # added for. Say so rather than imply health.
+        line += f" {DOT} listener stalled {seconds_since_listener_beat:.0f}s"
+    return line
+
+
 def _frames(seconds: float) -> int:
     return max(1, round(seconds / FRAME_SECONDS))
 
@@ -452,6 +499,14 @@ WHISPER_MODEL_SIZE = "small.en"
 WHISPER_LOCAL_DIR = Path(__file__).parent / "models" / "faster-whisper-small.en"
 SINGLE_INSTANCE_MUTEX_NAME = "Global\\JarvisVoiceControlSingleInstance"
 
+# How long a starting instance waits for a departing one to finish before
+# giving up -- see _acquire_single_instance_lock. Sized against the quit
+# path's own worst case (a blocking earcon, Piper synthesis and playback,
+# then llm_intent.unload()), with room for that to be running against an
+# audio stack Windows is already mid-way through suspending.
+SINGLE_INSTANCE_WAIT_SECONDS = 20.0
+SINGLE_INSTANCE_POLL_SECONDS = 0.5
+
 
 def _acquire_single_instance_lock():
     """
@@ -461,12 +516,41 @@ def _acquire_single_instance_lock():
     verification, not anything in our code; see README). It hasn't
     been seen to run our actual logic, but a named mutex makes that
     moot: only one process ever gets past this, full stop.
+
+    Waits rather than standing down instantly, which is what the sleep/
+    wake cycle actually needs. Two Task Scheduler entries drive that
+    cycle -- "Jarvis Quit On Sleep" (Kernel-Power 42) and "Jarvis Restart
+    On Wake" (Power-Troubleshooter 1) -- and nothing sequences them. The
+    quit path deliberately blocks on audio right as Windows tears the
+    audio stack down for suspend, so the outgoing process is routinely
+    still alive when the incoming one starts. Standing down immediately
+    meant the restart lost that race and left *nothing* running until the
+    next logon -- and lost it silently, since this exits 0, so Task
+    Scheduler recorded a success. Logged either way now, so a stand-down
+    is at least visible in logs/session.jsonl after the fact.
     """
-    mutex = win32event.CreateMutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
-    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        print("Another copy of me is already running, sir. Standing down.")  # pre-HUD: nothing is initialised yet
-        sys.exit(0)
-    return mutex
+    deadline = time.monotonic() + SINGLE_INSTANCE_WAIT_SECONDS
+    waited = 0.0
+    while True:
+        mutex = win32event.CreateMutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        # Read before anything else can clobber this thread's last error.
+        already_running = win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
+        if not already_running:
+            if waited:
+                _log_event("single_instance_acquired_after_wait", waited_seconds=round(waited, 1))
+            return mutex
+        # Ours only by name -- drop the duplicate handle before retrying,
+        # or every poll leaks one for the life of the process.
+        try:
+            win32api.CloseHandle(mutex)
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            print("Another copy of me is already running, sir. Standing down.")  # pre-HUD: nothing is initialised yet
+            _log_event("single_instance_stand_down", waited_seconds=round(waited, 1))
+            sys.exit(0)
+        time.sleep(SINGLE_INSTANCE_POLL_SECONDS)
+        waited += SINGLE_INSTANCE_POLL_SECONDS
 
 
 def _redirect_output_if_headless():
@@ -523,8 +607,21 @@ def main():
         matcher = IntentMatcher()
 
     def _load_heavy_models():
-        _load_whisper()
-        _load_matcher()
+        # All-or-nothing. Left half-loaded (Whisper up, the matcher's own
+        # load having thrown), whisper_model is non-None, so
+        # _ensure_heavy_models_loaded's `is None` check never retries --
+        # and every matcher.match() afterwards raises into the listener's
+        # crash handler instead, for the rest of the process's life, with
+        # a spoken "picking back up" apology each time. Drop both so the
+        # next utterance gets a real retry.
+        nonlocal whisper_model, matcher
+        try:
+            _load_whisper()
+            _load_matcher()
+        except Exception:
+            whisper_model = None
+            matcher = None
+            raise
 
     # llama.cpp mmaps the GGUF's weights by default (use_mmap=True) --
     # they're file-backed, evictable pages, not committed RAM, so holding
@@ -599,25 +696,34 @@ def main():
         _log_event("models_unloaded")
 
     def _ensure_heavy_models_loaded():
-        if whisper_model is None:
-            # A flash, not a steady state -- the caller has usually just
-            # set the state this belongs under (SESSION, straight after a
-            # wake word), and overwriting it here left the display amber
-            # until some later mode change happened to correct it.
-            hud.begin_flash(hud.THINKING)
-            hud.pending("waking the heavy circuits", spinner=True)
-            earcons.play("wake_up")
-            speak(phrases.pick("wake_up"))  # started before loading, not after -- fills the wait rather than adding to it
-            _load_heavy_models()
-            hud.resolve("back at full power", "system")
-            hud.end_flash()
-            _log_event("wake_up")
-            # Safety net, not the primary path -- with UNLOAD_LLM_ON_DEEP_SLEEP
-            # False (the default) the LLM was never actually dropped, so
-            # prewarm_state() is almost always already "warm" here and
-            # this no-ops instantly. Matters if that flag is ever flipped
-            # back to True, or the LLM was unloaded for some other reason.
-            _start_llm_prewarm("wake")
+        # Takes _processing_lock itself rather than trusting every caller
+        # to. Two of the three call sites already held it (it is an RLock,
+        # so re-entering on the same thread is free) -- the wake-word path
+        # did not, so a push-to-talk worker part-way through loading the
+        # models could be joined by the listener kicking off a *second*
+        # concurrent load: two ~500MB WhisperModel constructions and two
+        # spoken "waking the heavy circuits" racing each other across four
+        # physical cores.
+        with _processing_lock:
+            if whisper_model is None:
+                # A flash, not a steady state -- the caller has usually just
+                # set the state this belongs under (SESSION, straight after a
+                # wake word), and overwriting it here left the display amber
+                # until some later mode change happened to correct it.
+                hud.begin_flash(hud.THINKING)
+                hud.pending("waking the heavy circuits", spinner=True)
+                earcons.play("wake_up")
+                speak(phrases.pick("wake_up"))  # started before loading, not after -- fills the wait rather than adding to it
+                _load_heavy_models()
+                hud.resolve("back at full power", "system")
+                hud.end_flash()
+                _log_event("wake_up")
+                # Safety net, not the primary path -- with UNLOAD_LLM_ON_DEEP_SLEEP
+                # False (the default) the LLM was never actually dropped, so
+                # prewarm_state() is almost always already "warm" here and
+                # this no-ops instantly. Matters if that flag is ever flipped
+                # back to True, or the LLM was unloaded for some other reason.
+                _start_llm_prewarm("wake")
 
     hud.banner()
     with hud.boot_step("acoustic frontend", f"silero vad \u00b7 {SAMPLE_RATE}Hz \u00b7 {int(FRAME_SECONDS * 1000)}ms frames"):
@@ -677,6 +783,19 @@ def main():
         "mode": "wake",
         "main_last_chunk": time.time(),
         "hotkey_last_chunk": time.time(),
+        # Liveness for `jarvis status` -- stamped on every listener_loop
+        # iteration. That loop has crash containment, but a thread that
+        # dies anyway used to leave the control socket cheerfully
+        # reporting "Wake-word armed" while nothing was listening at all.
+        "listener_beat": time.time(),
+        # Raised by the push-to-talk worker, consumed by listener_loop:
+        # the conversation's idle countdown is a frame counter local to
+        # that loop, so the hotkey thread cannot reset it directly.
+        "renew_session": False,
+        # Raised by _set_enabled on resume, consumed by listener_loop --
+        # same reasoning: the VAD and wake-word models are driven by that
+        # thread and must not be reset out from under it.
+        "reset_acoustic": False,
         # One turn of pronoun memory -- the app a dispatched action last
         # actually touched, so "minimize it"/"close that" right after
         # "open chrome" can resolve without naming the app again. Fed to
@@ -733,6 +852,39 @@ def main():
 
     stream = _create_stream()
 
+    def _drain_audio_queue() -> int:
+        """
+        Throw away everything captured while something else was blocking.
+
+        The mute that stops the always-on session listener hearing
+        Jarvis's own replies (is_speaking(), checked in listener_loop) is
+        evaluated when a chunk is *dequeued*, not when it was captured --
+        and audio_q is unbounded, so a 3-30s LLM fallback banks every
+        frame recorded during it. Drained afterwards at machine speed,
+        those frames are only harmless while a reply is still playing.
+
+        On the paths that end without speaking at all -- the LLM's own
+        abstain, an empty transcript, a dictated line -- the mute is
+        already lifted by then, and the backlog still holds the "One
+        moment, sir" spoken *before* the call. VAD fires on it (three
+        frames is the onset bar), the listener records it, and Jarvis
+        transcribes its own voice as the next command -- which misses the
+        fast path, says "One moment, sir" again, and abstains again.
+        Dropping the backlog is the fix; that audio is stale by
+        definition, and anything still being said is still being captured
+        live.
+        """
+        dropped = 0
+        try:
+            while True:
+                audio_q.get_nowait()
+                dropped += 1
+        except queue.Empty:
+            pass
+        if dropped:
+            hud.note(f"dropped {dropped} stale audio frame(s)")
+        return dropped
+
     def _record_stat(category: str, text: str, note: str = "") -> None:
         """
         Cheap, best-effort usage tracking for `jarvis stats` (the
@@ -769,7 +921,12 @@ def main():
         if not state["enabled"]:
             hud.set_state(hud.OFFLINE)
         elif state["mode"] in ("session_listening", "session_recording"):
-            hud.set_state(hud.SESSION)
+            # Dictation gets its own colour rather than borrowing
+            # SESSION's: it is the one state in which a closing phrase
+            # does NOT close the conversation (it gets typed out like any
+            # other words), so it must not look identical to the state
+            # where it does.
+            hud.set_state(hud.DICTATING if state["dictating"] else hud.SESSION)
         elif whisper_model is None:
             hud.set_state(hud.ASLEEP)
         else:
@@ -793,7 +950,23 @@ def main():
                 stream.close()
         except Exception:
             pass
+        stream = None
+        if not state["enabled"]:
+            # A pause landed while the old stream was being torn down.
+            # Fail closed -- the project's standing rule for anything
+            # security-adjacent -- and leave the mic shut rather than hand
+            # a paused Jarvis a live capture stream back. _set_enabled(True)
+            # opens a fresh one on resume.
+            return
         stream = _create_stream()
+        # The audio either side of this gap is discontinuous. openWakeWord
+        # builds confidence over a rolling window and Silero carries
+        # recurrent hidden state, so both would otherwise carry a splice
+        # across the reopen -- and a splice reads as neither silence nor
+        # speech to either of them.
+        vad.reset()
+        wake_model.reset()
+        _drain_audio_queue()
 
     # Push-to-talk used to open a brand-new sd.InputStream on every single
     # press and tear it down on release -- the same class of Windows
@@ -847,6 +1020,74 @@ def main():
         )
         hotkey_stream.start()
 
+    def _start_pause_unload() -> None:
+        """
+        Drop Whisper and the matcher after a pause, on a background
+        thread.
+
+        Off the control thread because the unload needs _processing_lock,
+        which an in-flight LLM fallback can hold for up to 30s -- and
+        blocking `jarvis pause` behind that blew jarvisctl.py's own 3s
+        socket timeout, so a pause that had already taken effect reported
+        "Can't reach jarvis -- is it running?" instead. Nothing the user
+        can observe waits on this: the mic is shut and the state machine
+        reset synchronously in _set_enabled before this is even started.
+        """
+
+        def _run():
+            try:
+                with _processing_lock:
+                    # Re-checked under the lock: the wait for it can be
+                    # seconds long, and a resume may have landed since.
+                    if state["enabled"]:
+                        return
+                    _unload_heavy_models()
+            except Exception:
+                _log_event("pause_unload_error", traceback=traceback.format_exc())
+
+        threading.Thread(target=_run, name="pause-unload", daemon=True).start()
+
+    def _start_resume_reload() -> None:
+        """
+        Quietly bring Whisper and the matcher back after a resume, on a
+        background thread.
+
+        Pausing unloads them (see _set_enabled's disable branch) and
+        nothing used to load them again -- so every resume landed in what
+        is functionally deep sleep, however brief the pause was.
+        `jarvis status` answered "Wake-word armed (deep sleep)" seconds
+        after a deliberate resume, the HUD said ARMED at the same moment,
+        and the next command paid the full reload and announced "Back at
+        full power, sir" -- a line that is supposed to mean "you left me
+        alone for half an hour". The documented state diagram has Paused
+        returning to WakeArmed *awake*; this restores that rather than
+        leaving it to be tripped over.
+
+        Silent on purpose: _ensure_heavy_models_loaded's earcon and spoken
+        cue exist to fill a wait the user didn't ask for, and here they
+        would stack straight on top of "Back online, sir" for no benefit.
+        Off the control thread so `jarvis resume` still answers at once.
+        """
+
+        def _run():
+            try:
+                with _processing_lock:
+                    # Both re-checked under the lock rather than before
+                    # it: the wait can be seconds long, and either a fresh
+                    # pause or a real utterance may have landed meanwhile.
+                    if not state["enabled"] or whisper_model is not None:
+                        return
+                    _load_heavy_models()
+                _restore_steady_state()
+                _log_event("resume_reload")
+            except Exception:
+                # Daemon thread with nothing to catch it, and the failure
+                # is recoverable anyway -- _ensure_heavy_models_loaded
+                # still loads on the next utterance, just audibly.
+                _log_event("resume_reload_error", traceback=traceback.format_exc())
+
+        threading.Thread(target=_run, name="resume-reload", daemon=True).start()
+
     def _set_enabled(enabled: bool):
         """
         Closes (or reopens) the main always-on session-listening stream
@@ -865,34 +1106,72 @@ def main():
         stopped.
         """
         nonlocal stream
+        # Deliberately lock-free, and deliberately in this order.
+        #
+        # "enabled" is written FIRST, before "mode". That ordering is what
+        # actually closes the race this used to lose: the listener writes
+        # state["mode"] at the end of a session utterance, and it now
+        # makes that write under _processing_lock *and* conditional on
+        # state["enabled"] (see listener_loop). Whichever of the two
+        # threads goes second, both agree on "wake" -- so the reset can
+        # no longer be silently undone, which is what left a paused Jarvis
+        # on mode "session_listening" and had the next `jarvis resume`
+        # come back into an open conversation nobody opened.
+        #
+        # Taking _processing_lock across this whole function would also
+        # close it, but at a price worth refusing: an in-flight LLM
+        # fallback holds that lock for up to 30s, and `jarvis pause` is
+        # the privacy control -- the mic has to shut when asked, not once
+        # the model finishes thinking.
         state["enabled"] = enabled
         if enabled:
+            state["mode"] = "wake"
+            state["dictating"] = False
+            state["last_activity"] = time.time()
+            # Stamped *before* the stream is created, matching
+            # _reopen_input_stream's own discipline -- otherwise the 5s
+            # input watchdog compares against a timestamp from before the
+            # pause and tears down the brand-new stream on its first idle
+            # tick, reintroducing exactly the Windows cold-open glitch
+            # that keeping one stream open exists to avoid.
+            state["main_last_chunk"] = time.time()
             if stream is None:
                 stream = _create_stream()
-            hud.set_state(hud.ARMED)
+            _drain_audio_queue()
+            # Both acoustic models carry state across the pause gap --
+            # openWakeWord a rolling confidence window, Silero its
+            # recurrent hidden state -- and the audio either side of that
+            # gap is discontinuous. Every *other* transition into "wake"
+            # already resets them. Flagged rather than reset here: both
+            # objects are driven by the listener thread, and resetting
+            # them from this one would race a speech_prob()/predict()
+            # call mid-flight.
+            state["reset_acoustic"] = True
+            # Not a hardcoded ARMED: the models are still unloaded at this
+            # point, and _restore_steady_state is the helper that already
+            # knows how to say so. _start_resume_reload then brings them
+            # back and repaints.
+            _restore_steady_state()
             speak(phrases.pick("resume"))
+            _start_resume_reload()
             _start_llm_prewarm("resume")  # safety net -- see _ensure_heavy_models_loaded's identical call
         else:
             hud.set_state(hud.OFFLINE)
+            # The privacy-relevant half, and the only part that has to be
+            # synchronous: the mic is shut before this call returns.
             if stream is not None:
                 stream.stop()
                 stream.close()
                 stream = None
-            # _processing_lock is an RLock specifically so this is safe
-            # to call from inside an already-locked context too (e.g.
-            # "stop listening" said via push-to-talk, mid-_process()) --
-            # without it, unloading here could race an in-flight
-            # transcribe() on another thread and crash it with a null
-            # model reference.
-            with _processing_lock:
-                _unload_heavy_models()
             # Reset the session state machine too, not just the stream --
             # otherwise pausing mid-conversation and resuming later left
             # the listener stuck in "session_recording" with the models
             # unloaded, crashing on the next transcribe attempt.
             state["mode"] = "wake"
             state["dictating"] = False
+            _drain_audio_queue()
             speak(phrases.pick("pause"))
+            _start_pause_unload()
 
     # Push-to-talk's worker thread (below) and the wake-word listener
     # both call into whisper_model/matcher/llm_intent -- serialized here
@@ -1098,6 +1377,19 @@ def main():
             _record_stat("meta", text, "pause")
             return False
         if result.intent == "enable_listening":
+            if state["enabled"]:
+                # Nothing to resume. disable_listening above is already
+                # context-sensitive; this is the matching half, and it
+                # matters because "wake up" and "start listening" are
+                # ordinary things to say mid-conversation -- both are
+                # enable_listening seeds, so they used to fire a full
+                # resume: a spoken "Back online, sir." and the HUD (and
+                # the room lights behind it) slammed to ARMED while the
+                # conversation was still open.
+                hud.resolve("already listening")
+                speak(phrases.pick("already_listening"))
+                _record_stat("meta", text, "resume_noop")
+                return False
             _set_enabled(True)
             hud.resolve("back online")
             _record_stat("meta", text, "resume")
@@ -1434,6 +1726,11 @@ def main():
                 # display stuck mid-command is exactly the case where
                 # knowing the real state matters most.
                 _restore_steady_state()
+                # Using the hotkey is using Jarvis: renew the open
+                # conversation's idle countdown rather than letting it run
+                # out mid-use. The counter itself is local to
+                # listener_loop, which owns it and consumes this flag.
+                state["renew_session"] = True
 
         threading.Thread(target=_process, daemon=True).start()
 
@@ -1462,6 +1759,12 @@ def main():
         pre_buffer: "deque[np.ndarray]" = deque(maxlen=PRE_BUFFER_FRAMES)
 
         while not state["stop"]:
+            # Liveness for `jarvis status`, stamped before the blocking
+            # get so a thread simply parked on an empty queue still reads
+            # as alive -- that is a quiet room, not a dead listener. A
+            # genuinely long block (a cold LLM fallback) lets this go
+            # stale, which is why LISTENER_STALL_SECONDS clears it.
+            state["listener_beat"] = time.time()
             try:
                 chunk = audio_q.get(timeout=0.5)
             except queue.Empty:
@@ -1493,6 +1796,30 @@ def main():
             # re-triggering itself, causing runaway desktop switches).
             if state["hotkey_active"] or not state["enabled"] or is_speaking():
                 continue
+
+            # Push-to-talk renews the conversation's idle countdown.
+            # session_silence_run is a frame counter local to this loop,
+            # so the hotkey worker cannot reset it directly -- it raises a
+            # flag and this consumes it. Without this, a push-to-talk
+            # command inside an open conversation bought no extra time at
+            # all: the conversation still closed four minutes after the
+            # last thing said *to the session*, however recently the
+            # hotkey had been used.
+            if state["renew_session"]:
+                state["renew_session"] = False
+                session_silence_run = 0
+
+            # Raised by _set_enabled on resume. Consumed here rather than
+            # done there because both objects belong to this thread --
+            # resetting them from the control thread would race a
+            # speech_prob()/predict() call already in flight.
+            if state["reset_acoustic"]:
+                state["reset_acoustic"] = False
+                vad.reset()
+                wake_model.reset()
+                speech_onset_run = 0
+                session_silence_run = 0
+                pre_buffer.clear()
 
             try:
                 if state["mode"] == "wake":
@@ -1587,6 +1914,13 @@ def main():
                         if session_silence_run >= SESSION_IDLE_TIMEOUT_FRAMES:
                             hud.line("Quiet for a while -- closing the session.", "dim")
                             earcons.play("session_close")
+                            # Spoken, not just chimed. This is a documented
+                            # state-diagram edge, and the guide promises
+                            # every state change is said out loud -- it was
+                            # the only close that happened in silence, which
+                            # made the difference between "it closed" and
+                            # "it stopped hearing me" invisible.
+                            speak(phrases.pick("session_timeout"))
                             hud.set_state(hud.ARMED)
                             state["mode"] = "wake"
                             state["dictating"] = False
@@ -1610,8 +1944,30 @@ def main():
                             _record_timing("transcribe", time.perf_counter() - _t0)
                             vad.reset()
                             should_close = _handle_transcript(text, confident, quality, via_session=True)
-                        state["mode"] = "wake" if should_close else "session_listening"
-                        hud.set_state(hud.ARMED if should_close else hud.SESSION)
+                            # Inside the lock, and failing closed on a
+                            # pause that landed while this was busy.
+                            # Dedented out of it, this write raced
+                            # _set_enabled's own mode reset and silently
+                            # undid it: a push-to-talk "stop listening"
+                            # (or `jarvis pause`) resolving mid-
+                            # transcription left mode on
+                            # "session_listening" while paused, and the
+                            # next `jarvis resume` came back into an open
+                            # conversation nobody opened -- acting on
+                            # ambient speech with no wake word said.
+                            if should_close or not state["enabled"]:
+                                state["mode"] = "wake"
+                            else:
+                                state["mode"] = "session_listening"
+                        _restore_steady_state()
+                        # Everything captured while the lock was held is
+                        # stale by now, and on the paths that end without
+                        # speaking it would otherwise be drained with the
+                        # is_speaking() mute already lifted -- letting
+                        # Jarvis record and transcribe its own "One
+                        # moment, sir" as the next command. See
+                        # _drain_audio_queue for the full mechanism.
+                        _drain_audio_queue()
                         session_silence_run = 0
                         speech_onset_run = 0
                         pre_buffer.clear()
@@ -1704,20 +2060,24 @@ def main():
                 conn, _addr = server.accept()
             except socket.timeout:
                 continue
+            quitting = False
             with conn:
                 command = conn.recv(64).decode("utf-8", "ignore").strip().lower()
                 if command == "status":
-                    if not state["enabled"]:
-                        reply = "Paused (mic off)"
-                    elif state["mode"] in ("session_listening", "session_recording"):
-                        reply = "Conversation open"
-                    elif whisper_model is None:
-                        reply = "Wake-word armed (deep sleep)"
-                    else:
-                        reply = "Wake-word armed (awake)"
-                    # Purely observational -- see llm_intent.prewarm_state's
-                    # docstring; the LLM fallback works regardless of this.
-                    reply += f" {DOT} LLM {llm_intent.prewarm_state()}"
+                    # Derived by a module-level pure function so the state
+                    # naming is testable without starting the app, and so
+                    # every combination it can print is one the process
+                    # can actually be in. The LLM suffix is purely
+                    # observational -- see llm_intent.prewarm_state's
+                    # docstring; the fallback works regardless of it.
+                    reply = _status_line(
+                        enabled=state["enabled"],
+                        mode=state["mode"],
+                        whisper_loaded=whisper_model is not None,
+                        dictating=state["dictating"],
+                        llm_state=llm_intent.prewarm_state(),
+                        seconds_since_listener_beat=time.time() - state["listener_beat"],
+                    )
                 elif command == "stats":
                     reply = _format_stats(state["stats"])
                 elif command == "pause":
@@ -1742,13 +2102,26 @@ def main():
                         hud.set_debug(not hud.is_debug())
                     reply = f"debug output {'on' if hud.is_debug() else 'off'}"
                 elif command == "quit":
+                    # Announced *after* this connection closes, not
+                    # before. jarvisctl.py reads until EOF on a socket
+                    # whose 3s timeout governs every recv(), and the
+                    # goodbye reliably outlasts that: a blocking spin-down
+                    # earcon, then Piper synthesis and playback, then
+                    # llm_intent.unload(). Announcing inside the `with
+                    # conn:` block held EOF back past the client's
+                    # deadline, so a perfectly successful quit printed
+                    # "Can't reach jarvis -- is it running?" and exited 1
+                    # -- throwing away the reply it had already received,
+                    # and reporting failure to the sleep-triggered
+                    # scheduled task as well as to anyone at a prompt.
                     reply = "powering down, sir"
-                    conn.sendall(reply.encode())
-                    _announce_and_shutdown()
-                    break
+                    quitting = True
                 else:
                     reply = f"unrecognized command: {command!r}"
                 conn.sendall(reply.encode())
+            if quitting:
+                _announce_and_shutdown()
+                break
     except KeyboardInterrupt:
         # Only reachable at all when run in a visible console (Ctrl+C
         # has nothing to interrupt under pythonw.exe/Task Scheduler,

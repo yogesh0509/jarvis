@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Starts a fresh Jarvis when the system wakes from sleep.
+
+  The <Delay> is load-bearing, not politeness. Nothing sequences this
+  task against "Jarvis Quit On Sleep": that one fires on Kernel-Power 42
+  as the machine suspends, and the quit it triggers deliberately blocks
+  on audio (spin-down earcon, then Piper synthesis and playback) against
+  an audio stack Windows is already tearing down - so the outgoing
+  process is routinely still alive when this fires. With no delay, the
+  incoming process hit main.py's single-instance mutex and stood down,
+  leaving nothing running until the next logon, and silently: it exits 0,
+  so Task Scheduler recorded a success either way.
+
+  main.py now waits out the incumbent as well (see
+  _acquire_single_instance_lock and SINGLE_INSTANCE_WAIT_SECONDS), so
+  this is the belt to that braces. Both, because the failure is invisible
+  from the outside and the cost of the delay is fifteen seconds.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Restarts jarvis fresh (themed console) when the system wakes from sleep</Description>
+    <URI>\Jarvis Restart On Wake</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <EventTrigger>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <Delay>PT15S</Delay>
+    </EventTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{{WT_EXE}}</Command>
+      <Arguments>-F -p Jarvis</Arguments>
+    </Exec>
+  </Actions>
+</Task>
