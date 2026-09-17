@@ -12,9 +12,7 @@ __pycache__/
 # section for exact fetch commands per model). Never commit these.
 models/
 
-# Runtime-generated state (per-machine, not source)
+# Runtime-generated state (per-machine, not source) -- llm_usage_log.jsonl,
+# learned_seeds.json and seed_promotion_state.json all live under logs/ too
 logs/
 *.log
-llm_usage_log.jsonl
-learned_seeds.json
-seed_promotion_state.json

@@ -52,7 +52,7 @@ jarvis debug [on|off]        # toggle terminal verbosity without restart
 
 # standalone LLM-fallback benchmark (run by hand after changing
 # llm_intent.py's model/prompt/schema)
-.\.venv\Scripts\python.exe _bench_llm.py
+.\.venv\Scripts\python.exe tools\_bench_llm.py
 
 # promote frequently-seen LLM-resolved phrases into the fast path
 # (manual only — restart jarvis afterward for new seeds to take effect)
@@ -143,6 +143,22 @@ any action with real side effects like delete/send).
   constraint (see existing tests for the pattern per module).
 
 For the *why* behind any of the above (real bugs hit, tuning history,
-rejected alternatives), see README.md's "Design decisions" section — it's
-written as a decision log, not just a feature list, and is the first place
-to check before re-deriving a design choice from scratch.
+rejected alternatives), see `DECISIONS.md` — it's written as a decision
+log, not just a feature list, and is the first place to check before
+re-deriving a design choice from scratch.
+
+## Documentation map
+
+The docs were split by audience — check the right one before re-deriving
+something that's already written down:
+
+| File | Covers |
+|---|---|
+| `README.md` | Project overview, setup, fetching models, starting Jarvis |
+| `USER_GUIDE.md` | Day-to-day usage, the four-state diagram, full `jarvis` command reference |
+| `ARCHITECTURE.md` | Pipeline shape, security boundary, full module-by-module layout |
+| `DECISIONS.md` | The decision log — why, not just what, organized by area |
+| `ENVIRONMENT.md` | This dev machine's quirks (TLS resets, double-process-spawn) |
+| `KNOWN_LIMITATIONS.md` | Known gaps, deliberately deferred rather than fixed |
+| `STATUS.md` | Phase-by-phase build history |
+| `scheduler/README.md` | The Task Scheduler entries behind autostart/sleep/wake |

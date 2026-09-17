@@ -7,7 +7,7 @@ confirm latency/accuracy before trusting a change.
 Two things this version fixes over the original: it used to call
 warmup() *before* timing anything, so every timed call was a KV-prefix
 hit -- that produced the "~2.5-2.8s steady-state" figure once recorded
-in llm_intent.py's docstring and README.md's decision log, and never
+in llm_intent.py's docstring and DECISIONS.md's decision log, and never
 measured what production actually pays on its first real call. This
 version times the COLD first call as its own, clearly separate number,
 and reports prompt/completion token counts (from the API's own "usage"
@@ -16,6 +16,11 @@ regression. It also used to just print raw JSON for a human to eyeball
 -- it now checks each utterance against an expected action and prints a
 pass/fail count.
 """
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import json
 import time
@@ -66,7 +71,7 @@ TEST_UTTERANCES = [
     ("take dictation for me", "start_dictation"),
     ("open notepad", "none"),  # not registered -- must decline, never guess
     # --- the new abstain path, using the real hallucinated transcripts
-    # from llm_usage_log.jsonl that used to get confidently (mis)dispatched ---
+    # from logs/llm_usage_log.jsonl that used to get confidently (mis)dispatched ---
     ("or been grown for me", "no_match"),
     ("hey job is", "no_match"),
     ("follow down", "no_match"),

@@ -39,9 +39,9 @@ from pathlib import Path
 
 from apps_registry import APPS
 
-USAGE_LOG_PATH = Path(__file__).parent / "llm_usage_log.jsonl"
-LEARNED_SEEDS_PATH = Path(__file__).parent / "learned_seeds.json"
-PROMOTION_STATE_PATH = Path(__file__).parent / "seed_promotion_state.json"
+USAGE_LOG_PATH = Path(__file__).parent / "logs" / "llm_usage_log.jsonl"
+LEARNED_SEEDS_PATH = Path(__file__).parent / "logs" / "learned_seeds.json"
+PROMOTION_STATE_PATH = Path(__file__).parent / "logs" / "seed_promotion_state.json"
 
 PROMOTION_INTERVAL_SECONDS = 24 * 60 * 60
 PROMOTION_THRESHOLD = 3
@@ -73,6 +73,7 @@ def log_llm_resolution(text: str, parsed: dict) -> None:
     if label is None:
         return
     entry = {"text": text.strip().lower(), "label": label, "ts": time.time()}
+    USAGE_LOG_PATH.parent.mkdir(exist_ok=True)
     with open(USAGE_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -103,6 +104,7 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    PROMOTION_STATE_PATH.parent.mkdir(exist_ok=True)
     PROMOTION_STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
 
 
@@ -144,6 +146,7 @@ def maybe_run_promotion(existing_seeds: dict[str, list[str]], force: bool = Fals
         promoted.append(f'"{text}" -> {label} (seen {count} times)')
 
     if promoted:
+        LEARNED_SEEDS_PATH.parent.mkdir(exist_ok=True)
         LEARNED_SEEDS_PATH.write_text(json.dumps(learned, indent=2), encoding="utf-8")
 
     _save_state({"last_run": time.time()})

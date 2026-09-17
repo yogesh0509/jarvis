@@ -8,8 +8,8 @@ its own independent audio stream -- a manual override that works
 regardless of whether the main listener is on, off, or asleep.
 Controlled from the command line via jarvisctl.py (status/pause/
 resume/quit) talking to a local control socket -- no tray icon, no
-GUI. See README.md for the phase-by-phase build and the design
-rationale behind each piece.
+GUI. See STATUS.md for the phase-by-phase build and DECISIONS.md for the
+design rationale behind each piece.
 """
 
 import json

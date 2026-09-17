@@ -5,6 +5,12 @@ pipeline -- run by hand, same "re-validation tool" convention as
 _bench_llm.py. Spawns a real console window, moves it to a different
 real desktop, verifies three ways, and moves it back.
 """
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import subprocess
 import time
 

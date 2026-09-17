@@ -5,7 +5,7 @@ GGUF Q4_K_M, via llama-cpp-python -- benchmarked standalone first
 (16/17 correct on a realistic test set) before wiring in.
 
 Latency note (corrects an earlier claim in this docstring and in
-README.md's decision log): "~2.5-2.8s steady-state per call after the
+DECISIONS.md's decision log): "~2.5-2.8s steady-state per call after the
 one-time ~6s first-load cost" was measured by a benchmark that warmed
 the model up before timing anything, so it only ever measured a call
 with the KV cache already holding the system prompt's prefix.
