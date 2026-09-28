@@ -163,6 +163,19 @@ SCHEMA = {
 #     example's own formatting.
 #   - prose generally tightened to keep only what the grammar doesn't
 #     already enforce structurally.
+#   - the free-text-repo example's repo name is a fictional placeholder
+#     ("payments_api"), not a real one from this machine -- it used to be
+#     the user's actual "bdk_wallet". Confirmed live as a real failure
+#     mode, not a hypothetical one: with the one concrete repo name the
+#     model had ever seen being a real, frequently-used one, a bare "bdk"
+#     or other low-information utterance ("for what") reliably collapsed
+#     onto exactly that example rather than genuinely extracting a repo
+#     name from the utterance (focus_vscode_repo, repo="bdk_wallet",
+#     dispatched from single-word/noise input more than once -- see
+#     session.jsonl). A name with zero resemblance to anything the user
+#     would plausibly say removes it as an attractor without losing the
+#     example's actual teaching point (that repo is free text pulled from
+#     the utterance, not a closed enum).
 SYSTEM_PROMPT_TEMPLATE = f"""You turn a spoken command into a structured action, or handle small talk yourself. Reply with ONLY a JSON object, no other text, no extra whitespace.
 
 Fields:
@@ -185,7 +198,7 @@ Examples:
 "open chrome"->{{"action":"focus_or_launch_app","app":"chrome","direction":"none","repo":"","reply":""}}
 "maximize chrome"->{{"action":"maximize_app","app":"chrome","direction":"none","repo":"","reply":""}}
 "go to the next desktop"->{{"action":"switch_desktop","app":"none","direction":"next","repo":"","reply":""}}
-"switch to the bdk wallet window in vscode"->{{"action":"focus_vscode_repo","app":"vscode","direction":"none","repo":"bdk_wallet","reply":""}}
+"switch to the payments api window in vscode"->{{"action":"focus_vscode_repo","app":"vscode","direction":"none","repo":"payments_api","reply":""}}
 "how many files are in this folder"->{{"action":"count_files_in_folder","app":"none","direction":"none","repo":"","reply":""}}
 "what's on my screen right now"->{{"action":"describe_screen","app":"none","direction":"none","repo":"","reply":""}}
 "what's playing right now"->{{"action":"now_playing","app":"none","direction":"none","repo":"","reply":""}}

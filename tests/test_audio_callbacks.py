@@ -82,6 +82,11 @@ def _callbacks_from_a_live_main(monkeypatch):
     monkeypatch.setattr(main, "IntentMatcher", _FakeMatcher)
     monkeypatch.setattr(main, "WakeWordModel", lambda **k: _FakeWakeWord())
     monkeypatch.setattr(main, "SileroVAD", _FakeVad)
+    # Boot starts this before either InputStream call above -- without
+    # this it's a real COM polling thread against whatever render
+    # device this machine has, not the fake one this module promises.
+    monkeypatch.setattr(main.output_monitor, "start", lambda: None)
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: False)
     with pytest.raises(_StopHere):
         main.main()
     assert len(captured["callbacks"]) == 2

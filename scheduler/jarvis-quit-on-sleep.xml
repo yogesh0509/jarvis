@@ -11,7 +11,7 @@
   Why quit at all rather than ride through the suspend: audio devices are
   a known weak spot across a real sleep/wake cycle - a capture stream can
   come back in a broken state that's invisible from outside. See
-  USER_GUIDE.md section 5 for the full reasoning.
+  USER_GUIDE.md's "States" section for the full reasoning.
 -->
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -45,7 +45,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -WindowStyle Hidden -Command "cd {{JARVIS_DIR}}; .\.venv\Scripts\python.exe jarvisctl.py quit"</Arguments>
+      <Arguments>-NoProfile -WindowStyle Hidden -Command "cd {{JARVIS_DIR}}; .\.venv\Scripts\python.exe jarvisctl.py quit silent"</Arguments>
     </Exec>
   </Actions>
 </Task>

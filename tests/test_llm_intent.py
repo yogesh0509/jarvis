@@ -207,6 +207,20 @@ def test_system_prompt_template_stays_within_a_shrink_budget():
     assert len(SYSTEM_PROMPT_TEMPLATE) < 3600
 
 
+def test_prompt_repo_example_is_not_a_real_user_repo_name_regression():
+    # Confirmed live as a real failure mode: with "bdk wallet"/"bdk_wallet"
+    # as the only concrete focus_vscode_repo example the model had ever
+    # seen, bare noise ("bdk", "for what") reliably collapsed onto that
+    # exact example instead of genuinely extracting a repo name from the
+    # utterance -- see DECISIONS.md's "Mid-session wake-word swallow, and
+    # the 'bdk wallet' false dispatches". The example now uses a fictional
+    # placeholder; this pins that so a future edit doesn't quietly bring a
+    # real repo name back into the one example the model gets to imitate.
+    from llm_intent import SYSTEM_PROMPT_TEMPLATE
+
+    assert "bdk" not in SYSTEM_PROMPT_TEMPLATE.lower()
+
+
 def test_rejects_no_match_missing_from_action_enum_regression():
     # "no_match" must be accepted as its own outcome, never treated as
     # an unrecognized/malformed action (that would silently collapse it

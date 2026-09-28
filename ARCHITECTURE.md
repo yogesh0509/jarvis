@@ -66,6 +66,12 @@ vad.py               Silero VAD wrapper (speech/silence probability per frame)
 virtual_desktop.py   IVirtualDesktopManager COM wrapper (current-desktop check)
 tts.py               Piper TTS playback, mic-mute-while-speaking, persistent
                       output stream
+output_monitor.py    detects whether the system's default audio output is
+                      playing anything at all -- Spotify, a video, anything,
+                      not just Jarvis's own voice (tts.py's is_speaking()
+                      only covers that) -- via IAudioMeterInformation on the
+                      render endpoint; gates wake-word detection and session
+                      dispatch while it's true (push-to-talk is unaffected)
 hud.py               the terminal display -- single locked writer for all
                       user-facing output, pinned status bands, live mic meter,
                       in-place line rewriting. `python hud.py` runs a

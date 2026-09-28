@@ -47,6 +47,7 @@ def _reset_hud_state():
     hud._hud._level = 0.0
     hud._hud._raw_level = 0.0
     hud._hud.debug = False
+    hud._hud.last_render_error = None
 
 
 @pytest.fixture
@@ -82,6 +83,30 @@ def test_every_content_method_renders_without_error(captured):
     assert "open chrome for me" in out
     assert "Already up on this desktop, sir." in out
     assert "\x1b[" in out
+
+
+def test_raw_write_failure_is_swallowed_not_propagated(captured, monkeypatch):
+    """
+    Confirmed live via session.jsonl's threading.excepthook record: a
+    plain out.write() call raised OSError("[WinError 1] Incorrect
+    function"), and with _raw unguarded that propagated straight out of
+    main.py's on_press (a bare hud.line() call, no try/except of its
+    own) into `keyboard`'s single shared hook-processing thread, killing
+    it outright -- push-to-talk dead for the rest of the process's life.
+    hud.line() must never raise, whatever the underlying stream does.
+    """
+
+    class _ExplodingStream:
+        def write(self, text):
+            raise OSError(1, "Incorrect function")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(hud._hud, "_stream", _ExplodingStream())
+    hud.line("this should not raise", "system")
+    assert hud._hud.last_render_error is not None
+    assert "Incorrect function" in hud._hud.last_render_error
 
 
 def test_pending_is_rewritten_in_place_not_appended(captured):

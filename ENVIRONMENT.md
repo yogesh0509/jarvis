@@ -48,8 +48,30 @@ under the base interpreter (`C:\Users\agraw\...\Python312\python.exe`).
 Reproduced with zero project imports, so it's not our code; almost
 certainly the same security software again, doing some kind of
 process-reputation check by shadow-executing new/unrecognized binaries.
-The child has never been observed to reach real program logic (a log-write
-smoke test only ever saw the parent's PID) but `main.py` takes a named
-mutex (`_acquire_single_instance_lock`) as a hard guarantee regardless --
-correct practice for an autostart background service anyway, independent
-of this quirk.
+`main.py` takes a named mutex (`_acquire_single_instance_lock`) as a hard
+guarantee regardless -- correct practice for an autostart background
+service anyway, independent of this quirk.
+
+**Correction (2026-09-17): which of the two processes is real was
+recorded backwards here.** This previously said the base-interpreter
+child "has never been observed to reach real program logic (a log-write
+smoke test only ever saw the parent's PID)". Measured directly against a
+running Jarvis:
+
+| PID | Executable | RAM | Threads | CPU |
+|---|---|---|---|---|
+| 32584 | `D:\jarvis\.venv\Scripts\python.exe` | 4 MB | 1 | 0.02s |
+| 26320 | `...\Python312\python.exe` | 1250 MB | 56 | 380s |
+
+The **base-interpreter process is the entire application** -- it owns the
+control socket on 47123, holds the microphone, and has Whisper and the
+GGUF model loaded. The venv process sits at one thread in
+`Wait`/`UserRequest` for the child's lifetime. The earlier smoke test
+presumably attributed the log write to the wrong PID.
+
+Two practical consequences, both of which cost real debugging time on
+09-17: the process to inspect (RAM, handles, thread state, mic ownership)
+is the base-interpreter one, not the one whose command line names the
+venv; and Windows' microphone consent store attributes Jarvis's mic use
+to `Python312\python.exe`, which reads alarmingly like an unrelated
+stray Python until you know this.

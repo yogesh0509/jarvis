@@ -146,3 +146,51 @@ def test_an_unknown_command_never_reaches_the_socket(monkeypatch, capsys):
     code, out = _run_client(monkeypatch, capsys, 1, "detonate")
     assert code == 1
     assert "Usage:" in out
+
+
+def test_quit_silent_reaches_the_server_as_one_command(monkeypatch, capsys):
+    # The sleep-triggered task's whole purpose: skip the spoken goodbye
+    # so the teardown finishes before Windows suspends the audio stack,
+    # rather than straddling the suspend and closing streams onto a
+    # driver that is reinitialising on the other side.
+    received = []
+
+    def handler(conn):
+        with conn:
+            received.append(conn.recv(64))
+            conn.sendall(b"powering down, sir")
+
+    port, thread = _serve_once(handler)
+    code, out = _run_client(monkeypatch, capsys, port, "quit", "silent")
+
+    assert code == 0
+    assert received == [b"quit silent"]
+    assert "powering down, sir" in out
+    thread.join(timeout=5)
+
+
+def test_a_bare_quit_still_gets_the_goodbye(monkeypatch, capsys):
+    # Opt-in, not the default -- anyone quitting by hand wants the
+    # spin-down and the sign-off.
+    received = []
+
+    def handler(conn):
+        with conn:
+            received.append(conn.recv(64))
+            conn.sendall(b"powering down, sir")
+
+    port, thread = _serve_once(handler)
+    code, _out = _run_client(monkeypatch, capsys, port, "quit")
+
+    assert code == 0
+    assert received == [b"quit"]
+    thread.join(timeout=5)
+
+
+def test_an_unknown_quit_argument_never_reaches_the_socket(monkeypatch, capsys):
+    # Same client-side validation the other arguments get: the server
+    # matches "quit silent" exactly, so a typo must not arrive as
+    # something it half-recognises.
+    code, out = _run_client(monkeypatch, capsys, 1, "quit", "quietly")
+    assert code == 1
+    assert "Usage:" in out

@@ -41,6 +41,9 @@ jarvis start
 # control an already-running instance (talks to localhost:47123)
 jarvis status | stats | pause | resume | quit
 jarvis debug [on|off]        # toggle terminal verbosity without restart
+jarvis quit silent           # skip the spoken goodbye -- the sleep task uses
+                             # this so the audio teardown finishes before
+                             # Windows suspends (see scheduler/README.md)
 
 # tests — no audio device, no models, no window manager required
 .\.venv\Scripts\python.exe -m pytest
@@ -108,6 +111,7 @@ any action with real side effects like delete/send).
 | `vad.py` | Silero VAD wrapper — carries recurrent state, so never share one instance across independent audio streams |
 | `virtual_desktop.py` | `IVirtualDesktopManager` COM wrapper (current-desktop check); thread-local, `CLSCTX_INPROC_SERVER` |
 | `tts.py` | Piper TTS playback, mic-mute-while-speaking (count-based, not boolean), persistent output stream with device-failure recovery |
+| `output_monitor.py` | detects whether the system's default audio output is playing anything at all (Spotify, a video, anything -- not just Jarvis's own voice) via `IAudioMeterInformation`; gates wake-word detection and session dispatch while true, push-to-talk unaffected |
 | `hud.py` | single locked writer for all user-facing terminal output; degrades to plain `print()` when stdout isn't a terminal |
 | `earcons.py` | short non-verbal audio cues synthesized with numpy at import; routed through `tts._begin_speaking`/`_end_speaking` so they get mic-muted too |
 | `phrases.py` | reply phrasing as pools of variants — the one file to change for wording/tone |
@@ -126,14 +130,42 @@ any action with real side effects like delete/send).
 - **Audio device streams are opened once at startup and kept open for the
   process's life**, never per-call/per-press. A freshly-opened Windows
   audio device reliably glitches its first chunk(s), both directions.
+- **A running audio stream is not the same as a working one.**
+  `INPUT_WATCHDOG_SECONDS` only catches a stream that stopped calling
+  back; `INPUT_SILENCE_SECONDS` catches one still running but delivering
+  constant digital silence (a wedged capture driver). Never infer "audio
+  is arriving" from "callbacks are arriving" — see DECISIONS.md's "Input
+  health" section for the incident and the amplitude-vs-variation test
+  it led to.
+- **Every touch of `main.py`'s shared `stream` variable must hold
+  `_stream_lock`.** It's written from two threads (the listener's own
+  watchdog/reopen, and the control-socket thread's pause/resume/quit)
+  with no other synchronization between them — audit-confirmed to leave
+  two capture streams open concurrently under a pause/resume-vs-reopen
+  race. Never reuse `_processing_lock` for this — it can be held up to
+  30s by an in-flight LLM call, and a pause must not wait behind that.
+  See DECISIONS.md's "stream-lock race" section.
+- **System audio output (Spotify, a video, a call) is a different
+  problem from Jarvis hearing its own voice.** `is_speaking()` only
+  covers Jarvis's own TTS; `output_monitor.py` gates wake-word detection
+  and session dispatch while *anything* is playing through the speakers
+  — confirmed necessary after a real false-trigger (a session opened on
+  music, with lyrics dispatched as volume commands). Push-to-talk stays
+  exempt, same as every other override here. See DECISIONS.md's "System
+  output" section.
 - **Fail closed, not open**, for anything security/correctness-adjacent
   (e.g. virtual-desktop membership checks) — a redundant extra window is
   a fine worst case; silently doing the wrong destructive-adjacent thing
   is not.
-- **The listener loop must never die on an unhandled exception.** `main.py`
-  wraps the whole mode-dispatch block in try/except, logs, speaks an
-  apology, and resets to a known-good state — a silently-dead listener
-  thread is worse than any single misfire.
+- **The listener loop must never die on an unhandled exception, and
+  containment starts at the mode-dispatch `try:`, not the top of the
+  loop.** `main.py` wraps the whole mode-dispatch block in try/except,
+  logs, speaks an apology, and resets to a known-good state — but
+  anything added between `audio_q.get()` and that `try:` runs uncontained
+  and needs its own try/except, or it can kill the thread silently while
+  `jarvis status` keeps reporting healthy (this has happened once
+  already). `threading.excepthook` logs any thread that dies to
+  `session.jsonl` as a backstop. See DECISIONS.md for the full account.
 - Structured event logging goes to `logs/session.jsonl` regardless of what
   the HUD chooses to display — the HUD is a view, not the source of truth.
 - `phrases.pick()` never returns the same variant twice in a row for a

@@ -14,11 +14,15 @@ design choice from scratch. Project overview and setup live in
 - [Listening: wake-word sessions, not per-command push-to-talk](#listening-wake-word-sessions-not-per-command-push-to-talk)
 - [Push-to-talk: a persistent stream, not one opened per press](#push-to-talk-a-persistent-stream-not-one-opened-per-press)
 - [Reliability: the listener thread doesn't die on error anymore](#reliability-the-listener-thread-doesnt-die-on-error-anymore)
+- [Input health: a running stream that hears nothing](#input-health-a-running-stream-that-hears-nothing)
+- [The stream-lock race: two threads, one capture device](#the-stream-lock-race-two-threads-one-capture-device)
+- [System output: Spotify is not Jarvis's own voice](#system-output-spotify-is-not-jarviss-own-voice)
 - [State-machine audit against the documented diagram](#state-machine-audit-against-the-documented-diagram)
 - [Command-line control (`jarvisctl.py`), not a tray icon](#command-line-control-jarvisctlpy-not-a-tray-icon)
 - [Idle unload after 30 minutes ("deep sleep")](#idle-unload-after-30-minutes-deep-sleep)
 - [Transcription accuracy](#transcription-accuracy)
 - [Intent resolution: local embedding match, local LLM fallback](#intent-resolution-local-embedding-match-local-llm-fallback)
+- [Mid-session wake-word swallow, and the "bdk wallet" false dispatches](#mid-session-wake-word-swallow-and-the-bdk-wallet-false-dispatches)
 - [Latency: what the ">30s" actually was, and what changed](#latency-what-the-30s-actually-was-and-what-changed)
 - [Virtual-desktop awareness](#virtual-desktop-awareness)
 - [Screen and window context](#screen-and-window-context)
@@ -123,9 +127,228 @@ one"), and resetting to a known-good `wake` state instead of letting the
 thread die, so any *future* unhandled exception (this one or a new one)
 degrades gracefully instead of silently going deaf.
 
+**The containment has a boundary, and it was crossed once already.** The
+try/except above wraps the mode-dispatch block specifically -- it starts
+at that `try:`, not at the top of the loop. When the output-gate check
+(`output_monitor.py`, see "System output" below) was added between
+`audio_q.get()` and that `try:`, it ran uncontained: on its very first
+falling edge, an exception there killed the listener thread outright,
+about 5 seconds after boot, while `jarvis status` went on reporting
+"Wake-word armed" to a room nothing was listening to. Nothing printed it
+either -- under `jarvis start`, Python's default `threading.excepthook`
+writes to a terminal nobody reads. Two fixes, not one: the output-gate
+check itself now has its own try/except, and `main.py` installs
+`_log_dead_thread` as `threading.excepthook` so *any* thread that dies,
+from any future addition in this gap, is recorded to `session.jsonl`
+instead of vanishing silently. The lesson generalizes: anything inserted
+between the queue read and the mode-dispatch `try:` needs its own
+containment -- it is not covered by proximity to code that is.
+
+## Input health: a running stream that hears nothing
+
+Every liveness signal in this process answered the wrong question.
+
+`INPUT_WATCHDOG_SECONDS` fires from the `queue.Empty` branch of
+`listener_loop` -- it can only ever notice a stream that **stopped**.
+`state["main_last_chunk"]` is stamped inside `audio_callback` regardless
+of what the callback was handed. The listener heartbeat, the HUD's level
+meter, the `jarvis status` line: all of them confirm the machinery is
+turning, none of them look at what is going through it.
+
+So a capture device that keeps calling back on schedule while delivering
+pure digital silence is invisible to all of it, and that is not a
+hypothetical. On 2026-09-17, after a 13-hour suspend, the Intel SST
+driver reloaded its DSP firmware on resume and came back handing over a
+constant `1/32768` -- one 16-bit LSB, identical every frame, on every
+host API and every device index. Windows admitted nothing: endpoint
+active, unmuted, 100%, Device Manager `OK`, and its own peak meter
+**pinned at exactly `1.000000`**, which is itself a stuck reading rather
+than a plausible one. `jarvis status` said "Wake-word armed (awake) · LLM
+warm" for 50 minutes. Push-to-talk bailed at its VAD gate every time,
+printing to the HUD and logging nothing, so the session log contained no
+evidence that anything had been tried at all.
+
+Three changes, and the ordering of their importance is the point:
+
+1. **Say it.** `input_silent` latches after `INPUT_SILENCE_SECONDS` of
+   unbroken silence and `_status_line` appends `NO MIC SIGNAL`. This
+   matters most, because the status line is read precisely when
+   something is already suspected, and "armed" was an active lie.
+2. **Log it.** An `input_silent` event, and a peak on push-to-talk's
+   no-speech bail -- which is otherwise indistinguishable after the fact
+   from someone holding the key and saying nothing.
+3. **Try a reopen.** Once, not repeatedly. The recoverable version of
+   this exists, but a wedged *driver* survives a reopen and survives a
+   full process restart (both confirmed here), so retry loops would only
+   bury the log line that actually matters.
+
+The window is two minutes -- long enough that a silent room at 3am never
+trips it, short enough to catch a dead device inside one sitting.
+Detection only; see `KNOWN_LIMITATIONS.md` for the open question of what
+*causes* the wedge and `scheduler/README.md` for the silent-quit change
+that removes Jarvis's most plausible contribution to it.
+
+### Correction: amplitude alone was the wrong test
+
+This section originally said the floor was "deliberately just above one
+LSB: the wedged signature is exactly `3.05e-5`, and a genuinely quiet
+room still fluctuates well above that." **The second half of that was
+wrong, and it was never measured -- it was assumed.** Measured properly
+on the same Intel SST array afterwards, in an ordinary quiet room:
+
+```
+frames=187   below-1e-4 frames=182 (97.3%)
+distinct values among the quiet frames: 3  -> 1, 2 and 3 x LSB
+```
+
+**97% of frames in a normal quiet room sit under the floor**, because
+the DSP's own noise suppression floors a quiet room to 1-3 LSB. So the
+floor-only latch could not tell "dead device" from "nobody is talking",
+and in practice it fired on ordinary silence roughly every two minutes,
+each time reopening a perfectly healthy capture stream -- on a driver
+this project already knows is fragile, and with the documented
+cold-open glitch on every reopen. Reported from the HUD, where it showed
+up as an endless pair of warnings.
+
+What actually separates the two states is **variation, not level**:
+
+| | peak level | distinct values |
+|---|---|---|
+| wedged converter | ~1 LSB | **exactly one**, forever |
+| quiet room | 1-3 LSB | several, dithering |
+
+So the latch now requires both conditions: under the floor for the whole
+window **and** every quiet frame carrying the exact same value
+(`INPUT_SILENCE_CONSTANT_ONLY`). A live converter dithers; a frozen one
+repeats. Erring toward "silence is normal" is deliberate -- a false
+alarm costs a scary message plus a needless reopen of a healthy stream,
+while a late detection costs only lateness.
+
+The general lesson, worth keeping: **an assumption about what the
+hardware does is not evidence about what the hardware does.** The
+original floor was picked from a single measurement of the *broken*
+state without ever measuring the *healthy* one it had to be
+distinguished from.
+
+## The stream-lock race: two threads, one capture device
+
+Asked directly, after a second mic-wedge incident: is Jarvis's own state
+management causing this, independent of the sleep-suspend timing already
+fixed? Auditing every touchpoint of `main.py`'s shared `stream` variable
+(the main capture stream, reassigned across pause/resume/reopen/quit)
+found a real one: **nothing synchronized it at all.**
+
+Four sites wrote it, across two threads, with no lock:
+
+- `_reopen_input_stream` (listener thread — the 5s watchdog, and the
+  silence latch above) stops/closes the old stream and creates a new one.
+- `_set_enabled`'s resume branch (control-socket thread) creates one if
+  `stream is None`.
+- `_set_enabled`'s pause branch (control-socket thread) stops/closes it.
+- `_shutdown` (control-socket thread, or `KeyboardInterrupt`) stops/
+  closes it.
+
+None of this needs a sleep cycle to matter. An ordinary `jarvis pause`
+landing at the same moment the listener thread's own watchdog decides
+the stream needs reopening is enough: a resume could see `stream is
+None` set by a reopen already in flight and open a *second* concurrent
+capture stream on the same physical device — the first orphaned, never
+stopped, its callback still attached — or a reopen's `stream.start()`
+could race a pause's `stream.close()` on the very same object. Confirmed
+this is not theoretical: a scratch copy of `main.py` with the lock
+stripped out reliably left more than one stream simultaneously open
+under a tight pause/resume-vs-reopen stress loop
+(`test_concurrent_reopen_and_pause_resume_never_leaves_two_streams_open`);
+with the lock restored, the same test holds regardless of how the two
+threads interleave.
+
+**Not confirmed as the cause of either past wedge incident** — both of
+those align cleanly with the sleep-quit timing race instead (see "Input
+health" above and `scheduler/README.md`'s "Why the sleep quit is
+silent"), and neither showed direct evidence of a pause/resume landing
+mid-reopen. But it's a real, previously-unsynchronized hazard regardless
+of whether it has ever actually fired, and exactly the kind of thing
+that could leave a flaky driver like Intel SST wedged without a sleep
+cycle anywhere in the picture.
+
+`_stream_lock` is a new, separate `threading.Lock()` — deliberately not
+`_processing_lock`, which can be held for up to 30s by an in-flight LLM
+call and which `_set_enabled`'s own docstring already refused to take
+for exactly that reason (pause is the privacy control; it must not wait
+behind a slow model call). `_stream_lock` only ever guards a few quick
+PortAudio calls, so serializing on it costs nothing pause couldn't
+already cost.
+
+## System output: Spotify is not Jarvis's own voice
+
+Reported directly: "Jarvis is listening to Spotify music and reacting
+based on it." Confirmed in `logs/session.jsonl` -- a session's worth of
+real fast-path dispatches (`volume_down`, `volume_up`) appeared shortly
+after Spotify started playing, with **no wake-word transcript anywhere
+between them and the previous logged session close**, and `peak: 1.0`
+on nearly every one of them. The wake word almost certainly
+false-triggered on the music itself and silently reopened a session --
+"almost certainly" because that transition had zero trace in the
+structured log until this incident (see `wake_triggered`, added
+immediately after).
+
+`is_speaking()` (tts.py) already solves the adjacent problem -- Jarvis
+hearing its own spoken replies -- but it is a counted flag scoped to
+Jarvis's *own* TTS stream specifically. It has no way to know anything
+about Spotify, a video, or any other app's audio, because nothing hooks
+into them. The only way to answer "is anything coming out of the
+speakers right now" without an integration into every app that might be
+playing something is to ask Windows directly: `output_monitor.py` polls
+`IAudioMeterInformation` on the default render endpoint (the same
+Core Audio API family already used by `virtual_desktop.py` and
+`monitors.py`) and exposes a debounced `is_output_playing()`.
+
+Two design choices worth recording:
+
+- **Gates wake-word detection and session dispatch, not just the fast
+  path.** The false trigger was in the *wake word itself*, not just a
+  transcript that happened to match a seed -- gating only dispatch would
+  have left the session-opening problem untouched. The check sits at the
+  same choke point `is_speaking()` already uses, ahead of the
+  `mode == "wake"` dispatch, so wake-word prediction itself is skipped
+  while output plays.
+- **Push-to-talk is deliberately exempt.** The alternative -- gating the
+  hotkey too -- would mean you could never voice-control the very thing
+  that's playing ("pause the music") without first turning it down,
+  which defeats a large fraction of what this project is for. Holding
+  Right Ctrl and talking over the music is the explicit override, same
+  as every other "keep working no matter what else is true" case
+  documented for it elsewhere.
+
+The trade-off this accepts, stated plainly: **"hey jarvis" (hands-free)
+will not fire while system output is playing.** This is not acoustic
+echo cancellation -- it doesn't attempt to isolate a real voice speaking
+over music, only answers "is the render endpoint active". A future
+"pause the music with your voice while it's still audibly playing"
+request would need actual AEC (subtracting a loopback reference from the
+mic signal), which this deliberately does not attempt.
+
+Two smaller decisions fell out of the debounce values chosen
+(`ON_SECONDS`/`OFF_SECONDS`, deliberately asymmetric): engaging fast
+matters more than releasing fast, because releasing too eagerly during
+an ordinary quiet beat mid-song would flap the gate open and shut
+constantly, while engaging slowly would let a moment of loud audio
+through before the gate catches up. Both are provisional starting
+points, same status as `VAD_SPEECH_THRESHOLD`/`WAKE_THRESHOLD` --
+reasonable, not measured, revisit from real data if either turns out
+wrong in practice.
+
+The deep-sleep idle-unload check (`DEEP_SLEEP_IDLE_SECONDS`) was hoisted
+out of the `mode == "wake"` dispatch block specifically because of this
+gate: left where it was, a long playlist playing uninterrupted for well
+over 30 minutes would have pinned the heavy models in memory for as long
+as the output kept playing, since the check would never have run at all
+while gated. It now runs independent of the output gate, immediately
+above it.
+
 ## State-machine audit against the documented diagram
 
-`USER_GUIDE.md` section 5 draws the runtime as a state diagram, and that
+`USER_GUIDE.md`'s "States" section draws the runtime as a state diagram, and that
 diagram was treated as the spec in an audit of what the code actually
 does. Eleven divergences; the ones worth recording here are the ones
 whose symptoms were visible but unattributable.
@@ -417,6 +640,130 @@ exists** -- deferred until an action with real side effects
 (delete/send/close-without-save) is added; the current allowlist is
 non-destructive by construction ("close" means minimize, never actually
 closing/quitting anything, per explicit user instruction).
+
+## Mid-session wake-word swallow, and the "bdk wallet" false dispatches
+
+Two user-reported bugs, both root-caused from `logs/session.jsonl` and
+`logs/llm_usage_log.jsonl` rather than guessed at:
+
+**"hey jarvis" sometimes does nothing for a few minutes, then works
+again unprompted.** Two separate causes were found under this one
+report, and the first one below is *not* the answer to it -- recorded
+that way deliberately, because the first fix shipped before the second
+cause was known, and reading this later without that order would be
+misleading.
+
+*Cause actually behind the reported dead window: int16 wraparound on
+the wake path.* `main.py`'s wake branch is the only place in the whole
+pipeline that converts audio to int16 (`openWakeWord` wants int16;
+Whisper takes float). It did so with a bare
+`(chunk * 32767).astype(np.int16)`, and `astype` **wraps rather than
+saturates**. float32 capture can exceed unity when an APO does gain/AGC
+ahead of the process -- this machine's mic runs Intel SST -- and every
+recent transcript in `session.jsonl` records a raw peak of exactly
+1.00, i.e. a capture path sitting at saturation. Measured directly:
+`[1.0, 1.05, 1.2, -1.3] * 32767` -> `[32767, -31131, -26216, 22939]`.
+A sample just over full scale comes back near-full-scale with the
+*opposite sign*, injected into the loudest part of the waveform -- for
+"hey jarvis", the part carrying the signal the model is looking for.
+That produces exactly the observed shape: intermittent, level-dependent,
+worse the louder you speak, recovering "on its own" because it is
+stochastic rather than latched. Decisively, it also explains the
+asymmetry the report kept pointing at -- **push-to-talk worked
+throughout every dead window**, and push-to-talk never touches this
+line. Fixed by clipping to [-1, 1] before scaling. The logged boot that
+misbehaved (19:14:47) rules out every stateful explanation on its own:
+no `wake_triggered` beforehand, so no session was open; the listener's
+own output-gate transitions are in the log *during* the dead window, so
+the thread was alive and ungated; no `input_silent`; and `ARMED` showing
+red is simply its defined colour, `(120, 28, 16)`, not a state desync.
+
+Two measurements were missing that would have made this findable in
+minutes rather than across several rounds, and both now exist: sub-
+threshold wake scores (`wake_near_miss`, logged as a 10s high-water mark
+above `WAKE_NEAR_MISS_FLOOR` -- only scores *over* the threshold were
+ever recorded before, so "it heard me and scored 0.45" and "it heard
+nothing" were indistinguishable), and `listener_gate_stuck`, which names
+which of the four skip gates is up once a stretch passes 30s. `jarvis
+status` also reports `speaking` now, since a leaked tts count is the one
+of those gates that can latch forever. Relatedly, `tts._speak_now`'s
+`_get_voice()` call sat *outside* the try/finally that owns
+`_end_speaking()` -- the one call in that function that does heavy
+first-use work, and therefore the one that can throw and leak the count
+permanently; moved inside.
+
+*Cause found first, real but separate: a session already open swallows
+the wake word.* `wake_model.predict()` only ever runs in the
+`listener_loop`'s `"wake"` mode -- once a session is open
+(`"session_listening"`/`"session_recording"`), every subsequent
+utterance is VAD-segmented and transcribed as a *command*, never
+re-checked against the wake model, and the session only closes itself
+after `SESSION_IDLE_TIMEOUT_FRAMES` (4 minutes) of silence. Saying "hey
+jarvis" again while a session is (unexpectedly, from the user's
+perspective) still open doesn't re-arm anything -- it falls through to
+the fast-path matcher (no seed matches a bare wake phrase), then a full
+LLM fallback call, and comes back as the generic "Hello, sir. How may I
+assist you today?" reply. That reads as "the wake word didn't work,"
+prompting a retry, when what actually happened is the opposite: it was
+heard, just not *as* a wake word. Confirmed directly: dozens of "hey
+jarvis"/near-miss transcriptions ("hey jobters", "hey job is", "hey
+jobbers") appear in the log as ordinary `transcript` events rather than
+`wake_triggered` events. Compounding this, the idle-timeout close
+(`session_silence_run >= SESSION_IDLE_TIMEOUT_FRAMES`) was the one
+session-close path with **zero trace in session.jsonl** -- every other
+close goes through `_record_stat`'s `"meta"`/`session_close` outcome,
+this one didn't call `_log_event` at all, which is exactly backwards
+for the path most likely to explain "it started working again on its
+own." Fixed two ways: a bare wake-word echo (`"hey jarvis"`/`"jarvis"`,
+already recognized by `_should_reject_transcript`'s `wake_echo` check,
+now shared via the `_WAKE_ECHO_PHRASES` constant) landing mid-session is
+now intercepted before fast-path/LLM matching, acknowledged instantly
+with the existing `already_listening` phrase pool, and refreshes
+`last_activity` -- no more multi-second LLM round trip for a phrase that
+was never going to match anything; and the idle-timeout close now logs
+a `session_idle_closed` event, closing the observability gap for next
+time.
+
+**Bare noise (`"bdk"`, `"for what"`) dispatching `focus_vscode_repo`
+with `repo="bdk_wallet"`.** Not the LLM "being sensitive" in the sense
+of picking up real ambient words -- two separate self-inflicted biases
+compounding:
+- `TRANSCRIBE_HOTWORDS` (see Transcription accuracy above) used to carry
+  a tail of the user's real repo/project names ("bdk wallet bdk cli
+  Hashstack djed shu programming bitcoin bitshala") for
+  `focus_vscode_repo` recognition. `llm_usage_log.jsonl` showed this
+  tail coming back as **literal transcribed text from near-silent
+  audio** ("shu programming bitcoin bitshaka", "how many files folder
+  windows bdk wallet bdk wallet") -- hotwords biases decoding *toward*
+  these tokens regardless of what's actually in the audio, and the more
+  obscure/low-frequency a word, the more that reads as a hallucination
+  magnet rather than a helpful nudge. Removed; app names, desktop/window
+  vocabulary, and query phrasing stay, since none of those showed up as
+  hallucinated output.
+- `llm_intent.py`'s few-shot prompt had exactly one concrete example of
+  `focus_vscode_repo`'s free-text repo extraction, and it used the same
+  real repo name ("bdk wallet" -> `repo="bdk_wallet"`). With only one
+  worked example ever shown to the model, low-information input
+  reliably collapsed onto it rather than genuinely extracting a repo
+  name -- confirmed directly: bare `"bdk"` and `"for what"` both
+  resolved to `focus_vscode_repo`/`repo="bdk_wallet"`. Replaced with a
+  fictional placeholder (`"payments_api"`) that keeps the same teaching
+  point (repo is free text, not a closed enum) without being an
+  attractor for anything the user would plausibly say.
+- The pre-LLM transcript gate (`_should_reject_transcript`,
+  `TRANSCRIPT_GATE_ENFORCED`) already flagged both `"bdk"` dispatches
+  via `avg_logprob` in shadow mode, and would have blocked them had it
+  been enforced. **Left disabled, deliberately, after checking the
+  actual shadow data rather than flipping it on** -- real, legitimately
+  dispatched utterances in the same log ("how many files", asked
+  repeatedly) score `avg_logprob` as low as -2.11, inside the same range
+  as the noise it's meant to catch (`"bdk"` at -1.83/-2.58, `"for what"`
+  at -2.58). A single global threshold on this signal, at the current
+  sample size, cannot separate the two without also rejecting a real,
+  frequently-used command. The gate keeps logging
+  `transcript_would_reject` either way; revisit enforcing it once there
+  is enough shadow data to place a threshold below the real-command
+  floor, not just above the most obvious noise.
 
 ## Latency: what the ">30s" actually was, and what changed
 

@@ -6,7 +6,7 @@
 .DESCRIPTION
     These three tasks are the entire implementation of the "starts at
     login, quits on sleep, comes back on wake" behaviour that
-    USER_GUIDE.md section 5 draws as a state diagram. Nothing in the
+    USER_GUIDE.md's "States" section draws as a state diagram. Nothing in the
     Python code observes power events at all. They lived only in the live
     Task Scheduler database until now, which meant the documented
     behaviour had no backing artifact anywhere in the repo -- not

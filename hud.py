@@ -368,9 +368,28 @@ class _Hud:
         return f"{_bg(tuple(int(c) for c in self._colour))}  {_RESET} "
 
     def _raw(self, text):
-        out = self._out()
-        out.write(text)
-        out.flush()
+        try:
+            out = self._out()
+            out.write(text)
+            out.flush()
+        except Exception:
+            # A single console write can transiently fail on Windows
+            # (confirmed live: OSError "[WinError 1] Incorrect function"
+            # out of a plain out.write() call, via session.jsonl's
+            # threading.excepthook record) -- and unlike every other HUD
+            # entry point, this one is also reached directly from
+            # arbitrary caller threads, not just the already-guarded
+            # render loop below. Left unguarded, that OSError propagated
+            # straight out of main.py's on_press (a bare hud.line() call,
+            # no try/except of its own) and into `keyboard`'s single
+            # shared hook-processing thread, killing it outright --
+            # push-to-talk dead for the rest of the process's life, with
+            # nothing to show for it but the crash record itself. Same
+            # "must never take an unrelated thread down" reasoning as
+            # every audio callback in this codebase; worst case here is
+            # one dropped display line, recorded the same way
+            # _render_loop already records its own failures.
+            self.last_render_error = traceback.format_exc()
 
     def _finalize_pending(self, newline=True):
         if self._pending is not None:

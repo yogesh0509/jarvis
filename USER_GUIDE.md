@@ -1,290 +1,67 @@
 # Jarvis -- User Guide
 
-A walkthrough of how Jarvis behaves day to day: when it starts, what it's
-doing at each stage, what you can actually say to it, the different "off"
-states and what each one means, and how to control it. Written from what
-you'd actually experience -- implementation details live in `README.md`
-instead.
+What you can say to Jarvis, the states it can be in, and the `jarvis`
+command line. For the reasoning behind any of this -- real bugs,
+measurements, rejected alternatives -- see `DECISIONS.md`; for open
+issues and recovery steps, see `KNOWN_LIMITATIONS.md`.
 
-## 1. Starting up
+## What you can say
 
-Jarvis starts **automatically every time you log into Windows** -- you
-don't need to launch anything yourself. A full-screen console window
-opens with its own look (dark background, the Mark III suit's red and
-gold mixed with the original cyan HUD accents), showing a running
-commentary of everything it hears and does as it happens. You can
-minimize or un-fullscreen it (the usual Windows shortcuts work), but
-leave it running -- closing that window's own **X** button also stops
-Jarvis, though less cleanly than the quit command (section 7): Windows
-just ends the process directly rather than it shutting itself down in
-an orderly way. No lasting harm either way, but prefer `jarvis quit`
-when you can.
+Paraphrasing works -- these are representative, not exhaustive. Anything
+unrecognized gets a spoken "not sure how to do that yet" instead of
+being ignored, and nothing in the current command set is destructive
+(nothing deletes, sends, or closes an app without minimizing first).
 
-On startup, it spends several seconds loading (transcription model, the
-wake-word listener, the command-matching model), visible as a few
-status lines in that window. During that handful of seconds it isn't
-listening for "hey jarvis" yet. Once loaded, it's live -- and says so
-out loud ("Online and at your service, sir").
+**Talking to it**
+- "hey jarvis", wait for "Yes, sir?", then speak -- hands-free, for everyday use
+- Hold Right Ctrl, speak, let go -- push-to-talk; works in any state, including paused
+- "hey jarvis" won't trigger while system audio (music/video/a call) is playing through the speakers -- push-to-talk always works instead, even to control that audio itself
+- Hold Right Ctrl while it's talking to cut off a long reply and speak immediately
+- An unfamiliar phrasing takes a couple seconds longer (local AI fallback) -- it says "One moment, sir" while it thinks; that's normal, not a hang
 
-It also starts the same way after your laptop wakes from sleep -- see
-the state diagram below, section 5.
-
-If you ever need to start it by hand (for instance, right after you've
-quit it -- see section 6), section 7 has the command.
-
-## 2. The two ways to talk to it
-
-**Wake word -- "hey jarvis".** Say it, then wait for the short "Yes,
-sir?" reply before speaking your command. This is the hands-free way,
-and it's the one meant for everyday use.
-
-**Push-to-talk -- hold Right Ctrl.** Hold the key down, speak, let go.
-This is a manual backup that works no matter what state Jarvis is in --
-even if it's fully paused (see section 5). If the wake word ever isn't
-cooperating, or you just prefer a physical key, this always works.
-
-The reason it works even while paused: push-to-talk listens on its own
-independent connection to your microphone, rather than relying on the
-same listening connection everything else uses. Holding Right Ctrl and
-speaking is a self-contained action every time, regardless of what state
-Jarvis was in a moment before.
-
-**Why the wait for "Yes, sir?" matters.** The wake-word engine needs a
-brief window of audio to actually recognize "hey jarvis," so it confirms
-a beat after you've finished saying it. If you start your command
-immediately with no pause, the very start of it can get spoken before
-Jarvis has really switched into listening mode, and come out clipped or
-mis-transcribed. The spoken cue is the reliable signal that it's now
-actually listening -- wait for it, then speak.
-
-## 3. What you can say
-
-A representative list, not exhaustive -- paraphrasing is the whole
-point, so close variations of any of these should work too. Anything not
-covered gets a brief "not sure how to do that yet" reply instead of
-being ignored, and (see section 4) it's spoken back to you now, not just
-shown in the window.
-
-**Apps.** Eight are hand-curated for precise matching (Chrome, Discord,
-VS Code, File Explorer, Settings, the D: drive, Windows Terminal, and
-Spotify), and many more are found automatically at startup by scanning
-your Start Menu -- Office apps, OneDrive, git tools, PowerShell, and
-whatever else you have installed, restart Jarvis to pick up anything
-newly installed:
-- "open chrome" / "bring up discord" / "open excel" -- brings it forward
-  if already open on this desktop, launches a fresh one otherwise
-- "minimize chrome" / "close discord" -- **"close" always means
-  minimize**, never actually quitting or closing the app
-- "maximize chrome" -- the other half of minimize
+**Apps** (Chrome, Discord, VS Code, File Explorer, Settings, D: drive, Windows Terminal, Spotify curated by name; anything else in your Start Menu found automatically)
+- "open chrome" / "bring up discord" -- brings it forward if open, launches it otherwise
+- "minimize chrome" / "close discord" -- **"close" always means minimize**, never quits an app
+- "maximize chrome"
 - "how many chrome windows are open" -- counts across every desktop
-- If you name an app that genuinely isn't installed/registered, it says
-  so honestly ("I don't have Photoshop registered, sir") rather than
-  guessing at the closest thing it does have.
-- **Several windows of the same app open?** "bring up chrome" picks the
-  one on your current monitor, prefers one already visible over a
-  minimized one, and favours whichever you used most recently. Name what
-  you're after ("the chrome window with the football stream", "the
-  GitHub one") to be specific, or just repeat the command within a few
-  seconds to cycle to the next one instead of the same window every time.
+- Several windows of the same app open? Name what you're after ("the chrome window with the football stream"), or repeat the command within a few seconds to cycle to the next one
+- An app that isn't installed/registered gets an honest decline, never a guess
 
-**Desktops:**
-- "switch to the next desktop" / "go to the previous desktop" -- next/
-  previous only; a specific number ("desktop 2") isn't supported yet and
-  gets an honest "I can only do next/previous, sir" instead of guessing
-- "snap this window to the left" / "snap right" -- Windows' own
-  half-screen snap, not a virtual-desktop change; whatever currently has
-  focus, no app name needed
+**Desktops**
+- "switch to the next/previous desktop" -- next/previous only, no specific numbers
+- "snap this window to the left/right" -- Windows' half-screen snap, whatever has focus
 
-**System controls (no app name needed -- act on the whole system or
-whatever has focus):**
-- "turn the volume up" / "turn it down" / "mute"
+**System controls**
+- "turn the volume up/down" / "mute"
 - "play" / "pause" / "skip this track" / "previous track"
-- "lock my computer" -- the one system control worth a heads-up: it
-  genuinely locks your screen (Win+L), the same as any other lock
+- "lock my computer" -- genuinely locks your screen
 
-**VS Code, by name:**
-- "switch to the bdk_wallet window in vscode" -- jumps to whichever open
-  VS Code window's title contains that name
+**VS Code**
+- "switch to the bdk_wallet window in vscode" -- jumps to the open window whose title contains that name
 
-**Read-only questions:**
-- "how many files are in this folder" -- reads whatever folder the
-  currently-focused File Explorer window is showing
-- "what's playing" / "what song is this" -- reads Spotify's currently
-  playing track; if Spotify's open but paused (or nothing's cued up),
-  it says so honestly rather than guessing at a track
+**Read-only questions**
+- "how many files are in this folder" -- the currently-focused File Explorer window
+- "what's playing" / "what song is this" -- Spotify's current track, or an honest "can't tell" if it's paused or idle
 
-**Screens.** Have a laptop plus an external monitor? Jarvis knows which
-is which:
-- "what's on my screen" -- describes whatever's focused, plus a quick
-  note on what's on the other screen
-- "what's on my laptop screen" / "what's on the monitor" / "what's on my
-  other screen" -- describes that screen specifically, grouped by app
-  rather than reading out every window title
-- "move this to my laptop screen" / "move this to the monitor" / "move
-  this to the other screen" -- sends whatever's currently focused to
-  that screen, resizing it to fit proportionally; a maximized window
-  stays maximized, just on the new screen
-- Numbered screens ("screen 2") aren't supported -- there's no reliable
-  way to know which physical screen a number would mean, so it declines
-  honestly and asks you to say "laptop" or "monitor" instead. The same
-  goes for moving a window to a different *virtual desktop* (not a
-  physical screen) -- Windows itself doesn't provide a safe way to do
-  that, so it's not supported, only switching which desktop you're
-  viewing is
+**Screens** (laptop + external monitor)
+- "what's on my screen" / "what's on my laptop screen" / "what's on the monitor" -- describes it, grouped by app
+- "move this to my laptop screen" / "move this to the monitor" -- moves the focused window there, resized to fit
+- Numbered screens ("screen 2") aren't supported -- say "laptop" or "monitor" instead
 
-**Small talk and general questions.** Anything that isn't a command at
-all -- a greeting, "what time is it", "tell me a joke" -- gets an
-in-character spoken reply instead of a flat "I don't understand".
-Genuinely offline: no weather, news, or live search, and it says so
-honestly rather than making something up. It also remembers the last
-app an action touched for one turn, so "open chrome" then "minimize it"
-works without repeating the app name.
+**Small talk**
+- Greetings, "what time is it", "tell me a joke" -- an in-character reply; genuinely offline, so no weather/news/live search, and it says so rather than making something up
+- "open chrome" then "minimize it" -- remembers the last app an action touched, for one turn
 
-**Dictation.** "take dictation" (only within an open conversation --
-say "hey jarvis" first) switches to typing out whatever you say next,
-word for word, into whatever window currently has focus -- notes,
-messages, a document, wherever your cursor is. Say "stop dictation" to
-go back to normal commands. See section 4a for the details.
+**Dictation**
+- "take dictation" (inside an open conversation) -- types out whatever you say next, word for word, wherever your cursor is
+- "stop dictation" to leave it -- **closing phrases get typed while dictating, not obeyed**, so this is the way out by voice (push-to-talk also works normally as an escape hatch)
 
-**Nothing destructive exists in the current command set** -- every
-action either brings something forward, minimizes/maximizes/moves it,
-snaps or switches desktops, adjusts volume/media, locks the screen, or
-reads something back to you. Nothing deletes, sends, or closes an app
-without minimizing first.
+## States
 
-## 4. A typical wake-word interaction, start to finish
-
-1. You say **"hey jarvis"**. It opens what's effectively a conversation
-   -- from here you don't need to say the wake word again for each
-   command.
-2. It replies **"Yes, sir?"** -- your cue that it's genuinely ready.
-   Wait for this before speaking (see section 2).
-3. You speak a command (e.g. "open chrome"). It figures out when you've
-   stopped talking on its own (it listens for a pause in your speech --
-   no button, no wake word needed), acts on it, and **speaks its reply
-   back to you** -- every reply is spoken now, not just a handful of
-   status lines.
-4. You can keep going -- say another command right after, and another.
-   Each one is handled the same way, still without repeating "hey
-   jarvis."
-5. When you're done, say a closing phrase -- **"power down"**, "stop
-   listening", "that's enough for now", "we're done", "go to sleep", or
-   similar -- and the conversation closes.
-6. **If you just walk away instead of saying a closing phrase**, it'll
-   close the conversation on its own after about 4 minutes of silence,
-   and say so as it does. "Silence" there means silence it actually
-   heard: time while it's speaking, or while you're holding Right Ctrl,
-   doesn't count toward it, so in a noisy room the real wait can be
-   longer than four minutes. A push-to-talk command counts as using it
-   and starts the four minutes over.
-
-While a conversation is open, if it doesn't understand what you said (or
-it's not something it knows how to do), it says so out loud and keeps
-listening for your next command -- the conversation doesn't end because
-of a command it didn't understand.
-
-**How long it takes.** Common phrasings (the ones in section 3) resolve
-almost instantly. A phrasing it hasn't seen before falls back to a small
-local AI model to figure out what you meant -- normally a couple of
-seconds, occasionally longer, and noticeably longer than that for the
-*first* fallback after Jarvis has just started or come back from deep
-sleep (it's loading that model fresh). The moment it's heard you, it
-prints and speaks an acknowledgment (**"One moment, sir"**) before that
-fallback runs, specifically so a longer wait doesn't look like it's gone
-unresponsive -- if you don't hear or see anything at all after speaking,
-something's actually wrong (see section 8), but a "one moment" followed
-by a pause is normal.
-
-**Interrupting it.** If a reply is running long and you want to cut it
-off and say something else, hold Right Ctrl -- push-to-talk always
-stops whatever Jarvis is currently saying, immediately, then starts
-listening for your new command.
-
-### 4a. Dictation mode
-
-Say **"take dictation"** (or "start dictating", "let's dictate
-something") inside an open conversation. From then on, whatever you say
-is typed out, word for word, into whatever window currently has
-focus -- switch focus to a document, a chat window, a notes app, before
-or while dictating, and that's where it goes. It stays in this mode
-across as many sentences as you like, same pause-to-segment behavior as
-a normal conversation. Say **"stop dictation"** (or "end dictation",
-"done dictating") to leave it and go back to normal commands.
-
-Dictation isn't matched against any command at all while it's
-active -- it's typed as-is, so a dictated sentence that happens to
-mention "open chrome" just gets typed, not executed. **That includes
-the closing phrases**: say "power down" while dictating and it gets
-typed out like anything else, rather than closing the conversation.
-
-The stop phrase is checked directly against what you said rather than
-guessed at, so it won't misfire on dictated text that merely sounds
-similar. It's the normal way out, but not the only one -- dictation also
-ends if the conversation times out on silence, if you pause Jarvis
-(either way), or if it hits an internal error and resets itself. Coming
-back from any of those leaves you in ordinary command mode, never still
-dictating. Push-to-talk also works normally while dictating, as a
-reliable escape hatch if you forget the stop phrase, or just to slip in
-a quick command without leaving dictation mode for your other
-utterances.
-
-## 5. The four states -- and what each one actually means
-
-Jarvis **says these out loud** as they happen (a short spoken line, not
-just the text in the window), including opening a conversation (the
-"Yes, sir?" cue) -- every state change and every command reply is spoken
-now.
-
-**a) Wake-word-armed (the normal resting state).** Not in an active
-conversation, just quietly waiting to hear "hey jarvis". This is where
-it is most of the time between uses. Within this state, after 30
-minutes of nothing happening (no wake word, no commands, no
-push-to-talk), it quietly lightens its own load in the background to
-save memory -- **deep sleep** ("Easing into low power mode, sir"). It's
-still listening for "hey jarvis" the entire time this happens; nothing
-about what you can say or do changes, it just takes a couple of extra
-seconds to fully "wake up" the first time you use it again after a long
-gap ("Back at full power, sir"). You don't need to do anything to
-trigger or undo this; it happens and reverses itself on its own.
-
-**b) Conversation open.** Covered in section 4 -- opened by saying "hey
-jarvis" (followed by the "Yes, sir?" cue), closed by a closing phrase or
-~4 minutes of silence.
-
-**c) Paused / mic off (manual, and the real privacy control).** This is
-the one genuine "stop listening entirely" state -- while paused, it is
-not listening for the wake word or anything else at all. You turn this
-on and off yourself, two ways:
-   - **By voice**: hold Right Ctrl (push-to-talk) and say "stop
-     listening" to pause ("Going dark, sir"), or "start listening" to
-     resume ("Back online, sir"). Push-to-talk is what makes this
-     reachable by voice even while paused, since nothing else is
-     listening at that point.
-   - **From the command line**: see section 7.
-
-   The difference between this and deep sleep is real: deep sleep still
-   hears "hey jarvis" and can be woken by voice; paused hears nothing
-   at all until you deliberately resume it (voice via push-to-talk, or
-   the command line).
-
-   Pausing also drops the transcription models, the same ones deep sleep
-   drops -- there's no point holding half a gigabyte resident for a mic
-   that's switched off. Resuming quietly loads them again in the
-   background, so a second or two after "Back online, sir" it's genuinely
-   back to normal rather than only looking it. You don't have to wait for
-   that or do anything about it; if you speak first, it just loads them
-   then instead.
-
-**d) Fully quit.** Stops completely -- not paused, not asleep, just not
-running ("Powering down. Goodbye, sir" -- said before it actually
-exits, not after, so it doesn't get cut off). See section 6 for how,
-and what happens afterward.
-
-### State diagram
-
-(Renders on GitHub as-is. For VS Code's Markdown preview
-(Ctrl+Shift+V) you need a Mermaid extension -- "Markdown Preview Mermaid
-Support" is the usual one; without it the block shows as plain text.)
+- **Wake-word armed** -- resting state, listening for "hey jarvis". After 30 idle minutes it quietly drops into **deep sleep** to save memory (still hears the wake word; a couple seconds slower to respond the first time back).
+- **Conversation open** -- opened by "hey jarvis", takes any number of commands until a closing phrase ("power down", "we're done", ...) or ~4 minutes of silence closes it.
+- **Paused** -- mic fully off, the real privacy control. Only push-to-talk ("stop listening" / "start listening" while holding Right Ctrl) or the command line can set this.
+- **Quit** -- not running at all. Closing the window (✕) also stops it, less cleanly than `jarvis quit`.
 
 ```mermaid
 stateDiagram-v2
@@ -317,208 +94,50 @@ stateDiagram-v2
     Running --> [*] : "jarvis quit",\nor system entering sleep
 
     note right of Running
-        Closing the laptop lid quits Jarvis
-        the moment sleep begins, and a fresh
-        copy starts the moment the system
-        wakes back up -- same as quitting and
-        starting it by hand, just automatic.
-        Whatever conversation/pause state it
-        was in before sleep is NOT restored;
-        it comes back wake-word-armed, awake.
+        Closing the laptop lid quits Jarvis the
+        moment sleep begins, and a fresh copy
+        starts the moment the system wakes back
+        up. Conversation/pause state is NOT
+        restored across this -- it comes back
+        wake-word-armed, awake.
     end note
 ```
+(GitHub renders this natively; VS Code's Markdown preview needs a Mermaid extension.)
 
-**Why Dictating is drawn inside the conversation, not beside it.** It's
-a mode *within* an open conversation, and the edge out of it is
-deliberately narrow: only the exact "stop dictation" phrase leads back
-to taking commands. A closing phrase said while dictating gets typed
-out, not acted on -- which is exactly why it's worth drawing as its own
-state rather than leaving it implied. The silence timeout, pausing, and
-push-to-talk all still behave normally from inside it (see section 4a).
+A few things the diagram alone doesn't show:
+- Closing/pausing share one word list ("power down", "stop listening", ...); resuming uses a different one ("start listening", "wake up") -- they aren't interchangeable.
+- "hey jarvis" never resumes from Paused, with or without Ctrl -- nothing is listening for it in that state. Only Ctrl + a resume word (or `jarvis resume`) works.
+- Saying a "stop" word without Ctrl only closes the conversation; the same word with Ctrl pauses entirely, conversation open or not.
 
-**Why quit-and-restart instead of just freezing in place through
-sleep?** Audio devices are a known weak spot across a real sleep/wake
-cycle -- a microphone connection can come back in a broken state after
-resuming, in a way that's invisible from the outside (the window looks
-fine, it just silently stops actually hearing anything). Restarting
-fresh sidesteps that entirely: a brand-new connection to the microphone
-every time you wake the laptop, rather than trying to detect and repair
-a possibly-broken one.
-
-### The two word lists -- and exactly when Ctrl matters
-
-It's tempting to think of this as "the same phrase, said with or without
-Ctrl" -- it's close, but not quite that. Two separate points to get right:
-
-1. **The words themselves differ by direction.** Closing a conversation
-   and pausing both use the *same* list -- "power down", "stop
-   listening", "we're done", "that's enough for now", "go to sleep", and
-   a few others. Resuming from paused uses a **different** list --
-   "start listening", "wake up", "come back online". These aren't
-   interchangeable; "power down" doesn't resume anything, and "start
-   listening" doesn't pause anything.
-
-2. **"hey jarvis" only ever does one job: opening a conversation from
-   the wake-armed state.** It is not a valid way to resume from paused,
-   with or without holding Ctrl -- while paused, nothing is listening
-   for the wake word at all (that's the whole point of that state), so
-   there's nothing to hear it. **Ctrl + "hey jarvis" does not bring it
-   back.** To resume from paused, it has to be Ctrl + one of the
-   *resume* words above (or the resume command).
-
-Where Ctrl actually matters: saying a "stop" word **without** Ctrl,
-inside an open conversation, only closes that conversation (back to
-wake-armed, still listening for "hey jarvis"). Saying the exact same
-word **while holding Ctrl** pauses it completely instead, regardless of
-whether a conversation happened to be open at that moment.
-
-## 6. How to stop it
-
-**To pause it temporarily** (you're stepping away, or just don't want
-it listening right now): say "stop listening" while holding Right Ctrl,
-or run `jarvis pause` (section 7). Bring it back the same way, in
-reverse.
-
-**To quit it entirely**: run `jarvis quit` (section 7), or press Ctrl+C
-in its console window -- both go through the same clean shutdown.
-There's no voice command for a full quit -- pausing covers the "I want
-it to stop listening" need, and a full quit is a more deliberate action
-best done from the keyboard/command line so it doesn't happen by
-accident.
-
-**Once quit, it stays off** until you either start it by hand again
-(section 7 -- `jarvis start`), or your laptop next wakes from sleep or
-you next log into Windows, both of which start it fresh automatically.
-
-**Closing your laptop lid does quit it -- on purpose, see section 5.**
-It comes back automatically the moment the laptop wakes, no different
-than logging in, just faster since Windows itself is already running.
-
-## 7. Controlling it from the command line
-
-`jarvis <command>`, from anywhere -- open a **new** terminal window
-first if you've just had this set up, since a window opened before
-today won't know about the command yet:
-
-```
-jarvis start      # launch it (only needed if it's not already running)
-jarvis status     # what's it doing right now
-jarvis stats      # usage counts, timings + last 20 utterances -- see section 8
-jarvis debug      # toggle detailed output in the window (see section 8)
-jarvis debug on   # ...or set it explicitly
-jarvis debug off
-jarvis pause      # mic off, stop listening entirely
-jarvis resume     # bring it back
-jarvis quit       # stop it completely
-```
-
-`status` reports the state by name -- `Wake-word armed (awake)`,
-`Wake-word armed (deep sleep)`, `Conversation open`, `Dictation
-(conversation open)`, or `Paused (mic off)` -- matching the diagram in
-section 5, plus whether the local AI fallback is warmed up yet (`LLM
-warm` / `LLM warming` / `LLM cold`, or `LLM failed` if the warm-up hit
-an error). That last part is purely informational and it answers on any
-setting; it just tells you whether the next AI-fallback answer will be
-near-instant or take a few seconds longer for the one-time warm-up. A
-failed warm-up isn't fatal either -- the fallback still works, it just
-loads when it's first needed.
-
-If it ever adds `listener stalled Ns` on the end, that's the one status
-worth acting on: it means the part of Jarvis that listens hasn't run for
-a while. Give it a moment (a slow AI fallback can legitimately hold
-things up for half a minute), and if it persists, `jarvis quit` and
-start it again.
-
-(Under the hood, `jarvis` is a small command file in `D:\jarvis` that
-forwards to `jarvisctl.py`, plus a `start` option that tool can't offer
-on its own -- it can only talk to an already-running copy. If you'd
-rather not rely on the short command, the long form still works from
-`D:\jarvis`: `.venv\Scripts\python.exe jarvisctl.py <command>`, or
-`.venv\Scripts\python.exe main.py` to start it directly.)
-
-## 8. Reading the window
-
-The window is a live display, not a scrolling log. Three things never
-move: a coloured band across the top, and a status strip plus a second
-band across the bottom.
-
-```
-  (colour band)
-  03:42:07  > open chrome for me
-              > focus_or_launch_app   0.95 |||||||||-
-              < Already up on this desktop, sir.
-
-  (colour band)
-  * SESSION OPEN   ...||||..    up 0:14:22   .37 cmds  .4 llm
-  (colour band)
-```
-
-**The status strip** shows what state it's in, a live microphone meter,
-how long it's been running, and running counts.
-
-**The colour is the state**, and it's the same colour your monitor-sync
-lights pick up -- so the room tells you what it's doing without you
-looking at the screen at all:
-
-| Colour | Meaning |
+| Colour | State |
 |---|---|
-| Deep red | Armed, waiting for "hey jarvis" |
+| Deep red | Armed |
 | Cyan | Conversation open |
-| Bright cyan, pulsing with your voice | Recording what you're saying |
-| Green | Dictating -- what you say is being typed, not matched |
-| Amber | Thinking (the local AI fallback) |
-| Gold flash | Done |
-| Red flash | A problem, or it declined |
-| Near-black | Low power (models unloaded -- 30 min idle, or paused) |
-| Grey | Paused |
+| Bright cyan, pulsing | Recording |
+| Green | Dictating |
+| Amber | Thinking (LLM fallback) |
+| Near-black | Low power / paused |
 
-**Each thing you say occupies one block**, not three lines. What it
-heard appears the instant it's transcribed; the line underneath is then
-rewritten in place as it works out what you meant -- a spinner with a
-running seconds count while the local AI is thinking, then the action it
-settled on. The bar after the number is how confident it was: a full
-gold bar is a certain match, a short red one means it was guessing.
+## `jarvis` command line
 
-**Sounds, not just words.** A short rising blip the instant it catches
-"hey jarvis" -- that lands well before it says "Yes, sir?", so you know
-it heard you straight away. A soft click when it's understood a command,
-a low double-note when it declines, and a spin-down sweep when it shuts
-off.
+`jarvis <command>`, from anywhere (open a new terminal after first setup):
 
-### When something looks wrong
+```
+jarvis start           # launch it (auto-starts at login/wake too)
+jarvis status          # current state, LLM warm/cold, NO MIC SIGNAL if the mic's dead
+jarvis stats           # usage counts, per-stage timings, last 20 utterances
+jarvis debug [on|off]  # toggle detailed terminal output, no restart needed
+jarvis pause           # mic off, stop listening entirely
+jarvis resume          # bring it back
+jarvis quit            # stop it completely, with the spoken goodbye
+jarvis quit silent     # ...without the goodbye -- used by the sleep-triggered quit
+```
 
-`jarvis stats` gives a running summary since it last started: how many
-utterances it's heard, broken down by how each was resolved (an instant
-match, the local AI fallback, a chat reply, dictated text, declined,
-...), plus **how long each stage is taking** (typical, slow, and worst
-case for transcription, matching, the AI fallback and the action
-itself), plus the last 20 utterances with timestamps.
+`NO MIC SIGNAL` in `status` means the microphone itself has gone dead
+(not a Jarvis bug) -- see `KNOWN_LIMITATIONS.md` for recovery steps.
+`listener stalled Ns` means restart Jarvis. Everything is also logged to
+`logs\session.jsonl` regardless of the `debug` setting.
 
-`jarvis debug` turns on the detail the display normally hides -- the
-exact parsed command, match scores, stream warnings, full error traces.
-It takes effect immediately, with no restart, so you can turn it on the
-moment something starts misbehaving and catch the *next* occurrence.
-`jarvis debug off` puts it away again.
-
-You never lose anything by leaving debug off: **everything is written to
-`logs\session.jsonl` regardless**, one line per event. The window is
-just a view of it.
-
-## Quick reference
-
-| You want to... | Do this |
-|---|---|
-| Give it a command | Say "hey jarvis", wait for "Yes, sir?", then speak |
-| See what you can say | Section 3 above |
-| End the conversation | Say "power down" (or just stop talking for ~4 min) |
-| Give one command without the wake word | Hold Right Ctrl, speak, let go |
-| Cut off a reply that's running long | Hold Right Ctrl -- stops it mid-sentence |
-| Type out what you say, word for word | "take dictation" (in a conversation); "stop dictation" to leave -- closing phrases get typed, not obeyed |
-| Stop it from listening at all | Hold Right Ctrl + say "stop listening", or `jarvis pause` |
-| Bring it back after pausing | Hold Right Ctrl + say "start listening", or `jarvis resume` |
-| Check what it's doing | `jarvis status`, or look at the console window |
-| Check usage counts / timings / recent history | `jarvis stats` |
-| See the detail behind a misbehaviour | `jarvis debug on` (then `off`) |
-| Find out what it actually did, after the fact | `logs\session.jsonl` |
-| Shut it down completely | `jarvis quit` (or close its window) |
-| Get it running again after quitting | `jarvis start` -- also happens automatically at login or laptop wake |
+(`jarvis` forwards to `jarvisctl.py`'s control socket; `jarvisctl.py` can't
+launch a fresh instance itself, hence `start` being handled separately.
+Long form from `D:\jarvis`: `.venv\Scripts\python.exe jarvisctl.py <command>`.)

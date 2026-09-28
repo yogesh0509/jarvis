@@ -216,6 +216,31 @@ def _get_output_stream(samplerate: int) -> sd.OutputStream:
     return _output_stream
 
 
+def close_output() -> None:
+    """
+    Release the render device deliberately, rather than leaving it to
+    interpreter teardown.
+
+    main.py's _shutdown() closed both *input* streams and left this one
+    open -- fine when the process is simply exiting, much less fine on
+    the sleep-triggered quit, where the point is to hand every audio
+    handle back to Windows *before* it suspends the audio stack rather
+    than to still be holding one when the driver reinitialises on the
+    other side. Best-effort and idempotent: a device already torn down
+    under us throws here, and there is nothing useful left to do about
+    it at this point in the shutdown.
+    """
+    global _output_stream
+    if _output_stream is None:
+        return
+    try:
+        _output_stream.stop()
+        _output_stream.close()
+    except Exception:
+        pass
+    _output_stream = None
+
+
 def _write_audio(data: np.ndarray, samplerate: int) -> None:
     """
     Keeping the stream open for the process's life (above) fixed the
@@ -282,11 +307,23 @@ def _speak_now(text: str, utterance_id: int) -> None:
         _end_speaking()
         return
 
-    voice = _get_voice()
-    # One lock so overlapping speak() calls queue up rather than
-    # talking over each other -- state transitions are infrequent
-    # enough that this never causes a noticeable backlog.
+    # _get_voice() is INSIDE the try, not above it. It was outside, and
+    # that was a real (if rare) way to wedge the whole listener: it is
+    # the one call here that does heavy first-use work (PiperVoice.load
+    # -- file I/O plus an onnxruntime session), so it is the one that
+    # can throw, and a throw from above the try skips the finally and
+    # leaks the _speaking_count this utterance already incremented in
+    # speak(). A leaked count means is_speaking() answers True forever,
+    # and main.py's listener skips wake-word detection entirely while
+    # that is true -- "hey jarvis" silently dead for the rest of the
+    # process's life, with the HUD still showing ARMED because the mode
+    # genuinely still is "wake". Nothing between _begin_speaking() and
+    # this finally may sit outside it.
     try:
+        voice = _get_voice()
+        # One lock so overlapping speak() calls queue up rather than
+        # talking over each other -- state transitions are infrequent
+        # enough that this never causes a noticeable backlog.
         with _playback_lock:
             primed = False
             interrupted = False

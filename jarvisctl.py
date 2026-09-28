@@ -18,10 +18,15 @@ import sys
 HOST = "127.0.0.1"
 PORT = 47123
 COMMANDS = {"status", "stats", "debug", "pause", "resume", "quit"}
-# "debug" alone toggles; "debug on"/"debug off" set it explicitly. It's
-# the one command that takes an argument, hence the argv handling below
-# being slightly less blunt than a length check.
-ARGUMENTS = {"debug": {"on", "off"}}
+# "debug" alone toggles; "debug on"/"debug off" set it explicitly.
+# "quit silent" skips the spoken goodbye and the spin-down earcon and
+# goes straight to releasing the audio devices -- it exists for the
+# sleep-triggered scheduled task, which fires once Windows has already
+# begun suspending, and where several seconds of blocking Piper playback
+# is the difference between finishing the teardown before the suspend
+# and straddling it (see main.py's _announce_and_shutdown). Anyone
+# quitting by hand wants the goodbye, so it is opt-in, not the default.
+ARGUMENTS = {"debug": {"on", "off"}, "quit": {"silent"}}
 
 
 def main():
@@ -34,6 +39,7 @@ def main():
     if not valid:
         print(f"Usage: jarvisctl.py {{{'|'.join(sorted(COMMANDS))}}}")
         print("       jarvisctl.py debug [on|off]")
+        print("       jarvisctl.py quit [silent]")
         sys.exit(1)
 
     command = " ".join(args)

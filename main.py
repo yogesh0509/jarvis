@@ -34,10 +34,17 @@ from openwakeword.model import Model as WakeWordModel
 from intent_matcher import IntentMatcher
 from actions import dispatch_llm_action, llm_screen_context, parse_fast_path_intent
 from vad import SileroVAD
-from tts import VOICE as tts_voice, speak, is_speaking, interrupt as interrupt_speech
+from tts import (
+    VOICE as tts_voice,
+    speak,
+    is_speaking,
+    interrupt as interrupt_speech,
+    close_output as close_tts_output,
+)
 import earcons
 import hud
 import llm_intent
+import output_monitor
 import phrases
 import seed_promotion
 
@@ -80,6 +87,48 @@ FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 HOTKEY = "right ctrl"
 WAKE_WORD = "hey_jarvis"
 WAKE_THRESHOLD = 0.5
+
+# Near-miss wake scores, the measurement this project never had.
+#
+# Only scores *above* WAKE_THRESHOLD were ever recorded (see
+# "wake_triggered" at its call site) -- so "I said hey jarvis and
+# nothing happened" had no evidence behind it at all, and the two
+# explanations it could have ("the model never heard anything" vs "the
+# model heard it and scored 0.45") are indistinguishable from the log.
+# That is precisely the gap that made a reported dead-window-after-boot
+# un-diagnosable: the listener thread was provably alive and ungated
+# through it (its own output-gate transitions are in session.jsonl for
+# that exact window), the mode was provably "wake" (no wake_triggered,
+# so no session was open to swallow anything), and yet nothing fired.
+#
+# Logged as a periodic high-water mark rather than per frame: at 12.5
+# frames/sec a line per frame would be ~45k lines an hour of almost
+# entirely zeros. Only windows whose best score actually cleared
+# WAKE_NEAR_MISS_FLOOR are written, so a genuinely silent room stays
+# silent in the log and a run of 0.3-0.49 near-misses -- the signature
+# of a marginal trigger rather than a deaf one -- shows up plainly.
+WAKE_NEAR_MISS_FLOOR = 0.2
+WAKE_NEAR_MISS_WINDOW_SECONDS = 10.0
+
+# The other half of "I said hey jarvis and nothing happened": the
+# listener skips wake-word detection entirely while any of four gates is
+# up (push-to-talk held, paused, Jarvis speaking, system audio playing).
+# Each is individually correct and each is *meant* to be brief, but
+# nothing ever recorded one being up for a long stretch -- so a gate
+# stuck on (a leaked tts speaking-count, an output meter that latched)
+# looked exactly like a wake word that simply didn't work, with the HUD
+# still showing ARMED because the mode genuinely still is "wake".
+# 30s is comfortably longer than any legitimate hold: Jarvis's longest
+# reply is a few seconds, and a long music playlist -- the one case that
+# legitimately stays up for minutes -- is worth a single log line too,
+# since it is also a real answer to "why didn't it hear me".
+LISTENER_GATE_STUCK_SECONDS = 30.0
+
+# Raw (pre-normalization) peak at which captured audio counts as
+# clipped. Not 1.0 exactly: float32 capture that saturated comes back
+# at or a hair under full scale, and a flat-topped waveform is already
+# distorted before it reaches the last fraction of a percent.
+_CLIPPING_PEAK = 0.99
 VAD_SPEECH_THRESHOLD = 0.15  # 0.5 -> 0.35 -> 0.2 -> 0.1 -> 0.15: 0.1 caught normal
 # speaking volume reliably but proved too sensitive to background noise/room
 # chatter as false speech-onset; nudged back up slightly -- still noticeably
@@ -149,6 +198,18 @@ def _is_dictation_stop_phrase(text: str) -> bool:
 # phrase the embedding matcher already couldn't place is now also
 # refused a slow guess", not "a legitimate short fast-path command like
 # 'mute' stops working" -- those never reach this function at all.
+#
+# Checked against real shadow data (see DECISIONS.md's "Mid-session
+# wake-word swallow, and the 'bdk wallet' false dispatches") before ever
+# considering flipping this: real, legitimately-dispatched utterances
+# ("how many files", asked repeatedly) scored avg_logprob as low as
+# -2.11 -- inside the same range as confirmed noise this gate is meant
+# to catch ("bdk" at -1.83/-2.58). At the current sample size, no single
+# global threshold on this signal separates the two without also
+# rejecting a real, frequently-used command. Left False on that basis,
+# not by default inertia -- revisit once there's enough
+# transcript_would_reject data to place a threshold below the real-
+# command floor, not just above the most obvious noise.
 TRANSCRIPT_GATE_ENFORCED = False
 
 # faster-whisper's own defaults for when its internal temperature-
@@ -189,6 +250,12 @@ _HALLUCINATION_DENYLIST = {
     "subscribe",
 }
 
+# Shared with the mid-session interception in _handle_transcript_inner
+# below (see that check's comment) -- both places need the exact same
+# notion of "this transcript IS the wake word, nothing else", just for
+# two different purposes (discard vs. re-arm).
+_WAKE_ECHO_PHRASES = {"hey jarvis", "jarvis"}
+
 
 def _normalize_transcript(text: str) -> str:
     """Module-level, matching _is_dictation_stop_phrase's normalization convention."""
@@ -220,7 +287,7 @@ def _should_reject_transcript(text: str, quality: dict) -> "str | None":
 
     if normalized in _HALLUCINATION_DENYLIST:
         return "denylist"
-    if normalized in ("hey jarvis", "jarvis"):
+    if normalized in _WAKE_ECHO_PHRASES:
         return "wake_echo"
 
     return None
@@ -429,6 +496,8 @@ def _status_line(
     dictating: bool,
     llm_state: str,
     seconds_since_listener_beat: float = 0.0,
+    input_silent: bool = False,
+    speaking: bool = False,
 ) -> str:
     """
     The `jarvis status` reply, as a pure function of the state it
@@ -452,6 +521,27 @@ def _status_line(
         name = "Wake-word armed (awake)"
 
     line = f"{name} {DOT} LLM {llm_state}"
+    if enabled and input_silent:
+        # The whole point of this line is to be read when something is
+        # already suspected to be wrong, and "armed" is an active lie
+        # when the capture device is handing over nothing. Reported even
+        # though the stream, the thread and the models are all genuinely
+        # healthy -- they were, for 50 minutes, while nothing could be
+        # heard at all. Not folded into the name above because it is
+        # orthogonal to it: a conversation can be open and deaf too.
+        line += f" {DOT} NO MIC SIGNAL (capture device delivering silence)"
+    if enabled and speaking:
+        # Orthogonal to the name above, same as the mic line: the
+        # listener skips wake-word detection entirely while Jarvis is
+        # speaking, so "armed" and "actually listening right now" are
+        # not the same claim. Normally true for a second or two at a
+        # time -- but tts.py's speaking count is the one gate here that
+        # can leak and stay up forever (see _speak_now's finally), and
+        # when it does, this line is the difference between "the wake
+        # word is broken" and "something never said it had stopped
+        # talking". Two `jarvis status` calls ten seconds apart tell
+        # those apart instantly.
+        line += f" {DOT} speaking (wake word paused)"
     if seconds_since_listener_beat > LISTENER_STALL_SECONDS:
         # The listener loop has crash containment, but a thread that dies
         # anyway leaves this socket answering cheerfully while nothing is
@@ -490,6 +580,73 @@ INPUT_WATCHDOG_SECONDS = 5.0  # no audio callback at all for this long, on a
 # matching output-side recovery for the same class of Windows audio-stack
 # flakiness, just on the input side and detected by silence instead of a
 # thrown exception.
+
+INPUT_SILENCE_FLOOR = 1e-4  # peak amplitude below which a frame counts as
+# carrying no real audio. Just above one 16-bit LSB (1/32768 = 3.05e-5).
+#
+# NOT sufficient on its own to call a device dead, which is what this
+# comment used to claim ("a genuinely quiet room still fluctuates well
+# above it"). Measured directly on this machine's Intel SST array and
+# that is simply false: in an ordinary quiet room **97% of frames sit at
+# or below this floor**, because the DSP's own noise suppression floors
+# a quiet room to 1-3 LSB. Amplitude alone therefore cannot tell "dead
+# device" from "nobody is talking" -- and acting on it alone made the
+# latch fire on ordinary silence roughly every two minutes, each time
+# reopening a perfectly healthy capture stream for no reason. See
+# INPUT_SILENCE_CONSTANT_ONLY below for what actually separates them.
+INPUT_SIGNAL_FRAMES = _frames(0.24)  # consecutive above-floor frames required
+# before believing the device is actually carrying audio again. Exactly the
+# reasoning behind SPEECH_ONSET_FRAMES above, applied to device health
+# instead of speech: one frame is not evidence.
+#
+# What it exists for specifically: a freshly-opened Windows capture device
+# glitches its first chunk(s) (the reason streams are opened once and kept
+# open at all -- see tts.py and the push-to-talk stream). So the reopen
+# that the silence latch itself triggers hands back a chunk with a nonzero
+# peak, which read as "signal is back" and cleared the latch 0.19s after
+# setting it. Confirmed twice against a genuinely dead mic, whose own
+# noise floor still spiked to 1.5e-4 on a cold open while its mean stayed
+# at 3.4e-5. Real audio sustains across frames; a cold-open artifact does
+# not.
+INPUT_SILENCE_SECONDS = 120.0  # unbroken digital silence for this long on a
+# stream that is *running* -- callbacks arriving on schedule, queue never
+# empty -- means the device came back wrong, not that nobody spoke.
+#
+# INPUT_WATCHDOG_SECONDS above cannot see this case at all, and that is
+# the hole it fell through: main_last_chunk is stamped by the callback
+# regardless of what the callback was handed, so a driver feeding pure
+# silence keeps every liveness signal in this process looking perfectly
+# healthy. Confirmed live after a 13h sleep -- the Intel SST DSP reloaded
+# its firmware on resume and came back delivering a constant 1 LSB;
+# Windows reported the endpoint active, unmuted, at 100%, and `jarvis
+# status` cheerfully said "Wake-word armed (awake)" for 50 minutes while
+# nothing could possibly be heard. Two minutes is long enough that an
+# actually-quiet room at 3am never trips it, and short enough to catch
+# this before a day's worth of commands are lost to it.
+#
+# Reopening is tried once, since the recoverable version of this does
+# exist -- but a wedged *driver* survives it (and survives a full process
+# restart, also confirmed), so the latch and the status line matter more
+# than the reopen: say "deaf" rather than imply health.
+
+INPUT_SILENCE_CONSTANT_ONLY = True  # the second condition the latch needs,
+# and the one that makes it mean anything.
+#
+# Amplitude cannot separate "dead device" from "quiet room" here (see
+# INPUT_SILENCE_FLOOR). What does separate them is *variation*. Measured
+# on the same hardware, both states:
+#
+#   wedged   : max peak == mean peak == 0.0000305, every frame identical,
+#              one single distinct value for as long as you care to look
+#   quiet room: 1, 2 and 3 LSB all present (0.0000305 / 0.000061 /
+#              0.0000916) -- still below the floor, but genuinely dithering
+#
+# So the latch additionally requires that every quiet frame in the whole
+# window carried the *exact same* value. A live converter dithers; a
+# frozen one repeats. Erring toward silence-is-normal is deliberate: a
+# false alarm costs a scary message plus a needless reopen of a healthy
+# stream on a driver already known to be fragile, while a late detection
+# costs only that -- lateness.
 
 WHISPER_MODEL_SIZE = "small.en"
 # huggingface_hub's auto-download is unreliable here (see README) --
@@ -571,9 +728,44 @@ def _redirect_output_if_headless():
     sys.stderr = log_file
 
 
+def _log_dead_thread(args):
+    """
+    Last-resort net for a thread dying on an uncaught exception.
+
+    Python's default hook prints a traceback to stderr and nothing else
+    -- which under `jarvis start` means it lands in a Windows Terminal
+    window nobody is reading, and the thread is simply gone. That is how
+    a dead listener came to look exactly like a healthy one: the process
+    kept running, `jarvis status` kept saying "Wake-word armed", and the
+    only symptom was that nothing was heard ever again.
+
+    listener_loop has its own containment and should never reach here.
+    This exists precisely for the case where that containment has a hole
+    in it -- as it did when the output gate was first added above the
+    try block rather than inside it.
+    """
+    _log_event(
+        "thread_died",
+        thread=getattr(args.thread, "name", "?"),
+        exc_type=getattr(args.exc_type, "__name__", str(args.exc_type)),
+        traceback="".join(
+            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        ),
+    )
+    try:
+        hud.line(
+            f"A background thread ({getattr(args.thread, 'name', '?')}) died -- "
+            "see logs/session.jsonl. Restart jarvis.",
+            "warn",
+        )
+    except Exception:
+        pass
+
+
 def main():
     _redirect_output_if_headless()
     _mutex = _acquire_single_instance_lock()
+    threading.excepthook = _log_dead_thread
     # After the headless redirect, so hud.init() sees the real stdout and
     # correctly declines to emit escape sequences into a log file.
     hud.init()
@@ -739,6 +931,8 @@ def main():
         _lattice_step.detail = f"{len(matcher._seeds)} seeds"
     with hud.boot_step("wake sentinel", f'"{WAKE_WORD.replace("_", " ")}" \u2265 {WAKE_THRESHOLD:.2f}'):
         wake_model = WakeWordModel(wakeword_models=[WAKE_WORD], inference_framework="onnx")
+    with hud.boot_step("output guard", f"peak \u2265 {output_monitor.PEAK_THRESHOLD:.2f} \u00b7 render endpoint"):
+        output_monitor.start()
     with hud.boot_step("voice", f"piper \u00b7 en_GB {tts_voice}"):
         pass
     with hud.boot_step("control link", f"{CONTROL_HOST}:{CONTROL_PORT}"):
@@ -783,6 +977,35 @@ def main():
         "mode": "wake",
         "main_last_chunk": time.time(),
         "hotkey_last_chunk": time.time(),
+        # Last time the main stream carried anything above
+        # INPUT_SILENCE_FLOOR, and whether the "this device is delivering
+        # nothing" latch is currently set. Separate from main_last_chunk
+        # on purpose: that one answers "is the stream running", these
+        # answer "is it actually hearing anything", and a broken audio
+        # stack can say yes to the first and no to the second.
+        "main_signal_at": time.time(),
+        "input_silent": False,
+        # Consecutive above-floor frames seen so far -- see
+        # INPUT_SIGNAL_FRAMES. Owned by audio_callback alone.
+        "signal_run": 0,
+        # Range of the below-floor frames seen since real audio last
+        # arrived -- see INPUT_SILENCE_CONSTANT_ONLY. None until the
+        # first quiet frame. Owned by audio_callback alone.
+        "quiet_peak_lo": None,
+        "quiet_peak_hi": None,
+        # See _check_output_gate: tracks the system-output gate's own
+        # edge, separately from is_speaking()/hotkey_active/enabled.
+        "output_was_playing": False,
+        "output_playing_since": 0.0,
+        # Rolling high-water mark for sub-threshold wake scores -- see
+        # WAKE_NEAR_MISS_FLOOR. Owned by the listener thread alone.
+        "wake_best_score": 0.0,
+        "wake_window_started": time.time(),
+        # How long the combined skip condition has been up, and whether
+        # this stretch has already been reported -- see
+        # LISTENER_GATE_STUCK_SECONDS. Owned by the listener thread.
+        "gate_blocked_since": None,
+        "gate_blocked_logged": False,
         # Liveness for `jarvis status` -- stamped on every listener_loop
         # iteration. That loop has crash containment, but a thread that
         # dies anyway used to leave the control socket cheerfully
@@ -834,7 +1057,28 @@ def main():
             # here drops audio frames, and dropped frames cost real
             # transcription accuracy -- this is the one place in the HUD
             # work with a genuine downside if done carelessly.
-            hud.feed_level(float(np.abs(mono).max()))
+            peak = float(np.abs(mono).max())
+            hud.feed_level(peak)
+            # One comparison, no allocation -- the peak is already
+            # computed for the display above, so tracking "when did this
+            # stream last carry any signal at all" costs nothing extra in
+            # the one place that must not block. The evaluation of it
+            # happens on the listener thread (_check_input_signal).
+            if peak > INPUT_SILENCE_FLOOR:
+                state["signal_run"] += 1
+                if state["signal_run"] >= INPUT_SIGNAL_FRAMES:
+                    state["main_signal_at"] = time.time()
+                    state["quiet_peak_lo"] = None
+                    state["quiet_peak_hi"] = None
+            else:
+                state["signal_run"] = 0
+                # Range of the quiet frames themselves -- the only thing
+                # that separates a frozen converter from a quiet room,
+                # since both sit under the floor. Two floats, no
+                # allocation, in the one place that must not block.
+                lo, hi = state["quiet_peak_lo"], state["quiet_peak_hi"]
+                state["quiet_peak_lo"] = peak if lo is None else min(lo, peak)
+                state["quiet_peak_hi"] = peak if hi is None else max(hi, peak)
             audio_q.put(mono)
         except Exception:
             _log_event("audio_callback_error", traceback=traceback.format_exc())
@@ -851,6 +1095,29 @@ def main():
         return s
 
     stream = _create_stream()
+    # Guards every open/close/reassignment of `stream` (never
+    # `_processing_lock` -- that one can be held for up to 30s by an
+    # in-flight LLM call, and pause must not wait behind that). Four
+    # places touch this variable across two threads with no prior
+    # synchronization at all: the listener thread's own watchdog/silence
+    # recovery (_reopen_input_stream), and the control-socket thread's
+    # _set_enabled (pause/resume) and _shutdown (quit). Found by
+    # deliberately auditing every touchpoint after two mic-wedge
+    # incidents that a sleep-timing race explained on its own -- this
+    # race needs no sleep at all, just an ordinary pause/resume/quit
+    # landing at the same moment the listener thread's own watchdog
+    # decides the stream needs reopening. Without a lock: a resume could
+    # see `stream is None` set by a reopen already in flight and open a
+    # *second* concurrent capture stream on the same physical device
+    # (the first orphaned, never stopped -- callback still attached),
+    # or a reopen's stream.start() could race a pause's stream.close()
+    # on the very same object. Either is exactly the class of thing that
+    # could leave a flaky driver like Intel SST wedged, independent of
+    # the sleep-suspend timing already fixed elsewhere. Not confirmed as
+    # the cause of either past incident (both align cleanly with the
+    # sleep-quit race instead), but a real, previously-unsynchronized
+    # hazard regardless of whether it has fired yet.
+    _stream_lock = threading.Lock()
 
     def _drain_audio_queue() -> int:
         """
@@ -932,7 +1199,7 @@ def main():
         else:
             hud.set_state(hud.ARMED)
 
-    def _reopen_input_stream():
+    def _reopen_input_stream(reason: str = "no callbacks arriving"):
         """
         Recovery for a stream that's gone silent while it's supposed to
         be running -- the input-side counterpart to tts.py's output
@@ -940,25 +1207,34 @@ def main():
         reopen is even attempted, so a repeat failure (device still
         genuinely gone) waits out a full INPUT_WATCHDOG_SECONDS before
         the watchdog tries again instead of hammering it every 0.5s.
+
+        `reason` exists because this has two callers that mean different
+        things, and saying "looks stuck" for both was actively
+        misleading: the 5s watchdog fires when no callbacks arrive at
+        all (genuinely stuck), while the silence latch fires on a stream
+        that is running perfectly and delivering a frozen value. The
+        latch already prints its own fuller explanation, so this line
+        stays short and just names which of the two it was.
         """
         nonlocal stream
         state["main_last_chunk"] = time.time()
-        hud.line("Main listening stream looks stuck -- reopening.", "warn")
-        try:
-            if stream is not None:
-                stream.stop()
-                stream.close()
-        except Exception:
-            pass
-        stream = None
-        if not state["enabled"]:
-            # A pause landed while the old stream was being torn down.
-            # Fail closed -- the project's standing rule for anything
-            # security-adjacent -- and leave the mic shut rather than hand
-            # a paused Jarvis a live capture stream back. _set_enabled(True)
-            # opens a fresh one on resume.
-            return
-        stream = _create_stream()
+        hud.line(f"Reopening the main listening stream ({reason}).", "warn")
+        with _stream_lock:
+            try:
+                if stream is not None:
+                    stream.stop()
+                    stream.close()
+            except Exception:
+                pass
+            stream = None
+            if not state["enabled"]:
+                # A pause landed while the old stream was being torn down.
+                # Fail closed -- the project's standing rule for anything
+                # security-adjacent -- and leave the mic shut rather than hand
+                # a paused Jarvis a live capture stream back. _set_enabled(True)
+                # opens a fresh one on resume.
+                return
+            stream = _create_stream()
         # The audio either side of this gap is discontinuous. openWakeWord
         # builds confidence over a rolling window and Silero carries
         # recurrent hidden state, so both would otherwise carry a splice
@@ -966,7 +1242,114 @@ def main():
         # speech to either of them.
         vad.reset()
         wake_model.reset()
+        # main_signal_at is deliberately NOT stamped here, unlike
+        # main_last_chunk above. It answers "when did this device last
+        # carry audio", which a reopen does not change -- and stamping it
+        # made the silence latch clear itself 0.2s after every time it
+        # fired (confirmed live against a genuinely dead mic: latch,
+        # reopen, instant unlatch, relatch 120s later, forever). Only a
+        # frame above INPUT_SILENCE_FLOOR clears it, which is the only
+        # evidence that actually means anything here.
         _drain_audio_queue()
+
+    def _check_input_signal() -> None:
+        """
+        The other half of input health, and the half the 5s watchdog
+        structurally cannot see.
+
+        INPUT_WATCHDOG_SECONDS fires from listener_loop's `queue.Empty`
+        branch -- it only ever runs when the stream has stopped feeding
+        the queue. A capture device that is still running but handing
+        over pure digital silence never empties that queue, so the
+        watchdog never gets a turn, and every other liveness signal in
+        the process (main_last_chunk, the listener heartbeat, the HUD's
+        own level meter) keeps reading healthy. This is called from the
+        chunk-consuming path instead, which is the only path that
+        actually sees what the frames contain.
+
+        Latched rather than repeated: one log line and one reopen attempt
+        per silent spell, cleared the moment real audio comes back. See
+        INPUT_SILENCE_SECONDS for why reopening is only a first guess.
+        """
+        if not state["enabled"]:
+            # Paused means the mic is deliberately shut. Silence is the
+            # correct outcome, not a fault to report.
+            return
+        silent_for = time.time() - state["main_signal_at"]
+        if silent_for <= INPUT_SILENCE_SECONDS:
+            if state["input_silent"]:
+                state["input_silent"] = False
+                _log_event("input_signal_returned", silent_seconds=round(silent_for, 1))
+                hud.line("Mic signal is back.", "ok")
+            return
+        if state["input_silent"]:
+            return  # already latched, already reported, already reopened once
+
+        lo, hi = state["quiet_peak_lo"], state["quiet_peak_hi"]
+        if INPUT_SILENCE_CONSTANT_ONLY and (lo is None or hi is None or hi != lo):
+            # Quiet, but still dithering -- a live converter in a quiet
+            # room, not a frozen one. This is the common case by far (97%
+            # of frames in an ordinary quiet room sit under the floor),
+            # and treating it as a fault is what made this latch fire
+            # every two minutes and reopen a healthy stream each time.
+            return
+
+        state["input_silent"] = True
+        _log_event(
+            "input_silent",
+            seconds=round(silent_for, 1),
+            floor=INPUT_SILENCE_FLOOR,
+            frozen_at=lo,
+        )
+        hud.line(
+            f"No mic signal for {silent_for:.0f}s -- the capture device is repeating one "
+            "constant value, which means it is wedged, not merely quiet. Reopening once.",
+            "warn",
+        )
+        _reopen_input_stream(reason="frozen capture device")
+
+    def _check_output_gate() -> bool:
+        """
+        Returns True while the system's default audio output is
+        playing -- see output_monitor.py. Named and extracted the same
+        way _check_input_signal is, for the same reason: this is state
+        that needs to persist across calls (state["output_was_playing"],
+        the falling-edge drain below) and be testable on its own,
+        against the real listener_loop closure, without having to run
+        the whole loop.
+
+        Not folded into the combined hotkey/enabled/is_speaking skip
+        condition at its call site -- that combined condition only ever
+        needs the current value, but this needs to notice the specific
+        transition back to "not playing" to drain the backlog it caused,
+        which none of those other three gates require (they only ever
+        block for seconds; see the drain's own comment for why that
+        distinction matters here).
+        """
+        output_playing = output_monitor.is_output_playing()
+        if output_playing and not state["output_was_playing"]:
+            state["output_was_playing"] = True
+            state["output_playing_since"] = time.time()
+            # Structured, not just HUD -- same reasoning as
+            # wake_triggered/input_silent: this is exactly the fact
+            # someone reconstructing "why didn't hey jarvis work just
+            # now" needs, and the HUD line alone leaves no durable trace.
+            _log_event("output_playing_started")
+            hud.line("System audio playing -- \"hey jarvis\" is paused; Right Ctrl still works.", "dim")
+        elif not output_playing and state["output_was_playing"]:
+            state["output_was_playing"] = False
+            _log_event(
+                "output_playing_stopped",
+                seconds=round(time.time() - state["output_playing_since"], 1),
+            )
+            # Unlike is_speaking() (seconds), this gate can hold for the
+            # length of a song or a playlist -- draining here stops
+            # audio_q from banking minutes of stale frames that would
+            # otherwise all get burst-processed the instant output
+            # stops, at replay speed, as if freshly captured.
+            _drain_audio_queue()
+            hud.line("System audio stopped -- listening again.", "dim")
+        return output_playing
 
     # Push-to-talk used to open a brand-new sd.InputStream on every single
     # press and tear it down on release -- the same class of Windows
@@ -1135,8 +1518,31 @@ def main():
             # tick, reintroducing exactly the Windows cold-open glitch
             # that keeping one stream open exists to avoid.
             state["main_last_chunk"] = time.time()
-            if stream is None:
-                stream = _create_stream()
+            # Same discipline, same reason, one line further: a pause
+            # longer than INPUT_SILENCE_SECONDS is silent by definition
+            # (the stream was closed for it), so without this the
+            # silence check would latch "no mic signal" the instant the
+            # listener drained its first chunk after any real pause.
+            state["main_signal_at"] = time.time()
+            state["input_silent"] = False
+            state["signal_run"] = 0
+            state["quiet_peak_lo"] = None
+            state["quiet_peak_hi"] = None
+            # Same reason as the three above: a pause that spanned a
+            # stretch of music would otherwise resume still believing
+            # output was playing, and fire a spurious drain plus
+            # "System audio stopped" on the first chunk after resume.
+            # The gate's actual reading is always live
+            # (output_monitor polls independently); only this
+            # edge-tracking bookkeeping can go stale.
+            state["output_was_playing"] = False
+            # _stream_lock, not _processing_lock -- see its own comment.
+            # This is the one place resume can race the listener
+            # thread's own watchdog reopen (both see `stream is None`
+            # and could otherwise both open a fresh capture stream).
+            with _stream_lock:
+                if stream is None:
+                    stream = _create_stream()
             _drain_audio_queue()
             # Both acoustic models carry state across the pause gap --
             # openWakeWord a rolling confidence window, Silero its
@@ -1159,10 +1565,16 @@ def main():
             hud.set_state(hud.OFFLINE)
             # The privacy-relevant half, and the only part that has to be
             # synchronous: the mic is shut before this call returns.
-            if stream is not None:
-                stream.stop()
-                stream.close()
-                stream = None
+            # _stream_lock only ever guards a few quick PortAudio calls,
+            # never the model-loading work _processing_lock protects --
+            # taking it here does not reintroduce the "pause waits behind
+            # a 30s LLM call" problem this function's own docstring
+            # already refused once.
+            with _stream_lock:
+                if stream is not None:
+                    stream.stop()
+                    stream.close()
+                    stream = None
             # Reset the session state machine too, not just the stream --
             # otherwise pausing mid-conversation and resuming later left
             # the listener stuck in "session_recording" with the models
@@ -1189,14 +1601,29 @@ def main():
     # without conditioning on it as literal prior text (unlike initial_prompt).
     # Update this list as new app/action vocabulary gets added (Phase 5's
     # registered-apps table, new query phrasing, etc.) -- covers, in order:
-    # apps, desktop navigation, window actions, query phrasing, and the
-    # user's actual repo names (for VS Code repo-switching in Phase 5).
+    # apps, desktop navigation, window actions, and query phrasing.
+    #
+    # Deliberately NOT a place for repo/project names any more (a "bdk
+    # wallet bdk cli Hashstack djed shu programming bitcoin bitshala" tail
+    # used to live here, for focus_vscode_repo recognition). Confirmed live
+    # as the actual source of false dispatches, not a hypothetical one:
+    # llm_usage_log.jsonl showed hotwords fragments coming back as literal
+    # transcript from near-silent/ambient audio ("shu programming bitcoin
+    # bitshaka" -> focus_or_launch_app, "how many files folder windows bdk
+    # wallet bdk wallet" -> count_files_in_folder), each burning a full LLM
+    # call and, twice, an actual dispatch (bare "bdk" -> focus_vscode_repo,
+    # repo="bdk_wallet"). hotwords biases recognition *toward* these words
+    # regardless of what's actually in the audio -- the more obscure and
+    # low-frequency a word is, the more that bias reads as a hallucination
+    # magnet rather than a helpful nudge. Real repo names are still heard
+    # fine without being seeded here (Whisper doesn't need "bdk" primed to
+    # transcribe "bdk" correctly); what they bought was a false-positive
+    # source on quiet/ambient input, not a needed accuracy fix.
     TRANSCRIBE_HOTWORDS = (
         "Chrome Discord Visual Studio Code VS Code File Explorer Settings Spotify "
         "local disk D desktop virtual desktop next desktop previous desktop "
         "minimize focus switch open close laptop monitor screen "
-        "how many files folder windows "
-        "bdk wallet bdk cli Hashstack djed shu programming bitcoin bitshala"
+        "how many files folder windows"
     )
 
     # Segment-level confidence, gated on separately from the transcript
@@ -1314,6 +1741,22 @@ def main():
             _record_stat("empty", text)
             return False
 
+        # Clipping check, before anything tries to interpret this text.
+        # A raw peak at (or effectively at) full scale means the capture
+        # path saturated -- the waveform is flat-topped, and both the
+        # wake-word model and Whisper are being handed a distorted
+        # signal. Worth saying out loud because no amount of software
+        # tuning fixes it: the only real remedy is the Windows input
+        # level / "Microphone Boost" on the device itself (see
+        # DECISIONS.md's transcription-accuracy note, which anticipated
+        # the opposite problem -- a level set too *low*). Surfaced as a
+        # HUD note plus a structured field rather than a warning line:
+        # one clipped utterance is unremarkable, a run of them is the
+        # finding, and that pattern is only visible in the log.
+        if quality.get("peak", 0.0) >= _CLIPPING_PEAK:
+            _log_event("input_clipped", text=text, peak=quality.get("peak", 0.0))
+            hud.note(f"input clipped (peak {quality.get('peak', 0.0):.3f}) -- check the Windows mic level/boost")
+
         # Logged on *every* non-empty utterance, not just rejected ones --
         # this is the dataset TRANSCRIPT_GATE_ENFORCED's threshold gets
         # tuned from (see that constant's comment): reading back which
@@ -1354,6 +1797,33 @@ def main():
             keyboard.write(text + " ")
             hud.resolve("typed verbatim")
             _record_stat("dictated", text)
+            return False
+
+        # A bare wake-word echo landing here means "hey jarvis" was said
+        # again while a session from an earlier trigger was still open --
+        # confirmed as a real, repeated pattern in session.jsonl (the wake
+        # word arriving as an ordinary mid-session transcript -- "hey
+        # jarvis", near-misses like "hey jobters"/"hey job is" -- rather
+        # than as a fresh wake_triggered event), not a hypothetical one.
+        # Previously this fell straight through to fast-path/LLM matching
+        # like any other command: no seed matches a bare "hey jarvis", so
+        # it burned a full ~3-30s LLM fallback call and came back as the
+        # generic "Hello, sir. How may I assist you today?" -- which reads
+        # as Jarvis having missed the wake word entirely (prompting the
+        # user to repeat it) rather than already being open and listening.
+        # via_session-only: said via push-to-talk it's just an ordinary
+        # (if odd) utterance, not evidence of anything stuck.
+        # session_silence_run can't be reset from here -- that counter is
+        # local to listener_loop, same reasoning as state["renew_session"]
+        # elsewhere -- so refreshing last_activity (already done above) and
+        # acknowledging immediately, the same way already_listening does
+        # for a redundant "wake up" mid-conversation, is the fix available
+        # from inside this function.
+        if via_session and _normalize_transcript(text) in _WAKE_ECHO_PHRASES:
+            hud.resolve("already listening")
+            speak(phrases.pick("already_listening"))
+            _log_event("wake_echo_in_session", text=text)
+            _record_stat("meta", text, "wake_echo")
             return False
 
         _t0 = time.perf_counter()
@@ -1676,6 +2146,7 @@ def main():
         if not state["hotkey_frames"]:
             _restore_steady_state()
             hud.line("Dead air -- didn't catch a thing.", "dim")
+            _log_event("hotkey_no_speech", reason="no_frames", peak=0.0)
             return
 
         frames = state["hotkey_frames"]
@@ -1691,6 +2162,18 @@ def main():
         if not any(hotkey_vad.speech_prob(f) >= VAD_SPEECH_THRESHOLD for f in frames):
             _restore_steady_state()
             hud.line("Held the key, but didn't catch actual speech.", "dim")
+            # Logged with the peak, because this bail is indistinguishable
+            # from the outside between "held the key and said nothing" and
+            # "the capture device is dead" -- and it used to go to the HUD
+            # only, so push-to-talk against a silent mic produced no
+            # spoken reply, no log line, and no way to tell the two apart
+            # afterwards. A peak at the noise floor says which it was.
+            _log_event(
+                "hotkey_no_speech",
+                reason="vad_gate",
+                peak=round(max(float(np.abs(f).max()) for f in frames), 6),
+                frames=len(frames),
+            )
             return
         audio = np.concatenate(frames)
 
@@ -1785,7 +2268,100 @@ def main():
                     _log_event("stream_recovery_failed", traceback=traceback.format_exc())
                     hud.line("Couldn't recover an input stream -- will keep trying.", "warn")
                     hud.note(traceback.format_exc())
+                # Evaluated on this path too, not just the chunk path
+                # below. What the speakers are doing has nothing to do
+                # with whether the *mic* is delivering anything, and this
+                # branch is reached in exactly the cases where that
+                # distinction bites: a wedged capture device (no chunks
+                # at all -- the failure this codebase has now hit twice),
+                # and a paused Jarvis (main stream deliberately closed).
+                # Left only on the chunk path, the gate silently froze at
+                # whatever it last saw -- confirmed live, a tone played
+                # while the queue was empty produced no gate transition
+                # at all.
+                try:
+                    _check_output_gate()
+                except Exception:
+                    _log_event("output_gate_check_failed", traceback=traceback.format_exc())
+                    hud.note(traceback.format_exc())
                 continue
+
+            # Evaluated here, on the path that actually sees frame
+            # contents, and before the guards below -- a stuck
+            # hotkey_active or is_speaking() would otherwise `continue`
+            # past it forever, which is exactly the kind of silent
+            # deafness this exists to name. Own try/except for the same
+            # reason the watchdog has one: a failed reopen must not take
+            # the listener thread down with it.
+            try:
+                _check_input_signal()
+            except Exception:
+                _log_event("input_signal_check_failed", traceback=traceback.format_exc())
+                hud.note(traceback.format_exc())
+
+            # Deep-sleep idle-unload, checked here rather than down in
+            # the "wake" mode dispatch below (where it used to live)
+            # specifically so the output gate just below cannot block it
+            # indefinitely. The gates above/below it (hotkey held,
+            # paused, is_speaking()) only ever last seconds, so leaving
+            # this nested inside "wake" dispatch never mattered before --
+            # system output playing continuously well past the 30-minute
+            # idle mark is a completely ordinary case (a long playlist),
+            # and would otherwise pin the heavy models in memory for as
+            # long as the music kept playing.
+            #
+            # Contained, like every other step between the queue read and
+            # the main try below. Everything up here runs OUTSIDE that
+            # block's crash containment, so an exception in any of it
+            # kills the listener thread outright -- which is exactly the
+            # failure that block's own comment says must never happen
+            # again, and exactly what happened when the output gate was
+            # first added here uncontained (thread dead ~5s after boot,
+            # `jarvis status` still cheerfully reporting "Wake-word
+            # armed" while nothing was listening at all).
+            try:
+                if (
+                    state["mode"] == "wake"
+                    and whisper_model is not None
+                    and time.time() - state["last_activity"] > DEEP_SLEEP_IDLE_SECONDS
+                ):
+                    # Same lock the push-to-talk/session transcription
+                    # paths hold while actually using the models --
+                    # without it, this could unload out from under an
+                    # in-flight transcribe() on another thread and crash
+                    # it with a null model reference.
+                    with _processing_lock:
+                        _unload_heavy_models()
+                    hud.set_state(hud.ASLEEP)
+                    earcons.play("sleep")
+                    speak(phrases.pick("sleep"))
+                    _log_event("deep_sleep")
+            except Exception:
+                _log_event("deep_sleep_failed", traceback=traceback.format_exc())
+                hud.note(traceback.format_exc())
+
+            # System-output gate: see output_monitor.py and
+            # _check_output_gate. Spotify, a video, anything rendering
+            # through the speakers -- not just Jarvis's own voice
+            # (is_speaking(), immediately below). Confirmed live as a
+            # real failure mode, not a theoretical one: a session opened
+            # with no "hey jarvis" anywhere in the transcript (the wake
+            # word almost certainly false-triggering on loud music), and
+            # several chunks of the song that followed embedded close
+            # enough to real seed phrases to actually dispatch
+            # (volume_down/up), peak=1.0 on nearly every one.
+            #
+            # Contained for the same reason as the block above: this runs
+            # outside the main try, and an exception in it killed the
+            # listener thread silently the first time round. Failing to
+            # "not playing" on error keeps the listener working rather
+            # than leaving it permanently gated by a gate that threw.
+            try:
+                output_playing = _check_output_gate()
+            except Exception:
+                output_playing = False
+                _log_event("output_gate_check_failed", traceback=traceback.format_exc())
+                hud.note(traceback.format_exc())
 
             # Push-to-talk has its own stream now -- just don't let the
             # main listener also react to the same speech while it's held.
@@ -1794,8 +2370,48 @@ def main():
             # hears its own spoken replies and acts on them as new commands
             # (confirmed directly: "Switching to the next desktop, sir" kept
             # re-triggering itself, causing runaway desktop switches).
-            if state["hotkey_active"] or not state["enabled"] or is_speaking():
+            #
+            # Deliberately NOT applied to push-to-talk (hotkey_active is
+            # checked, output_playing is not, on that path -- see
+            # on_press/on_release below): holding Right Ctrl and talking
+            # over the music is exactly the override this project's own
+            # convention keeps working no matter what else is true.
+            _speaking_now = is_speaking()
+            if state["hotkey_active"] or not state["enabled"] or _speaking_now or output_playing:
+                # Deaf-listener diagnosis -- see
+                # LISTENER_GATE_STUCK_SECONDS. Records *which* of the
+                # four gates is holding, once per continuous stretch,
+                # so "nothing happened when I said hey jarvis" stops
+                # being indistinguishable from "the wake word scored
+                # 0.45". Structured only (plus a debug-only aside): a
+                # long playlist legitimately trips this, and that is not
+                # worth a warning line in the scrolling region.
+                _now = time.time()
+                if state["gate_blocked_since"] is None:
+                    state["gate_blocked_since"] = _now
+                elif (
+                    not state["gate_blocked_logged"]
+                    and _now - state["gate_blocked_since"] > LISTENER_GATE_STUCK_SECONDS
+                ):
+                    state["gate_blocked_logged"] = True
+                    _log_event(
+                        "listener_gate_stuck",
+                        seconds=round(_now - state["gate_blocked_since"], 1),
+                        hotkey_active=bool(state["hotkey_active"]),
+                        paused=not state["enabled"],
+                        speaking=bool(_speaking_now),
+                        output_playing=bool(output_playing),
+                    )
+                    hud.note(
+                        f"wake-word detection gated for "
+                        f"{_now - state['gate_blocked_since']:.0f}s "
+                        f"(hotkey={state['hotkey_active']} paused={not state['enabled']} "
+                        f"speaking={_speaking_now} output={output_playing})"
+                    )
                 continue
+            if state["gate_blocked_since"] is not None:
+                state["gate_blocked_since"] = None
+                state["gate_blocked_logged"] = False
 
             # Push-to-talk renews the conversation's idle countdown.
             # session_silence_run is a frame counter local to this loop,
@@ -1823,25 +2439,56 @@ def main():
 
             try:
                 if state["mode"] == "wake":
-                    if whisper_model is not None and time.time() - state["last_activity"] > DEEP_SLEEP_IDLE_SECONDS:
-                        # Same lock the push-to-talk/session transcription
-                        # paths hold while actually using the models --
-                        # without it, this could unload out from under an
-                        # in-flight transcribe() on another thread (e.g. a
-                        # long push-to-talk hold that started just before
-                        # the timeout, since last_activity is only stamped
-                        # again once that transcription finishes) and crash
-                        # it with a null model reference.
-                        with _processing_lock:
-                            _unload_heavy_models()
-                        hud.set_state(hud.ASLEEP)
-                        earcons.play("sleep")
-                        speak(phrases.pick("sleep"))
-                        _log_event("deep_sleep")
-
-                    chunk_i16 = (chunk * 32767).astype(np.int16)
+                    # Deep-sleep idle-unload now lives above, outside this
+                    # dispatch block -- see its own comment at the check
+                    # site for why (the output gate above must not be
+                    # able to block it for the length of a whole playlist).
+                    # np.clip is NOT optional here, and this is the only
+                    # place in the pipeline that converts to int16 at all.
+                    #
+                    # float32 capture can come back slightly outside
+                    # [-1, 1] -- WASAPI shared mode with an APO doing
+                    # gain/AGC ahead of us (this machine's mic runs Intel
+                    # SST, see CLAUDE.md) overshoots unity on loud input.
+                    # astype(np.int16) does NOT saturate, it wraps: a
+                    # sample of 1.05 becomes -31131, i.e. a near-full-
+                    # scale sample of the *opposite polarity*, injected
+                    # into exactly the loudest part of the waveform --
+                    # which for "hey jarvis" is the part carrying the
+                    # signal openWakeWord is looking for. Measured
+                    # directly: [1.0, 1.05, 1.2, -1.3] * 32767 ->
+                    # [32767, -31131, -26216, 22939].
+                    #
+                    # Consistent with what this machine's logs show --
+                    # every recent transcript records a raw peak of 1.00,
+                    # i.e. the capture path is running at saturation --
+                    # and with the shape of the reported bug: the wake
+                    # word intermittently not firing while push-to-talk
+                    # kept working throughout. Push-to-talk never touches
+                    # this line; it hands float audio straight to Whisper.
+                    # A single distorting conversion on the wake path
+                    # alone is exactly the asymmetry that produces.
+                    chunk_i16 = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
                     scores = wake_model.predict(chunk_i16)
-                    if scores.get(WAKE_WORD, 0.0) > WAKE_THRESHOLD:
+                    # Near-miss bookkeeping before the threshold test, so
+                    # a score that never fires still leaves a trace -- see
+                    # WAKE_NEAR_MISS_FLOOR for why this exists at all.
+                    # Two floats and a comparison per frame; the window
+                    # flush below is what actually writes anything.
+                    _wake_score = scores.get(WAKE_WORD, 0.0)
+                    if _wake_score > state["wake_best_score"]:
+                        state["wake_best_score"] = _wake_score
+                    if time.time() - state["wake_window_started"] >= WAKE_NEAR_MISS_WINDOW_SECONDS:
+                        if WAKE_NEAR_MISS_FLOOR <= state["wake_best_score"] <= WAKE_THRESHOLD:
+                            _log_event(
+                                "wake_near_miss",
+                                best_score=round(float(state["wake_best_score"]), 4),
+                                threshold=WAKE_THRESHOLD,
+                                window_seconds=WAKE_NEAR_MISS_WINDOW_SECONDS,
+                            )
+                        state["wake_best_score"] = 0.0
+                        state["wake_window_started"] = time.time()
+                    if _wake_score > WAKE_THRESHOLD:
                         # State flips the instant the wake word is
                         # detected, before anything audio-related is
                         # even attempted. This used to come *after* a
@@ -1875,6 +2522,24 @@ def main():
                         _ensure_heavy_models_loaded()
                         state["last_activity"] = time.time()
                         hud.line('Session open -- say "power down" when you\'re done.', "system")
+                        # The only place a session ever opens, and until
+                        # now the only state transition in the whole
+                        # listener loop with zero trace in session.jsonl.
+                        # Diagnosed the hard way: a burst of dispatched
+                        # fast-path commands appeared ~10s after a logged
+                        # "power down" (session_close) with no wake-word
+                        # transcript in between and peak=1.0 on nearly
+                        # every one of them -- consistent with the wake
+                        # word false-triggering on loud Spotify playback
+                        # and reopening a session nobody asked for, but
+                        # unconfirmable from the log as it stood, since
+                        # this line simply didn't exist. The score is the
+                        # point: WAKE_THRESHOLD (0.5) was tuned without
+                        # ever having a record of what real triggers
+                        # (wanted or not) actually scored.
+                        _log_event("wake_triggered", score=round(float(_wake_score), 4))
+                        state["wake_best_score"] = 0.0
+                        state["wake_window_started"] = time.time()
                         state["mode"] = "session_listening"
                         state["dictating"] = False  # a fresh session never starts already dictating
                         session_silence_run = 0
@@ -1921,6 +2586,18 @@ def main():
                             # made the difference between "it closed" and
                             # "it stopped hearing me" invisible.
                             speak(phrases.pick("session_timeout"))
+                            # Structured, not just HUD/spoken -- this was
+                            # the one session-close path with genuinely
+                            # zero trace in session.jsonl (every other one
+                            # goes through _record_stat's "meta"/
+                            # session_close outcome). Confirmed as a real
+                            # diagnostic gap, not a hypothetical one: with
+                            # no session_open/session_close pair to
+                            # correlate against, "how long was a session
+                            # left open, swallowing wake-word attempts,
+                            # before this timeout finally closed it" was
+                            # unanswerable from the log alone.
+                            _log_event("session_idle_closed", seconds=SESSION_IDLE_TIMEOUT_FRAMES * FRAME_SECONDS)
                             hud.set_state(hud.ARMED)
                             state["mode"] = "wake"
                             state["dictating"] = False
@@ -2012,11 +2689,26 @@ def main():
 
     def _shutdown():
         state["stop"] = True
-        if stream is not None:
-            stream.stop()
-            stream.close()
+        # _stream_lock: without it, this could run concurrently with the
+        # listener thread's own _reopen_input_stream (its watchdog runs
+        # every 0.5s regardless of shutdown -- state["stop"] is only
+        # checked at the top of that thread's loop, not mid-reopen) and
+        # close a stream the other thread is simultaneously calling
+        # .start() on.
+        with _stream_lock:
+            if stream is not None:
+                stream.stop()
+                stream.close()
         hotkey_stream.stop()
         hotkey_stream.close()
+        output_monitor.stop()
+        # Both directions, not just input. Every audio handle this
+        # process holds is released here, before the (potentially slow)
+        # model teardown below -- on the sleep-triggered quit this is a
+        # race against Windows suspending the audio stack, and losing it
+        # means closing streams onto a device that is already being
+        # reinitialised on the far side of the suspend.
+        close_tts_output()
         keyboard.unhook_all()
         # Drop the GGUF model here, while the interpreter is still fully
         # alive. Left to be collected at exit instead, llama_cpp's
@@ -2027,11 +2719,40 @@ def main():
         # but it's the last thing on screen and it reads like a crash.
         llm_intent.unload()
 
-    def _announce_and_shutdown():
+    def _announce_and_shutdown(silent: bool = False):
         # Blocking, not fire-and-forget -- the process exits right
         # after this, so a background thread would risk never
         # actually getting to play it.
         hud.set_state(hud.DORMANT)
+        if silent:
+            # The sleep-triggered quit takes this path, and the whole
+            # reason it exists is timing.
+            #
+            # `Jarvis Quit On Sleep` fires on Kernel-Power 42, i.e. once
+            # Windows has *already begun* suspending. The spin-down
+            # earcon plus Piper synthesis plus playback below is several
+            # seconds of blocking audio work, and scheduler/README.md
+            # already noted it runs "against an audio stack Windows is
+            # already tearing down". What that cost turned out to be:
+            # on 09-17 the process was frozen mid-teardown for a 13-hour
+            # suspend and finished it 3 seconds after resume -- 4 seconds
+            # after the Intel SST DSP reloaded its firmware -- issuing
+            # close calls on suspend-invalidated handles into a driver
+            # that was still reinitialising. The capture pipeline came
+            # back delivering a constant 1 LSB and stayed that way
+            # through a full process restart.
+            #
+            # Not proof that the goodbye caused it (n=1, and these DSPs
+            # wedge on their own), but the one earlier cycle that also
+            # survived a suspend finished its teardown 24s after wake,
+            # clear of the reload, and came back fine. Skipping the audio
+            # turns seconds of work into milliseconds, which is the
+            # difference between finishing before the suspend and
+            # straddling it. Nobody is listening to a goodbye from a
+            # machine that is already going to sleep anyway.
+            _log_event("shutdown_silent", reason="sleep")
+            _shutdown()
+            return
         # Both blocking, and in this order: the process exits the moment
         # the goodbye finishes, so a fire-and-forget spin-down would
         # either be talked over or cut off by the exit entirely.
@@ -2061,6 +2782,7 @@ def main():
             except socket.timeout:
                 continue
             quitting = False
+            quit_silently = False
             with conn:
                 command = conn.recv(64).decode("utf-8", "ignore").strip().lower()
                 if command == "status":
@@ -2077,14 +2799,25 @@ def main():
                         dictating=state["dictating"],
                         llm_state=llm_intent.prewarm_state(),
                         seconds_since_listener_beat=time.time() - state["listener_beat"],
+                        input_silent=state["input_silent"],
+                        speaking=is_speaking(),
                     )
                 elif command == "stats":
                     reply = _format_stats(state["stats"])
                 elif command == "pause":
+                    # Logged, unlike before. The voice path records a
+                    # pause via _record_stat("meta", ...), but the
+                    # control socket recorded nothing at all -- so a
+                    # `jarvis pause`, a sleep, and a `jarvis resume` left
+                    # session.jsonl with no trace that any of it had
+                    # happened, which is precisely the sequence someone
+                    # is trying to reconstruct when they come to read it.
                     _set_enabled(False)
+                    _log_event("control_pause")
                     reply = "going quiet, sir"
                 elif command == "resume":
                     _set_enabled(True)
+                    _log_event("control_resume")
                     reply = "back online, sir"
                 elif command.startswith("debug"):
                     # Runtime verbosity toggle over the existing control
@@ -2101,7 +2834,7 @@ def main():
                     else:
                         hud.set_debug(not hud.is_debug())
                     reply = f"debug output {'on' if hud.is_debug() else 'off'}"
-                elif command == "quit":
+                elif command in ("quit", "quit silent"):
                     # Announced *after* this connection closes, not
                     # before. jarvisctl.py reads until EOF on a socket
                     # whose 3s timeout governs every recv(), and the
@@ -2116,11 +2849,12 @@ def main():
                     # scheduled task as well as to anyone at a prompt.
                     reply = "powering down, sir"
                     quitting = True
+                    quit_silently = command.endswith("silent")
                 else:
                     reply = f"unrecognized command: {command!r}"
                 conn.sendall(reply.encode())
             if quitting:
-                _announce_and_shutdown()
+                _announce_and_shutdown(silent=quit_silently)
                 break
     except KeyboardInterrupt:
         # Only reachable at all when run in a visible console (Ctrl+C
