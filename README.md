@@ -31,6 +31,14 @@ llama.cpp's full source tree, including a deeply-nested Svelte web UI
 folder that exceeds Windows' 260-character `MAX_PATH` during extraction on
 this machine. The prebuilt CPU wheel sidesteps the whole problem.
 
+`livekit` (in `requirements.txt`) is there for exactly one thing: WebRTC's
+echo canceller (`AudioProcessingModule`), which lets "hey jarvis" work
+over music and video -- see `echo_canceller.py`. It's pure local DSP from
+an 11MB prebuilt `win_amd64` wheel; nothing connects to a LiveKit server
+or anywhere else. If it's missing or fails to load, Jarvis still runs,
+and system audio simply pauses the wake word again (the boot line
+"echo canceller" says so).
+
 ### Fetching the models
 
 None of the model weights are in this repo (see `.gitignore` --

@@ -9,7 +9,9 @@ diagrams live in `USER_GUIDE.md`.
 ## Pipeline
 
 ```
-mic --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
+mic --> echo_canceller.py (WebRTC AEC3, loopback.py reference -- removes
+        whatever the speakers are playing; raw passthrough when silent)
+      --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
       --> faster-whisper small.en (transcription)
       --> intent_matcher.py (fast embedding match)
             |-- confident match --> actions.py (dispatch)
@@ -21,7 +23,8 @@ mic --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
 Push-to-talk (Right Ctrl) is a second, independent entry point into the
 same `intent_matcher.py` -> `llm_intent.py` -> `actions.py` -> `tts.py`
 pipeline, bypassing the wake-word/VAD-session layer entirely (see
-`DECISIONS.md`).
+`DECISIONS.md`). It also bypasses echo cancellation: it stays on the raw
+mic, the override that works even if every other layer fails.
 
 `actions.py`'s `ACTIONS` dict is the actual security boundary: the
 matcher/LLM only ever select a key into a fixed dict of plain Python
@@ -71,7 +74,18 @@ output_monitor.py    detects whether the system's default audio output is
                       not just Jarvis's own voice (tts.py's is_speaking()
                       only covers that) -- via IAudioMeterInformation on the
                       render endpoint; gates wake-word detection and session
-                      dispatch while it's true (push-to-talk is unaffected)
+                      dispatch while it's true *and* echo cancellation isn't
+                      covering it (push-to-talk is unaffected)
+loopback.py          WASAPI loopback capture of whatever Windows is sending
+                      to the default output (hand-rolled comtypes, 16kHz mono
+                      via AUTOCONVERTPCM) -- the echo canceller's reference;
+                      gap-fills idle silence, reopens when the default
+                      output changes
+echo_canceller.py    WebRTC AEC3 (livekit's AudioProcessingModule, lazily
+                      imported) on the main capture stream, plus the
+                      fail-closed "is cancellation actually working on this
+                      output right now" decision the output gate consults,
+                      the reference delay aligner, and the session echo floor
 hud.py               the terminal display -- single locked writer for all
                       user-facing output, pinned status bands, live mic meter,
                       in-place line rewriting. `python hud.py` runs a
@@ -81,7 +95,7 @@ earcons.py           short non-verbal cues synthesized with numpy at import
 phrases.py           reply phrasing as pools of variants, one place to change
                       anything Jarvis says
 jarvisctl.py         one-shot control-socket client (status/stats/debug/
-                      pause/resume/quit)
+                      aec/pause/resume/quit)
 jarvis.cmd           `jarvis <command>` wrapper, `start` handled here directly
 launch.ps1           the actual `main.py` launch command (see DECISIONS.md's
                       "Voice replies and terminal theming" section for why
@@ -98,6 +112,10 @@ tools/               standalone, hand-run scripts -- not part of the live
                       as the record of why move-to-desktop was dropped
                       (E_ACCESSDENIED, see DECISIONS.md's "Screen and
                       window context" section)
+  _spike_aec.py         measures echo cancellation on the current default
+                      output -- raw vs AEC3 vs the driver's own SPEECH/
+                      COMMUNICATIONS modes; run once per output device
+                      (see DECISIONS.md's "System output, round two")
 requirements.txt      pinned dependencies (excl. llama-cpp-python, see
                       README.md's Setup section)
 models/               model weights (gitignored -- see README.md's

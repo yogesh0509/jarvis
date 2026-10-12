@@ -32,7 +32,13 @@ from faster_whisper import WhisperModel
 from openwakeword.model import Model as WakeWordModel
 
 from intent_matcher import IntentMatcher
-from actions import dispatch_llm_action, llm_screen_context, parse_fast_path_intent
+from actions import (
+    dispatch_llm_action,
+    llm_screen_context,
+    morning_briefing,
+    parse_fast_path_intent,
+    save_current_layout,
+)
 from vad import SileroVAD
 from tts import (
     VOICE as tts_voice,
@@ -41,16 +47,52 @@ from tts import (
     interrupt as interrupt_speech,
     close_output as close_tts_output,
 )
+import audio_endpoint
 import earcons
+import echo_canceller
 import hud
 import llm_intent
 import output_monitor
 import phrases
 import seed_promotion
+import timers
 
 DOT = "·"  # separator used throughout the HUD lines
 
 SESSION_LOG_PATH = Path(__file__).parent / "logs" / "session.jsonl"
+SESSION_LOG_BACKUP_PATH = SESSION_LOG_PATH.parent / (SESSION_LOG_PATH.name + ".1")
+
+# KNOWN_LIMITATIONS.md used to say this file "grows without bound...
+# delete it whenever; nothing reads it back" -- true until
+# tools/_report.py, which does now read it back, so unbounded growth
+# stops being a someday problem. 10MB is generous headroom over real
+# usage (measured live: ~160KB across 1370 events from real day-to-day
+# use) while still capping it before a long-running install turns this
+# into an actual disk concern.
+_LOG_ROTATE_MAX_BYTES = 10 * 1024 * 1024
+# A stat() call on every single log line (several per utterance) is
+# needless syscall overhead on what's already a hot path. Checking
+# every 50th call keeps the amortized cost near zero while still
+# catching growth well within a minute of typical use.
+_LOG_ROTATE_CHECK_EVERY = 50
+_log_event_call_count = 0
+
+
+def _rotate_session_log_if_needed() -> None:
+    """
+    Single-generation rotation -- session.jsonl.1 holds whatever was
+    there immediately before the most recent rotation, nothing older.
+    Deliberately simple: this file is a diagnostic trail for "what
+    happened recently," not an archive, and tools/_report.py only ever
+    reads the live file. Module-level and side-effect-free beyond the
+    one rename, so it's directly testable without starting the app.
+    """
+    try:
+        if SESSION_LOG_PATH.stat().st_size < _LOG_ROTATE_MAX_BYTES:
+            return
+        SESSION_LOG_PATH.replace(SESSION_LOG_BACKUP_PATH)
+    except FileNotFoundError:
+        pass
 
 
 def _log_event(kind: str, **fields) -> None:
@@ -69,8 +111,12 @@ def _log_event(kind: str, **fields) -> None:
     the listener thread, which is the one thread that has to survive
     everything (see listener_loop's crash-containment comment).
     """
+    global _log_event_call_count
     try:
         SESSION_LOG_PATH.parent.mkdir(exist_ok=True)
+        _log_event_call_count += 1
+        if _log_event_call_count % _LOG_ROTATE_CHECK_EVERY == 0:
+            _rotate_session_log_if_needed()
         record = {"ts": time.time(), "kind": kind, **fields}
         with open(SESSION_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + chr(10))
@@ -85,8 +131,55 @@ SAMPLE_RATE = 16000
 FRAME_SAMPLES = 1280  # 80ms at 16kHz -- openWakeWord's native chunk size
 FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 HOTKEY = "right ctrl"
+# Requiring intent, not a specific key. Diagnosed directly from
+# logs/session.jsonl: 215 of 216 logged push-to-talk presses produced no
+# speech at all -- but the root cause is that *any* bare key gets
+# pressed by accident (Right Ctrl is a modifier held constantly while
+# typing), not that this particular key is wrong; swapping it for Esc or
+# anything else would just move the problem. A tap now does nothing at
+# all, on either of the hotkey's two jobs (arming capture, and cutting
+# off a reply mid-sentence -- see on_press/_confirm_hotkey_hold below):
+# A tap now does nothing at all, on either of the hotkey's two jobs
+# (arming capture, and cutting off a reply mid-sentence -- see
+# on_press/_confirm_hotkey_hold below), and keeps the key's two
+# behaviours consistent with each other instead of one being instant
+# and the other debounced.
+#
+# 1.0s, not the original 0.22s -- raised after the 0.22s threshold had
+# been live long enough to log its own result: 813 confirmed-but-empty
+# holds (hotkey_no_speech/vad_gate) in logs/session.jsonl, 97% of them
+# under peak 0.01 (near silence, not a quiet real attempt). Exact
+# duration isn't logged directly, but frames (also logged) reconstructs
+# it: duration = 0.22 + max(0, frames - 4) * FRAME_SECONDS, since
+# hotkey_frames always starts from the 4-frame/0.3s rolling pre-buffer
+# at confirm time, plus whatever's appended after. Median reconstructed
+# duration was 0.54s; a 1.0s threshold would have silently absorbed
+# 83.9% of these 813 (684/813) before they ever reached RECORDING,
+# versus only 59.2% at 0.6s and 89.4% at 1.2s -- 1.0s sits right where
+# the marginal gain per extra 0.1-0.2s drops off. No equivalent data
+# exists for genuine *quick* commands (nothing distinguishes a
+# push-to-talk dispatch from a session one in the log), so this is a
+# real, currently-unmeasured trade-off, not a free win -- revisit if
+# short deliberate presses start getting dropped. See
+# HOTKEY_PRE_BUFFER_FRAMES below, which had to grow along with this: a
+# pre-buffer narrower than the hold threshold would silently clip the
+# start of exactly the speech this delay is meant to never lose.
+HOTKEY_HOLD_THRESHOLD_SECONDS = 1.0
 WAKE_WORD = "hey_jarvis"
 WAKE_THRESHOLD = 0.5
+
+# One-time boot check, read-only (audio_endpoint.get_input_volume never
+# writes the capture level -- see that module's docstring for why).
+# Diagnosed directly: this machine's own capture endpoint measured at
+# exactly 1.0 (100%) alongside a real cluster of mishearings sharing the
+# same shape ("hey jobis"/"hey jobbers"/"hey jawless", peak pinned at
+# 1.0, Whisper *confident* and still wrong) -- distinct from the
+# near-silence hallucination class this codebase already had a fix for.
+# 0.85 is a provisional bar, same status as every other first-guess
+# threshold here: clearly high enough that a sanely-configured mic
+# should never trip it, clearly low enough to have caught the one
+# machine this was diagnosed on.
+_HIGH_INPUT_LEVEL_WARNING = 0.85
 
 # Near-miss wake scores, the measurement this project never had.
 #
@@ -123,6 +216,15 @@ WAKE_NEAR_MISS_WINDOW_SECONDS = 10.0
 # legitimately stays up for minutes -- is worth a single log line too,
 # since it is also a real answer to "why didn't it hear me".
 LISTENER_GATE_STUCK_SECONDS = 30.0
+
+# Echo cancellation's own trail in session.jsonl (see echo_canceller.py).
+# aec_stats is periodic while output plays -- the numbers every
+# provisional threshold there gets revisited from. echo_onset_rejected
+# is a count flushed at most this often: a song's residual can fail the
+# echo-floor check several times a second, and one line per frame would
+# bury everything else, but a *real* command being refused has to show.
+AEC_STATS_LOG_SECONDS = 30.0
+ECHO_REJECT_LOG_SECONDS = 10.0
 
 # Raw (pre-normalization) peak at which captured audio counts as
 # clipped. Not 1.0 exactly: float32 capture that saturated comes back
@@ -222,6 +324,33 @@ _REJECT_NO_SPEECH_PROB = 0.6
 _REJECT_AVG_LOGPROB = -1.0
 _REJECT_COMPRESSION_RATIO = 2.4
 
+# A sample within this much of full scale counts as saturated, not just
+# loud -- diagnosed directly from logs/session.jsonl: real mishearings
+# ("hey jobis"/"hey jobbers"/"hey jawless", "post 45", "bar down")
+# clustered at peak >=0.75 with many transcripts sitting at exactly
+# peak=1.0000, distinct from the *other* mishearing population (peak
+# <0.15, near-silence amplified into phantom words -- the hallucination
+# class TRANSCRIBE_HOTWORDS/the denylist above already address). A
+# single loud instant doesn't mean clipping; many samples pinned at the
+# same ceiling value does -- that flat-topped-waveform shape is what
+# clipped_fraction (in _transcribe) measures, computed on the
+# *pre-normalization* audio (normalization is already a no-op once peak
+# is already ~1.0, so this reflects the real input, not an artifact of
+# the gain step). Module-level, unlike _MAX_NORMALIZE_GAIN, so
+# _should_reject_transcript below (also module-level, on purpose -- see
+# its own docstring) can see it.
+_CLIP_SAMPLE_FLOOR = 0.995
+# Provisional, like every other first-guess threshold in this codebase
+# (VAD_SPEECH_THRESHOLD, WAKE_THRESHOLD, output_monitor's
+# PEAK_THRESHOLD) -- there is no saved raw audio from past sessions to
+# validate this fraction against (session.jsonl only ever logged scalar
+# summaries, never the waveform), so this starts as a reasoned guess and
+# is meant to be revisited once transcript_would_reject's "clipped"
+# reason has real shadow data behind it, the same discipline
+# TRANSCRIPT_GATE_ENFORCED's own comment already applies to
+# avg_logprob/no_speech_prob/compression_ratio.
+_REJECT_CLIP_FRACTION = 0.10
+
 # Deliberately NOT a minimum-word-count rule anywhere in this gate --
 # "mute", "louder", "play", "pause", "lock" are all legitimate one-word
 # seeded fast-path commands (intent_matcher.INTENTS); a word-count floor
@@ -256,10 +385,57 @@ _HALLUCINATION_DENYLIST = {
 # two different purposes (discard vs. re-arm).
 _WAKE_ECHO_PHRASES = {"hey jarvis", "jarvis"}
 
+# Exact seed phrases requiring extra acoustic confidence before a fast-
+# path match on them gets trusted -- every one of these is also in
+# _HALLUCINATION_DENYLIST above, for the identical reason: each reads as
+# something real even from near-silence ("thank you"/"thanks"/"bye" are
+# textbook Whisper hallucinations, confirmed in this project's own
+# transcript_would_reject data). The fast path has *no* acoustic gate
+# anywhere else, by design -- TRANSCRIPT_GATE_ENFORCED's own comment is
+# explicit that a >=0.80 cosine match is its own evidence a real command
+# was heard. That argument doesn't hold here specifically: cosine
+# similarity to "thank you" is exactly as easy for a hallucinated "thank
+# you" to achieve as a real one, since the content itself is identical
+# either way -- length and phrasing carry none of the usual signal.
+# Narrow on purpose, not a general policy change: only these few short,
+# denylist-listed phrases get the extra check (see the gate's own call
+# site in _handle_transcript_inner), everything else keeps working
+# exactly as before.
+_ACOUSTICALLY_GATED_SEEDS = {"thank you", "thanks", "okay", "ok", "bye", "goodbye"}
+
 
 def _normalize_transcript(text: str) -> str:
     """Module-level, matching _is_dictation_stop_phrase's normalization convention."""
     return " ".join(text.lower().strip(" .,!?").split())
+
+
+def _acoustic_reject_reason(quality: dict) -> "str | None":
+    """
+    The acoustic-only subset of _should_reject_transcript's checks --
+    no_speech_prob/avg_logprob/compression_ratio/clipped_fraction, none
+    of which depend on what the words actually were. Split out
+    specifically for the social-intent acoustic gate (see
+    _ACOUSTICALLY_GATED_SEEDS' call site in _handle_transcript_inner):
+    that gate's whole seed list is, by construction, a subset of
+    _HALLUCINATION_DENYLIST (see intent_matcher.py's social_thanks/
+    social_ack comment -- that's *why* those seeds were picked), so
+    running the full _should_reject_transcript against them would hit
+    the denylist branch below on every single call regardless of audio
+    quality -- a tautological, permanent rejection, not a gate.
+    Confirmed directly: with clean quality (avg_logprob -0.30, no
+    clipping), "thank you"/"okay"/"bye" were still rejected every time
+    because the normalized text itself is a denylist entry. This helper
+    is the one both call sites actually need signal from.
+    """
+    if quality.get("no_speech_prob", 0.0) >= _REJECT_NO_SPEECH_PROB:
+        return "no_speech_prob"
+    if quality.get("avg_logprob", 0.0) <= _REJECT_AVG_LOGPROB:
+        return "avg_logprob"
+    if quality.get("compression_ratio", 0.0) >= _REJECT_COMPRESSION_RATIO:
+        return "compression_ratio"
+    if quality.get("clipped_fraction", 0.0) >= _REJECT_CLIP_FRACTION:
+        return "clipped"
+    return None
 
 
 def _should_reject_transcript(text: str, quality: dict) -> "str | None":
@@ -272,18 +448,21 @@ def _should_reject_transcript(text: str, quality: dict) -> "str | None":
     Returns a short machine-readable reason to reject, or None to
     proceed to the LLM fallback as normal. `quality` is the dict
     _transcribe returns alongside the text (no_speech_prob, avg_logprob,
-    compression_ratio -- see its definition).
+    compression_ratio, clipped_fraction -- see its definition). The
+    first three come from Whisper's own per-segment output;
+    clipped_fraction is measured directly off the raw audio instead --
+    a mechanical fact about the recording, not a model's confidence
+    about it, but reasoned about identically here: acoustic evidence
+    the content is unreliable, gating the same LLM-bound branch for the
+    same reason.
     """
     normalized = _normalize_transcript(text)
     if not normalized:
         return "empty"
 
-    if quality.get("no_speech_prob", 0.0) >= _REJECT_NO_SPEECH_PROB:
-        return "no_speech_prob"
-    if quality.get("avg_logprob", 0.0) <= _REJECT_AVG_LOGPROB:
-        return "avg_logprob"
-    if quality.get("compression_ratio", 0.0) >= _REJECT_COMPRESSION_RATIO:
-        return "compression_ratio"
+    acoustic_reason = _acoustic_reject_reason(quality)
+    if acoustic_reason is not None:
+        return acoustic_reason
 
     if normalized in _HALLUCINATION_DENYLIST:
         return "denylist"
@@ -320,7 +499,8 @@ _QUERY_SHAPED_ACTIONS = frozenset(
         "describe_screen",
         "now_playing",
         "count_app_windows",
-        "count_files_in_folder",
+        "list_timers",
+        "system_status",
         "none",
         "no_match",
         "start_dictation",
@@ -423,7 +603,9 @@ _TIMED_STAGES = ("transcribe", "match", "llm", "action")
 
 _STAT_CATEGORY_LABELS = [
     ("fast_path", "fast-path matches"),
+    ("fast_path_failed", "fast-path matches that failed to take"),
     ("llm_action", "LLM-resolved actions"),
+    ("llm_action_failed", "LLM-resolved actions that failed to take"),
     ("llm_chat", "LLM chat replies"),
     ("dictated", "dictated (typed verbatim)"),
     ("meta", "meta (pause/resume/dictation control)"),
@@ -498,6 +680,8 @@ def _status_line(
     seconds_since_listener_beat: float = 0.0,
     input_silent: bool = False,
     speaking: bool = False,
+    render_error: "str | None" = None,
+    aec: "str | None" = None,
 ) -> str:
     """
     The `jarvis status` reply, as a pure function of the state it
@@ -542,12 +726,29 @@ def _status_line(
         # talking". Two `jarvis status` calls ten seconds apart tell
         # those apart instantly.
         line += f" {DOT} speaking (wake word paused)"
+    if aec:
+        # Whether "hey jarvis" works over music right now is the
+        # question this answers -- covering means yes, everything else
+        # means the output gate holds while anything plays, as it did
+        # before echo_canceller.py. See echo_canceller.Canceller.coverage
+        # for the full set of names.
+        line += f" {DOT} AEC {aec.replace('_', ' ')}"
     if seconds_since_listener_beat > LISTENER_STALL_SECONDS:
         # The listener loop has crash containment, but a thread that dies
         # anyway leaves this socket answering cheerfully while nothing is
         # listening at all -- the precise failure that containment was
         # added for. Say so rather than imply health.
         line += f" {DOT} listener stalled {seconds_since_listener_beat:.0f}s"
+    if render_error:
+        # hud.last_render_error() existed all along -- "surfaced by
+        # `jarvis status`" was the plan in its own comment -- but
+        # nothing ever actually called it from here. A render-thread
+        # exception is swallowed by design (a drawing bug must never
+        # take the listener down), which is exactly why this is the one
+        # place left that can still say so. Last line only, not the
+        # full traceback: this is a one-line status reply, not a log.
+        summary = render_error.strip().splitlines()[-1] if render_error.strip() else render_error
+        line += f" {DOT} HUD render error: {summary}"
     return line
 
 
@@ -571,6 +772,23 @@ SPEECH_ONSET_FRAMES = _frames(0.24)  # consecutive VAD-positive frames required
 MAX_COMMAND_FRAMES = _frames(7.2)  # hard cap per command
 SESSION_IDLE_TIMEOUT_FRAMES = _frames(4 * 60)  # session auto-closes after this much silence
 PRE_BUFFER_FRAMES = _frames(0.3)  # kept rolling so speech-onset isn't clipped by VAD detection lag
+# A separate constant from PRE_BUFFER_FRAMES above -- same rolling-
+# buffer idea, but sized against HOTKEY_HOLD_THRESHOLD_SECONDS rather
+# than VAD detection lag, which is a different problem with a different
+# number behind it (and PRE_BUFFER_FRAMES is still used for its own
+# original purpose, in the session-listening path). hotkey_pre_buffer
+# rolls continuously from the moment the key goes down, and only
+# whatever's in it at the instant of confirmation becomes the start of
+# hotkey_frames -- so this has to cover at least the full hold threshold
+# plus a frame of margin, or someone who starts speaking right at press
+# and finishes before confirmation would have the start of their
+# utterance silently aged out of the deque before it's ever read. At
+# the original 0.22s threshold, 0.3s (one frame of margin) already
+# covered this; raising the threshold without raising this alongside it
+# would have reopened exactly the clipping problem PRE_BUFFER_FRAMES's
+# own 0.3s was chosen to prevent, just for push-to-talk instead of the
+# session path.
+HOTKEY_PRE_BUFFER_FRAMES = _frames(HOTKEY_HOLD_THRESHOLD_SECONDS + FRAME_SECONDS)
 DEEP_SLEEP_IDLE_SECONDS = 30 * 60  # unload the heavy models after this long with nothing happening
 INPUT_WATCHDOG_SECONDS = 5.0  # no audio callback at all for this long, on a
 # stream that's supposed to be open and running, means the stream/device
@@ -933,8 +1151,23 @@ def main():
         wake_model = WakeWordModel(wakeword_models=[WAKE_WORD], inference_framework="onnx")
     with hud.boot_step("output guard", f"peak \u2265 {output_monitor.PEAK_THRESHOLD:.2f} \u00b7 render endpoint"):
         output_monitor.start()
+    with hud.boot_step("echo canceller", "webrtc aec3 \u00b7 loopback reference") as _aec_step:
+        # Never raises -- a missing livekit wheel or a native load
+        # failure just leaves the output gate unconditional, i.e. exactly
+        # how Jarvis behaved before echo_canceller.py existed.
+        _aec_failure = echo_canceller.start()
+        if _aec_failure:
+            _aec_step.detail = "unavailable \u00b7 system audio still pauses the wake word"
+            _log_event("aec_unavailable", error=_aec_failure)
     with hud.boot_step("voice", f"piper \u00b7 en_GB {tts_voice}"):
         pass
+    with hud.boot_step("timers", "logs/memory.json"):
+        # Re-arms whatever timers.json still has on record from before
+        # this process last quit -- a quit-on-sleep/restart-on-wake
+        # cycle (see scheduler/README.md) must not silently drop a
+        # timer that was running when the machine went down. One
+        # already overdue by boot fires right here, not silently.
+        timers.restore()
     with hud.boot_step("control link", f"{CONTROL_HOST}:{CONTROL_PORT}"):
         pass
 
@@ -943,11 +1176,38 @@ def main():
         f"RIGHT CTRL any time \u00b7 unloads after {DEEP_SLEEP_IDLE_SECONDS // 60}min idle",
         "dim",
     )
-    hud.line("jarvis status | stats | debug | pause | resume | quit", "dim")
+    hud.line("jarvis status | stats | debug | aec | pause | resume | quit", "dim")
     hud.set_state(hud.ARMED)
     earcons.play("boot")
-    speak(phrases.pick("boot"))
+    # morning_briefing() replaces the old flat phrases.pick("boot") --
+    # same call site, but a warmer, factual greeting (time of day,
+    # battery, what's already open) instead of a fixed "online and at
+    # your service, sir." Falls back to the plain boot phrase on any
+    # failure at all: psutil/win32gui hiccups here must never cost the
+    # one thing that already worked, an audible sign the process is up.
+    try:
+        _briefing_text = morning_briefing()
+    except Exception:
+        _log_event("briefing_failed", traceback=traceback.format_exc())
+        _briefing_text = ""
+    speak(_briefing_text or phrases.pick("boot"))
     _log_event("boot", whisper=WHISPER_MODEL_SIZE, voice=tts_voice)
+
+    # Not a hud.boot_step -- there's nothing being loaded here, just a
+    # one-shot diagnostic read that stays silent unless there's actually
+    # something to say. See audio_endpoint.get_input_volume's docstring
+    # for exactly what this can and can't see (the software level
+    # slider, not a driver's separate hardware "Boost" property).
+    _input_level = audio_endpoint.get_input_volume()
+    if _input_level is not None and _input_level >= _HIGH_INPUT_LEVEL_WARNING:
+        _percent = round(_input_level * 100)
+        _log_event("input_level_high", level=_input_level)
+        hud.line(
+            f"Mic input level looks high ({_percent}%) -- if speech keeps "
+            "coming through garbled, worth turning it down under Sound settings.",
+            "warn",
+        )
+        speak(phrases.pick("input_level_high", percent=_percent))
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
 
@@ -972,6 +1232,13 @@ def main():
         "enabled": True,
         "hotkey_active": False,
         "hotkey_frames": [],
+        # Wall-clock time of the current physical press, or None when
+        # the key is up -- distinct from hotkey_active, which only
+        # becomes True once the hold is *confirmed* (see
+        # HOTKEY_HOLD_THRESHOLD_SECONDS). A press that never reaches the
+        # threshold sets this and then clears it again on release
+        # without hotkey_active ever having been touched at all.
+        "hotkey_pressed_at": None,
         "stop": False,
         "last_activity": time.time(),
         "mode": "wake",
@@ -997,6 +1264,29 @@ def main():
         # edge, separately from is_speaking()/hotkey_active/enabled.
         "output_was_playing": False,
         "output_playing_since": 0.0,
+        # The gate itself, which since echo_canceller.py is no longer
+        # the same thing as "output playing": playing *and* not covered
+        # by echo cancellation. Its own edge drives the drain/reset;
+        # gated_seconds accumulates the deaf time within one playback
+        # stretch, for output_playing_stopped (tools/_report.py).
+        "output_gated": False,
+        "output_gated_since": 0.0,
+        "output_gated_seconds": 0.0,
+        "aec_reason": "unavailable",
+        "aec_stats_logged_at": 0.0,
+        # Which HUD lines this playback stretch has already shown -- see
+        # _check_output_gate's _announce_gate. Reset on each new stretch.
+        "output_pause_announced": False,
+        "aec_on_announced": False,
+        # Session speech onsets refused for not clearing the echo floor
+        # while output played -- counted, and flushed to the log at most
+        # every ECHO_REJECT_LOG_SECONDS. Owned by the listener thread.
+        "echo_rejected_frames": 0,
+        "echo_rejected_logged_at": 0.0,
+        # Same bookkeeping for frames Silero called speech that were
+        # digital silence -- see _is_session_speech's silence floor.
+        "silent_rejected_frames": 0,
+        "silent_rejected_logged_at": 0.0,
         # Rolling high-water mark for sub-threshold wake scores -- see
         # WAKE_NEAR_MISS_FLOOR. Owned by the listener thread alone.
         "wake_best_score": 0.0,
@@ -1032,12 +1322,24 @@ def main():
         "dictating": False,
         # Observability -- see _record_stat/_format_stats. In-memory
         # only, never persisted -- resets to zero on every restart, same
-        # lifetime as everything else in `state`.
+        # lifetime as everything else in `state` (`jarvis stats`'s own
+        # rolling p50/p95 view). The *durable* record of the same
+        # numbers is per-utterance instead -- see current_timings below
+        # -- logged once per utterance rather than kept as a live
+        # window, so 40 process restarts no longer means 40 discarded
+        # sessions' worth of where-the-time-went data.
         "stats": {
             "total": 0,
             "recent": deque(maxlen=20),
             "timings": {stage: deque(maxlen=60) for stage in _TIMED_STAGES},
         },
+        # Reset at the start of processing each utterance (right before
+        # _transcribe, the earliest stage), populated by _record_timing
+        # alongside the rolling deques above, and read once by
+        # _record_stat when it logs that utterance's "outcome" event --
+        # a snapshot of *this one utterance's* stage timings, not an
+        # accumulating structure like "stats" above.
+        "current_timings": {},
     }
 
     def audio_callback(indata, frames, time_info, status):
@@ -1079,6 +1381,19 @@ def main():
                 lo, hi = state["quiet_peak_lo"], state["quiet_peak_hi"]
                 state["quiet_peak_lo"] = peak if lo is None else min(lo, peak)
                 state["quiet_peak_hi"] = peak if hi is None else max(hi, peak)
+            # After the health bookkeeping above, never before: that
+            # judges the *device* (a wedged converter vs a quiet room is
+            # told apart by raw variation), and cancelled audio can sit
+            # far quieter than anything the device actually delivered.
+            # Returns the raw block untouched while nothing is playing,
+            # and on any failure of its own (it never raises) -- see
+            # echo_canceller.py. ~1ms of work per 80ms block. Contained
+            # here anyway: if that contract ever broke, the raw frame is
+            # still worth queueing, not dropping with it.
+            try:
+                mono = echo_canceller.process(mono)
+            except Exception:
+                _log_event("aec_process_error", traceback=traceback.format_exc())
             audio_q.put(mono)
         except Exception:
             _log_event("audio_callback_error", traceback=traceback.format_exc())
@@ -1152,26 +1467,54 @@ def main():
             hud.note(f"dropped {dropped} stale audio frame(s)")
         return dropped
 
-    def _record_stat(category: str, text: str, note: str = "") -> None:
+    def _record_stat(category: str, text: str, note: str = "", status: str = "ok") -> None:
         """
         Cheap, best-effort usage tracking for `jarvis stats` (the
         control socket) -- a running count per outcome category plus a
         rolling log of the last few, so "why does this feel slow/wrong"
         has something better to go on than re-reading scrollback. Called
         at every meaningful exit point of _handle_transcript.
+
+        `status` ("ok" | "no_effect" | "failed", from actions.Outcome)
+        only ever changes which *category* the count lands under: a
+        failed dispatch is recorded as "<category>_failed" instead of
+        `category` itself, so `jarvis stats` stops silently counting a
+        failure as a success -- confirmed live as a real gap, not a
+        theoretical one: every action used to return a bare string, so
+        "That didn't take, sir" landed in the exact same "fast_path"/
+        "llm_action" bucket as "Minimised, sir." "no_effect" stays under
+        the plain category on purpose: the resolution path still worked
+        correctly, there was just nothing to do, which is a different
+        thing from a real failure. Every other call site (off_duty,
+        declined, no_match, ...) doesn't pass status at all, so it
+        defaults to "ok" and behaves exactly as before.
         """
         stats = state["stats"]
         stats["total"] += 1
-        stats[category] = stats.get(category, 0) + 1
-        stats["recent"].append({"ts": time.time(), "text": text, "category": category, "note": note})
+        effective_category = f"{category}_failed" if status == "failed" else category
+        stats[effective_category] = stats.get(effective_category, 0) + 1
+        stats["recent"].append({"ts": time.time(), "text": text, "category": effective_category, "note": note})
         hud.set_counters(
-            cmds=stats.get("fast_path", 0) + stats.get("llm_action", 0),
-            llm=stats.get("llm_action", 0) + stats.get("llm_chat", 0),
+            cmds=(
+                stats.get("fast_path", 0)
+                + stats.get("fast_path_failed", 0)
+                + stats.get("llm_action", 0)
+                + stats.get("llm_action_failed", 0)
+            ),
+            llm=stats.get("llm_action", 0) + stats.get("llm_action_failed", 0) + stats.get("llm_chat", 0),
         )
-        _log_event("outcome", category=category, text=text, note=note)
+        _log_event(
+            "outcome",
+            category=effective_category,
+            text=text,
+            note=note,
+            status=status,
+            timings={stage: round(seconds, 3) for stage, seconds in state["current_timings"].items()},
+        )
 
     def _record_timing(stage: str, seconds: float) -> None:
         state["stats"]["timings"][stage].append(seconds)
+        state["current_timings"][stage] = seconds
 
     def _restore_steady_state() -> None:
         """
@@ -1281,6 +1624,20 @@ def main():
                 state["input_silent"] = False
                 _log_event("input_signal_returned", silent_seconds=round(silent_for, 1))
                 hud.line("Mic signal is back.", "ok")
+                hud.end_flash()
+                # Only clears if nothing else is currently blocking --
+                # recovering from a wedge mid-hotkey-press shouldn't
+                # claim the mic is listening again before the press
+                # actually ends; the routine gating check re-asserts its
+                # own reason on its own next pass regardless.
+                _still_blocked = (
+                    state["hotkey_active"]
+                    or not state["enabled"]
+                    or is_speaking()
+                    or state["output_gated"]
+                )
+                if not _still_blocked:
+                    hud.set_input_blocked(None)
             return
         if state["input_silent"]:
             return  # already latched, already reported, already reopened once
@@ -1306,50 +1663,224 @@ def main():
             "constant value, which means it is wedged, not merely quiet. Reopening once.",
             "warn",
         )
+        # A hard fault, not a routine "not listening right now" -- gets
+        # its own band colour (reusing ERROR/PROBLEM, the same one a
+        # failed dispatch reaches, rather than growing the palette
+        # further for what the room lights already treat as "something
+        # is wrong") in addition to the status-strip text, so the room
+        # itself shows it, not just something that has to be read.
+        # Historically this reached `jarvis status` only, for 50
+        # minutes straight, while the band kept showing ordinary ARMED
+        # red the whole time -- see KNOWN_LIMITATIONS.md.
+        hud.begin_flash(hud.ERROR)
+        hud.set_input_blocked("NO MIC SIGNAL")
         _reopen_input_stream(reason="frozen capture device")
+
+    def _aec_coverage() -> "tuple[bool, str]":
+        # Its own containment, inside the gate's: a failure asking the
+        # canceller must read as "not covering" (gate exactly as before
+        # echo cancellation existed), never as "covering".
+        try:
+            return echo_canceller.coverage()
+        except Exception:
+            _log_event("aec_coverage_failed", traceback=traceback.format_exc())
+            return False, "error"
 
     def _check_output_gate() -> bool:
         """
-        Returns True while the system's default audio output is
-        playing -- see output_monitor.py. Named and extracted the same
-        way _check_input_signal is, for the same reason: this is state
-        that needs to persist across calls (state["output_was_playing"],
-        the falling-edge drain below) and be testable on its own,
-        against the real listener_loop closure, without having to run
-        the whole loop.
+        Returns True while the listener must ignore the mic because of
+        system output: the default render endpoint is playing (see
+        output_monitor.py) *and* echo cancellation isn't demonstrably
+        covering it (see echo_canceller.py). Before echo cancellation
+        those were the same thing, and they still are whenever coverage
+        is in any doubt -- AEC unavailable, switched off with `jarvis
+        aec off`, still converging, residual echo too loud, a reference
+        that stopped flowing. Fail closed.
+
+        Named and extracted the same way _check_input_signal is, for the
+        same reason: this is state that needs to persist across calls
+        (playback and gate edges, the drain below) and be testable on
+        its own, against the real listener_loop closure, without having
+        to run the whole loop.
 
         Not folded into the combined hotkey/enabled/is_speaking skip
         condition at its call site -- that combined condition only ever
         needs the current value, but this needs to notice the specific
-        transition back to "not playing" to drain the backlog it caused,
+        transition back to "not gated" to drain the backlog it caused,
         which none of those other three gates require (they only ever
         block for seconds; see the drain's own comment for why that
         distinction matters here).
         """
         output_playing = output_monitor.is_output_playing()
+        covering, aec_reason = _aec_coverage()
+        gated = output_playing and not covering
+        state["aec_reason"] = aec_reason
+        aec_active = aec_reason not in ("unavailable", "off")
+        now = time.time()
+
+        def _announce_gate() -> None:
+            # "converging" is the second or so at the start of every
+            # song -- and of every one of Jarvis's own replies, which
+            # this meter sees too. Announcing it would print a paused/
+            # resumed pair around nearly everything that plays; only a
+            # gate that's going to *stay* up is worth a line.
+            if aec_reason != "converging" and not state["output_pause_announced"]:
+                state["output_pause_announced"] = True
+                if aec_active:
+                    hud.line(f"System audio playing -- echo cancellation {aec_reason.replace('_', ' ')}, \"hey jarvis\" paused; Right Ctrl still works.", "dim")
+                else:
+                    hud.line("System audio playing -- \"hey jarvis\" is paused; Right Ctrl still works.", "dim")
+
+        started_now = False
         if output_playing and not state["output_was_playing"]:
+            started_now = True
             state["output_was_playing"] = True
-            state["output_playing_since"] = time.time()
+            state["output_playing_since"] = now
+            state["output_gated_seconds"] = 0.0
+            state["output_pause_announced"] = False
+            state["aec_on_announced"] = False
+            # The first periodic aec_stats lands one interval in, once
+            # the canceller has had time to converge on this audio.
+            state["aec_stats_logged_at"] = now
             # Structured, not just HUD -- same reasoning as
             # wake_triggered/input_silent: this is exactly the fact
             # someone reconstructing "why didn't hey jarvis work just
             # now" needs, and the HUD line alone leaves no durable trace.
-            _log_event("output_playing_started")
-            hud.line("System audio playing -- \"hey jarvis\" is paused; Right Ctrl still works.", "dim")
-        elif not output_playing and state["output_was_playing"]:
-            state["output_was_playing"] = False
-            _log_event(
-                "output_playing_stopped",
-                seconds=round(time.time() - state["output_playing_since"], 1),
-            )
+            _log_event("output_playing_started", gated=gated, aec=aec_reason)
+
+        if gated:
+            # Every call, not just the edge: a gate that opened as
+            # "converging" and turned into "residual_high" a second later
+            # is announced then.
+            _announce_gate()
+        if gated and not state["output_gated"]:
+            state["output_gated"] = True
+            state["output_gated_since"] = now
+            if not started_now:
+                # Coverage lost partway through playback -- a new
+                # output device, residual echo climbing, the reference
+                # dropping out. Exactly the moment someone asks "why did
+                # it stop hearing me", so logged whatever the reason.
+                _log_event("aec_coverage", covering=False, reason=aec_reason, **echo_canceller.stats())
+        elif not gated and state["output_gated"]:
+            state["output_gated"] = False
+            state["output_gated_seconds"] += now - state["output_gated_since"]
             # Unlike is_speaking() (seconds), this gate can hold for the
             # length of a song or a playlist -- draining here stops
             # audio_q from banking minutes of stale frames that would
-            # otherwise all get burst-processed the instant output
-            # stops, at replay speed, as if freshly captured.
+            # otherwise all get burst-processed the instant the gate
+            # lifts, at replay speed, as if freshly captured.
             _drain_audio_queue()
-            hud.line("System audio stopped -- listening again.", "dim")
-        return output_playing
+            # And the acoustic models restart clean: frames were thrown
+            # away for the whole gated stretch, so openWakeWord's rolling
+            # window and Silero's recurrent state would otherwise stitch
+            # the audio either side of the gap together as if contiguous
+            # -- the same reason a stream reopen and a resume reset them.
+            state["reset_acoustic"] = True
+            if output_playing:
+                _log_event("aec_coverage", covering=True, reason=aec_reason, **echo_canceller.stats())
+                # Not while Jarvis is the one talking: the meter sees its
+                # replies like any other audio, and is_speaking() already
+                # covers those -- a line per reply would be pure noise.
+                if not state["aec_on_announced"] and not is_speaking():
+                    state["aec_on_announced"] = True
+                    hud.line("System audio playing -- echo cancellation on, \"hey jarvis\" still works.", "dim")
+
+        if not output_playing and state["output_was_playing"]:
+            state["output_was_playing"] = False
+            # Every stop, not just a gated one. The gate-release reset
+            # above only fires if the gate actually held -- and with echo
+            # cancellation covering, Jarvis's own replies no longer gate,
+            # so Silero carried the reply's residual straight into the
+            # next listen and called the silence after it speech (see
+            # _is_session_speech's silence floor). No drain: covered
+            # frames were never held back, so there is no stale backlog.
+            state["reset_acoustic"] = True
+            stopped = {
+                "seconds": round(now - state["output_playing_since"], 1),
+                # The part of `seconds` actually spent deaf -- all of it
+                # without echo cancellation, a convergence blip with it.
+                "gated_seconds": round(state["output_gated_seconds"], 1),
+            }
+            if aec_active:
+                stopped["aec"] = echo_canceller.stats()
+            _log_event("output_playing_stopped", **stopped)
+            if state["output_pause_announced"]:
+                hud.line("System audio stopped -- listening again.", "dim")
+
+        # Periodic measurements while echo cancellation is actually in
+        # play -- what every provisional threshold in echo_canceller.py
+        # is meant to be revisited from.
+        if output_playing and aec_active and now - state["aec_stats_logged_at"] >= AEC_STATS_LOG_SECONDS:
+            state["aec_stats_logged_at"] = now
+            _log_event("aec_stats", gated=gated, **echo_canceller.stats())
+        return gated
+
+    def _is_session_speech(chunk: np.ndarray, prob: float) -> bool:
+        """
+        Silero's verdict on one session frame, plus -- only while system
+        output is playing -- the echo floor.
+
+        With output playing, the listener only gets this far at all if
+        echo cancellation is covering (otherwise _check_output_gate
+        holds). Cancellation leaves a residual, though, and residual
+        lyrics or dialogue can still look like speech to Silero at
+        VAD_SPEECH_THRESHOLD, which was tuned to be sensitive. What
+        residual can't do is be as loud as the user's own near-field
+        voice relative to the cancelled floor -- see
+        echo_canceller.ECHO_ONSET_MARGIN_DB. Used for both onset and
+        end-of-utterance, so a command spoken over music ends when the
+        user stops, not at MAX_COMMAND_FRAMES.
+
+        Fails closed: an error here refuses the frame, which at worst
+        is as deaf over music as Jarvis was before echo cancellation.
+        """
+        if prob < VAD_SPEECH_THRESHOLD:
+            return False
+        # Digital silence is never speech, whatever Silero says -- and it
+        # does say so. Silero's recurrent state, after even a faint
+        # residual of speech (AEC3's leftover of Jarvis's own reply, -40
+        # to -85 dBFS) followed by exact zeros, climbs (0.37 -> 0.62) and
+        # holds >= VAD_SPEECH_THRESHOLD for 3-20 frames -- reproduced
+        # offline with the real model and Piper audio of the real replies;
+        # zeros after a reset score 0.04. AEC3's suppressor outputs exact
+        # zeros, and this mic's SST DSP floors a quiet room to 1-3 LSB
+        # anyway (see INPUT_SILENCE_FLOOR). Confirmed live as the cause of
+        # a loop, not a hypothetical: a phantom recording ~1s after every
+        # reply, raw peak 1-2 LSB or 0.0, transcribed as "you you" and
+        # TRANSCRIBE_HOTWORDS' "how many files", each answered, each
+        # answer priming the next. Before echo cancellation the output
+        # gate held through every reply and its release reset Silero, so
+        # this never surfaced; see _check_output_gate's falling edge for
+        # that half of the fix.
+        if float(np.max(np.abs(chunk))) <= INPUT_SILENCE_FLOOR:
+            state["silent_rejected_frames"] += 1
+            now = time.time()
+            if now - state["silent_rejected_logged_at"] >= ECHO_REJECT_LOG_SECONDS:
+                _log_event("silent_vad_rejected", frames=state["silent_rejected_frames"], mode=state["mode"])
+                state["silent_rejected_frames"] = 0
+                state["silent_rejected_logged_at"] = now
+            return False
+        if not state["output_was_playing"]:
+            return True
+        try:
+            if echo_canceller.above_echo_floor(chunk):
+                return True
+        except Exception:
+            _log_event("echo_floor_check_failed", traceback=traceback.format_exc())
+        state["echo_rejected_frames"] += 1
+        now = time.time()
+        if now - state["echo_rejected_logged_at"] >= ECHO_REJECT_LOG_SECONDS:
+            _log_event(
+                "echo_onset_rejected",
+                frames=state["echo_rejected_frames"],
+                frame_dbfs=round(echo_canceller.dbfs(chunk), 1),
+                floor_dbfs=echo_canceller.stats().get("floor_dbfs"),
+                mode=state["mode"],
+            )
+            state["echo_rejected_frames"] = 0
+            state["echo_rejected_logged_at"] = now
+        return False
 
     # Push-to-talk used to open a brand-new sd.InputStream on every single
     # press and tear it down on release -- the same class of Windows
@@ -1360,19 +1891,38 @@ def main():
     # actual speech" even when something was said. Opened once here instead
     # and kept running for the process's life; on_press/on_release below
     # just toggle whether the callback is actually buffering frames.
+    # Rolling pre-buffer, kept live at all times regardless of whether
+    # the key is currently held -- the same rolling-buffer trick the
+    # session-listening path uses (see pre_buffer below), but sized by
+    # its own HOTKEY_PRE_BUFFER_FRAMES, not the session path's
+    # PRE_BUFFER_FRAMES -- see that constant's own comment for why they
+    # can't share one. Covers the full HOTKEY_HOLD_THRESHOLD_SECONDS, so
+    # confirming a hold costs none of the leading audio from whatever
+    # was actually said starting right at the press. Deliberately
+    # cheap: a deque append, nothing else, so it adds no real cost to a
+    # callback that already runs continuously for the process's life.
+    hotkey_pre_buffer: "deque[np.ndarray]" = deque(maxlen=HOTKEY_PRE_BUFFER_FRAMES)
+
     def hotkey_callback(indata, frames, time_info, status):
         # Same unconditional guard as audio_callback, for the same
         # reason -- and it matters more here, since push-to-talk is the
         # documented manual override that is supposed to keep working
-        # whatever else has gone wrong.
+        # whatever else has gone wrong. Deliberately does no HUD writes
+        # or interrupt_speech() bookkeeping of its own -- this is the
+        # realtime audio thread, and that work happens in
+        # _confirm_hotkey_hold instead, on the hold-confirmation timer's
+        # own thread, exactly so it never risks this callback overrunning
+        # its budget and dropping frames.
         try:
             if status:
                 hud.note(f"push-to-talk input stream status: {status}")
             state["hotkey_last_chunk"] = time.time()
+            mono = indata[:, 0].copy()
             if state["hotkey_active"]:
-                mono = indata[:, 0].copy()
                 hud.feed_level(float(np.abs(mono).max()))
                 state["hotkey_frames"].append(mono)
+            else:
+                hotkey_pre_buffer.append(mono)
         except Exception:
             _log_event("hotkey_callback_error", traceback=traceback.format_exc())
 
@@ -1524,6 +2074,16 @@ def main():
             # silence check would latch "no mic signal" the instant the
             # listener drained its first chunk after any real pause.
             state["main_signal_at"] = time.time()
+            if state["input_silent"]:
+                # A fresh stream, not a recovery _check_input_signal
+                # itself observed -- that function's own recovery path
+                # (which also calls these two) never runs for this
+                # transition, so a wedge that was still latched right
+                # before a pause would otherwise leave the ERROR flash
+                # stuck open-ended through the resume, with nothing left
+                # to ever clear it.
+                hud.end_flash()
+                hud.set_input_blocked(None)
             state["input_silent"] = False
             state["signal_run"] = 0
             state["quiet_peak_lo"] = None
@@ -1536,6 +2096,7 @@ def main():
             # (output_monitor polls independently); only this
             # edge-tracking bookkeeping can go stale.
             state["output_was_playing"] = False
+            state["output_gated"] = False
             # _stream_lock, not _processing_lock -- see its own comment.
             # This is the one place resume can race the listener
             # thread's own watchdog reopen (both see `stream is None`
@@ -1623,7 +2184,7 @@ def main():
         "Chrome Discord Visual Studio Code VS Code File Explorer Settings Spotify "
         "local disk D desktop virtual desktop next desktop previous desktop "
         "minimize focus switch open close laptop monitor screen "
-        "how many files folder windows"
+        "how many windows"
     )
 
     # Segment-level confidence, gated on separately from the transcript
@@ -1669,7 +2230,10 @@ def main():
         # below). Measured directly: uncapped, 3s of white noise
         # transcribed as "how many files folder windows bdk wallet bdk"
         # and took 42+ seconds.
-        peak = np.max(np.abs(audio))
+        abs_audio = np.abs(audio)
+        peak = np.max(abs_audio)
+        # On the *pre-gain* signal -- see _CLIP_SAMPLE_FLOOR's comment.
+        clipped_fraction = float(np.mean(abs_audio >= _CLIP_SAMPLE_FLOOR))
         if peak > 1e-4:
             gain = min(1.0 / peak, _MAX_NORMALIZE_GAIN)
             audio = audio * gain
@@ -1716,6 +2280,7 @@ def main():
             "max_temperature": max((seg.temperature for seg in segments), default=0.0),
             "n_segments": len(segments),
             "peak": float(peak),
+            "clipped_fraction": clipped_fraction,
         }
         return text, confident, quality
 
@@ -1753,9 +2318,27 @@ def main():
         # HUD note plus a structured field rather than a warning line:
         # one clipped utterance is unremarkable, a run of them is the
         # finding, and that pattern is only visible in the log.
+        #
+        # Deliberately a looser trigger than _REJECT_CLIP_FRACTION below
+        # -- this fires on a single sample touching full scale (one loud
+        # syllable can do that without the utterance being structurally
+        # clipped throughout), so it stays an informational breadcrumb,
+        # never a rejection. clipped_fraction is the stricter, "how much
+        # of this utterance was actually flat-topped" signal that feeds
+        # _should_reject_transcript's shadow-only "clipped" reason
+        # instead -- logged here too so one line carries both.
         if quality.get("peak", 0.0) >= _CLIPPING_PEAK:
-            _log_event("input_clipped", text=text, peak=quality.get("peak", 0.0))
-            hud.note(f"input clipped (peak {quality.get('peak', 0.0):.3f}) -- check the Windows mic level/boost")
+            _log_event(
+                "input_clipped",
+                text=text,
+                peak=quality.get("peak", 0.0),
+                clipped_fraction=quality.get("clipped_fraction", 0.0),
+            )
+            hud.note(
+                f"input clipped (peak {quality.get('peak', 0.0):.3f}, "
+                f"{quality.get('clipped_fraction', 0.0):.0%} of samples) -- "
+                "check the Windows mic level/boost"
+            )
 
         # Logged on *every* non-empty utterance, not just rejected ones --
         # this is the dataset TRANSCRIPT_GATE_ENFORCED's threshold gets
@@ -1830,6 +2413,33 @@ def main():
         result = matcher.match(text)
         _record_timing("match", time.perf_counter() - _t0)
 
+        # See _ACOUSTICALLY_GATED_SEEDS' own comment for the full
+        # reasoning -- reuses _acoustic_reject_reason's exact thresholds
+        # (Phase 0's clipping/quiet-audio work is what makes that signal
+        # trustworthy enough to act on here, not just log). Deliberately
+        # the acoustic-only helper, not the full _should_reject_transcript:
+        # every gated seed is, by construction, also a
+        # _HALLUCINATION_DENYLIST entry, so the full function's denylist
+        # check would reject these on every single call regardless of
+        # audio quality -- see _acoustic_reject_reason's own docstring.
+        # Treated as though nothing were heard at all, not a decline:
+        # the whole point is that this may not have been real speech in
+        # the first place, so no cue, no reply, nothing to see on the
+        # HUD -- silence answered with silence.
+        if result.intent is not None and result.closest_seed in _ACOUSTICALLY_GATED_SEEDS:
+            reject_reason = _acoustic_reject_reason(quality)
+            if reject_reason is not None:
+                _log_event(
+                    "social_intent_rejected",
+                    text=text,
+                    intent=result.intent,
+                    seed=result.closest_seed,
+                    reason=reject_reason,
+                    **quality,
+                )
+                _record_stat("rejected", text, f"social:{reject_reason}")
+                return False
+
         # "disable_listening" is context-dependent: mid-session it just
         # closes the session (wake word opens a new one later); said via
         # push-to-talk with no session open, it's the master mic-off.
@@ -1863,6 +2473,24 @@ def main():
             _set_enabled(True)
             hud.resolve("back online")
             _record_stat("meta", text, "resume")
+            return False
+
+        # Meta intents, not real dispatchable actions -- nothing in
+        # actions.py handles them, same shape as disable_listening/
+        # enable_listening above (and placed before the off-duty check
+        # below for the same reason: said via push-to-talk while paused
+        # is still a deliberate, intentional utterance). Already passed
+        # the acoustic gate above by the time either of these can be
+        # reached.
+        if result.intent == "social_thanks":
+            hud.resolve("acknowledged")
+            speak(phrases.pick("social_thanks_reply"))
+            _record_stat("meta", text, "social_thanks")
+            return False
+        if result.intent == "social_ack":
+            hud.resolve("acknowledged")
+            speak(phrases.pick("social_ack_reply"))
+            _record_stat("meta", text, "social_ack")
             return False
 
         if not state["enabled"]:
@@ -2101,47 +2729,130 @@ def main():
         elif parsed["action"] == "focus_vscode_repo":
             state["last_app"] = "vscode"
 
+        # "understood" fires here, before dispatch, not after -- the
+        # earcons exist for latency (see earcons.py), and a cold app
+        # launch can take ~5s; delaying this chirp until the outcome is
+        # known would delay the one immediate "heard you" signal by
+        # exactly the amount of time it's meant to hide. A second,
+        # quieter cue below reports the *outcome* once it's known,
+        # instead -- success stays silent, since the spoken reply
+        # already carries that.
         earcons.play("understood")
+        # Steady for the dispatch itself, not just a 0.45s flash *after*
+        # -- a cold app launch can take ~5s (focus_or_launch_app polls
+        # for the new window at 0.25s intervals, up to 20 times) with
+        # nothing at all shown for that whole stretch otherwise. Closed
+        # out by hud.reply()'s own flash() call just below, which
+        # unconditionally replaces whatever's in the flash slot -- gold
+        # again on success, red on a real failure -- so this needs no
+        # matching end_flash() of its own.
+        hud.begin_flash(hud.ACTING)
         _t0 = time.perf_counter()
-        message = dispatch_llm_action(parsed, text)
+        outcome = dispatch_llm_action(parsed, text)
         _record_timing("action", time.perf_counter() - _t0)
-        hud.reply(message)
-        speak(message)
-        _record_stat("llm_action" if via_llm else "fast_path", text, parsed["action"])
+        hud.reply(outcome.text, ok=(outcome.status != "failed"))
+        speak(outcome.text)
+        if outcome.status == "no_effect":
+            earcons.play("no_effect")
+        elif outcome.status == "failed":
+            earcons.play("error")
+        _record_stat("llm_action" if via_llm else "fast_path", text, parsed["action"], status=outcome.status)
         return False
 
     # --- push-to-talk: its own independent stream, always available ---
     # regardless of the main listener's state (on, mic-off, or deep
     # asleep) -- this is the one manual control guaranteed to work.
+    #
+    # Confirmation runs on its own threading.Timer thread, not inline in
+    # on_press and not in hotkey_callback -- deliberately neither. Not
+    # on_press: the whole point is to wait HOTKEY_HOLD_THRESHOLD_SECONDS
+    # before committing to anything, and on_press only fires once, at
+    # the start of the press. Not hotkey_callback: that runs on
+    # sounddevice's realtime audio thread, where the HUD writes and
+    # interrupt_speech() bookkeeping below do not belong (see that
+    # callback's own comment). A small dedicated lock -- not
+    # _processing_lock, which can be held up to 30s by an in-flight LLM
+    # call and has no business gating a key-hold decision -- serializes
+    # this against on_release, which runs on keyboard's own callback
+    # thread and can genuinely race it: a release landing at the exact
+    # instant the timer fires is the one case that needs a consistent
+    # answer to "did this count as a real hold", not two threads
+    # independently guessing.
+    _hotkey_confirm_lock = threading.Lock()
+    _hotkey_timer_holder = {"timer": None}
+
+    def _confirm_hotkey_hold():
+        with _hotkey_confirm_lock:
+            if state["hotkey_pressed_at"] is None:
+                return  # released (or raced by on_release) before this fired
+            if is_speaking():
+                # Barge-in: a confirmed press cuts off whatever's still
+                # being said instead of making the user wait it out --
+                # push-to-talk is the one control documented to work no
+                # matter what state Jarvis is in, including mid-reply.
+                # Voice alone can't safely do this (the session listener
+                # is fully muted while speaking specifically to avoid
+                # hearing its own voice back through the mic -- see
+                # is_speaking()'s other callers), but a physical key held
+                # with intent is unambiguously the user, not an echo.
+                interrupt_speech()
+                hud.line("Cutting myself off.", "dim")
+            # Stamped here, not just after transcription finishes (inside
+            # _handle_transcript) -- otherwise a long hold that starts
+            # right before the deep-sleep timeout leaves last_activity
+            # stale for the whole hold+transcribe duration, so the
+            # listener thread's idle check could fire (well, block on
+            # _processing_lock and then fire) right as this press is
+            # being processed.
+            state["last_activity"] = time.time()
+            # Seeded from the rolling pre-buffer, not started empty --
+            # see hotkey_pre_buffer's own comment: the time spent
+            # confirming this is a deliberate hold would otherwise be
+            # exactly the leading audio clipped off whatever was actually
+            # said starting right at the press.
+            # Flipped before touching the pre-buffer, not after -- this
+            # is what tells hotkey_callback (running concurrently on the
+            # realtime audio thread, deliberately without a lock of its
+            # own -- see that callback's own comment) to stop routing new
+            # frames into hotkey_pre_buffer and start routing them into
+            # hotkey_frames instead, narrowing the window in which a
+            # frame arriving at exactly this instant could be appended
+            # here and then cleared before ever being read. Not airtight
+            # (GIL-atomic per operation, not across the two together, so
+            # a single 80ms frame right at this boundary could still be
+            # lost) -- accepted deliberately, same trade-off hud.py's
+            # feed_level makes for the same reason: the alternative is
+            # the realtime callback taking a lock on every frame.
+            state["hotkey_active"] = True
+            state["hotkey_frames"] = list(hotkey_pre_buffer)
+            hotkey_pre_buffer.clear()
+            hud.set_state(hud.RECORDING)
+            hud.line("All ears.", "dim")
+
     def on_press(_event):
-        if state["hotkey_active"]:
-            return
-        if is_speaking():
-            # Barge-in: a manual press cuts off whatever's still being
-            # said instead of making the user wait it out -- push-to-talk
-            # is the one control documented to work no matter what state
-            # Jarvis is in, including mid-reply. Voice alone can't safely
-            # do this (the session listener is fully muted while
-            # speaking specifically to avoid hearing its own voice back
-            # through the mic -- see is_speaking()'s other callers), but
-            # a physical key press is unambiguously the user, not an echo.
-            interrupt_speech()
-            hud.line("Cutting myself off.", "dim")
-        # Stamped here, not just after transcription finishes (inside
-        # _handle_transcript) -- otherwise a long hold that starts right
-        # before the deep-sleep timeout leaves last_activity stale for
-        # the whole hold+transcribe duration, so the listener thread's
-        # idle check could fire (well, block on _processing_lock and
-        # then fire) right as this press is being processed.
-        state["last_activity"] = time.time()
-        state["hotkey_frames"] = []
-        state["hotkey_active"] = True
-        hud.set_state(hud.RECORDING)
-        hud.line("All ears.", "dim")
+        if state["hotkey_pressed_at"] is not None:
+            return  # OS auto-repeat while already held -- not a new press
+        state["hotkey_pressed_at"] = time.time()
+        timer = threading.Timer(HOTKEY_HOLD_THRESHOLD_SECONDS, _confirm_hotkey_hold)
+        timer.daemon = True
+        _hotkey_timer_holder["timer"] = timer
+        timer.start()
 
     def on_release(_event):
-        if not state["hotkey_active"]:
-            return
+        with _hotkey_confirm_lock:
+            state["hotkey_pressed_at"] = None
+            timer = _hotkey_timer_holder["timer"]
+            if timer is not None:
+                timer.cancel()  # best-effort -- if _confirm_hotkey_hold already started, this is a no-op
+                _hotkey_timer_holder["timer"] = None
+            if not state["hotkey_active"]:
+                # Never confirmed -- a tap, not a hold. Nothing was ever
+                # armed, so there is nothing to process and nothing worth
+                # logging: this is the exact case that used to be 215 of
+                # 216 logged push-to-talk presses (see
+                # HOTKEY_HOLD_THRESHOLD_SECONDS), and the fix is for it to
+                # leave no trace at all, not a quieter one.
+                return
         state["hotkey_active"] = False
         if not state["hotkey_frames"]:
             _restore_steady_state()
@@ -2190,6 +2901,20 @@ def main():
             try:
                 with _processing_lock:
                     _ensure_heavy_models_loaded()
+                    # Closed by _handle_transcript's own finally block
+                    # below (hud.end_flash()) regardless of how far
+                    # processing gets from here -- including the empty-
+                    # text early return -- so this needs no matching
+                    # end_flash of its own. Previously nothing at all
+                    # showed between "recording stopped" and "resolved";
+                    # only the LLM fallback (a separate, later stage) had
+                    # a THINKING state to show.
+                    hud.begin_flash(hud.THINKING)
+                    # Fresh for this utterance -- see current_timings'
+                    # own comment in the state dict. transcribe is the
+                    # earliest stage, so this is the one place that has
+                    # to be first.
+                    state["current_timings"] = {}
                     _t0 = time.perf_counter()
                     text, confident, quality = _transcribe(audio)
                     _record_timing("transcribe", time.perf_counter() - _t0)
@@ -2349,17 +3074,20 @@ def main():
             # word almost certainly false-triggering on loud music), and
             # several chunks of the song that followed embedded close
             # enough to real seed phrases to actually dispatch
-            # (volume_down/up), peak=1.0 on nearly every one.
+            # (volume_down/up), peak=1.0 on nearly every one. Since
+            # echo_canceller.py, it only holds while output is playing
+            # *and* not covered by echo cancellation -- with coverage,
+            # frames go on through, already cleaned of the speaker audio.
             #
             # Contained for the same reason as the block above: this runs
             # outside the main try, and an exception in it killed the
             # listener thread silently the first time round. Failing to
-            # "not playing" on error keeps the listener working rather
+            # "not gated" on error keeps the listener working rather
             # than leaving it permanently gated by a gate that threw.
             try:
-                output_playing = _check_output_gate()
+                output_gated = _check_output_gate()
             except Exception:
-                output_playing = False
+                output_gated = False
                 _log_event("output_gate_check_failed", traceback=traceback.format_exc())
                 hud.note(traceback.format_exc())
 
@@ -2372,12 +3100,40 @@ def main():
             # re-triggering itself, causing runaway desktop switches).
             #
             # Deliberately NOT applied to push-to-talk (hotkey_active is
-            # checked, output_playing is not, on that path -- see
+            # checked, output_gated is not, on that path -- see
             # on_press/on_release below): holding Right Ctrl and talking
             # over the music is exactly the override this project's own
             # convention keeps working no matter what else is true.
             _speaking_now = is_speaking()
-            if state["hotkey_active"] or not state["enabled"] or _speaking_now or output_playing:
+            if state["hotkey_active"] or not state["enabled"] or _speaking_now or output_gated:
+                # Persistent status-strip indicator -- see
+                # hud.set_input_blocked's docstring. Priority order picks
+                # the single most informative reason when more than one
+                # holds at once: a deliberate pause outranks the
+                # transient ones, since it's the one the user actually
+                # asked for and the one most likely to still be true
+                # later. This used to have *zero* persistent, glanceable
+                # signal at all -- only a one-shot debug note after
+                # LISTENER_GATE_STUCK_SECONDS, gone the moment anything
+                # else printed.
+                # A wedged mic outranks all four -- it must never be
+                # silently overwritten by one of these (see the
+                # clearing branch below for the other half of this: it
+                # must never be silently *cleared* by one either).
+                # Confirmed live as a real overlap, not a hypothetical
+                # one: KNOWN_LIMITATIONS.md's actual wedge incident
+                # records push-to-talk being tried *during* it.
+                if state["input_silent"]:
+                    pass
+                elif not state["enabled"]:
+                    hud.set_input_blocked("paused")
+                elif state["hotkey_active"]:
+                    hud.set_input_blocked("push-to-talk held")
+                elif _speaking_now:
+                    hud.set_input_blocked("speaking")
+                else:
+                    hud.set_input_blocked("system audio playing")
+
                 # Deaf-listener diagnosis -- see
                 # LISTENER_GATE_STUCK_SECONDS. Records *which* of the
                 # four gates is holding, once per continuous stretch,
@@ -2400,18 +3156,28 @@ def main():
                         hotkey_active=bool(state["hotkey_active"]),
                         paused=not state["enabled"],
                         speaking=bool(_speaking_now),
-                        output_playing=bool(output_playing),
+                        # The gate, as before echo cancellation; playing
+                        # and aec say why it held.
+                        output_gated=bool(output_gated),
+                        output_playing=bool(state["output_was_playing"]),
+                        aec=state["aec_reason"],
                     )
                     hud.note(
                         f"wake-word detection gated for "
                         f"{_now - state['gate_blocked_since']:.0f}s "
                         f"(hotkey={state['hotkey_active']} paused={not state['enabled']} "
-                        f"speaking={_speaking_now} output={output_playing})"
+                        f"speaking={_speaking_now} output={output_gated} aec={state['aec_reason']})"
                     )
                 continue
             if state["gate_blocked_since"] is not None:
                 state["gate_blocked_since"] = None
                 state["gate_blocked_logged"] = False
+                # Not if a wedge is still latched -- that's a different,
+                # higher-priority reason this same call would otherwise
+                # stomp on the moment the routine gate (which may have
+                # been true at the same time, see above) lets go first.
+                if not state["input_silent"]:
+                    hud.set_input_blocked(None)
 
             # Push-to-talk renews the conversation's idle countdown.
             # session_silence_run is a frame counter local to this loop,
@@ -2485,6 +3251,8 @@ def main():
                                 best_score=round(float(state["wake_best_score"]), 4),
                                 threshold=WAKE_THRESHOLD,
                                 window_seconds=WAKE_NEAR_MISS_WINDOW_SECONDS,
+                                output_playing=bool(state["output_was_playing"]),
+                                aec=state["aec_reason"],
                             )
                         state["wake_best_score"] = 0.0
                         state["wake_window_started"] = time.time()
@@ -2537,7 +3305,17 @@ def main():
                         # point: WAKE_THRESHOLD (0.5) was tuned without
                         # ever having a record of what real triggers
                         # (wanted or not) actually scored.
-                        _log_event("wake_triggered", score=round(float(_wake_score), 4))
+                        # output_playing/aec: a trigger *over* playing
+                        # audio is now possible on purpose (see
+                        # echo_canceller.py), and these are what tell a
+                        # wanted one from a residual-echo false trigger
+                        # when reading the log back.
+                        _log_event(
+                            "wake_triggered",
+                            score=round(float(_wake_score), 4),
+                            output_playing=bool(state["output_was_playing"]),
+                            aec=state["aec_reason"],
+                        )
                         state["wake_best_score"] = 0.0
                         state["wake_window_started"] = time.time()
                         state["mode"] = "session_listening"
@@ -2563,7 +3341,7 @@ def main():
                 elif state["mode"] == "session_listening":
                     pre_buffer.append(chunk)
                     prob = vad.speech_prob(chunk)
-                    if prob >= VAD_SPEECH_THRESHOLD:
+                    if _is_session_speech(chunk, prob):
                         session_silence_run = 0
                         speech_onset_run += 1
                         if speech_onset_run >= SPEECH_ONSET_FRAMES:
@@ -2608,7 +3386,7 @@ def main():
                     frame_count += 1
 
                     prob = vad.speech_prob(chunk)
-                    silence_run = 0 if prob >= VAD_SPEECH_THRESHOLD else silence_run + 1
+                    silence_run = 0 if _is_session_speech(chunk, prob) else silence_run + 1
 
                     if silence_run >= SILENCE_HANG_FRAMES or frame_count >= MAX_COMMAND_FRAMES:
                         audio = np.concatenate(command_frames)
@@ -2616,6 +3394,11 @@ def main():
                         # its definition above for why.
                         with _processing_lock:
                             _ensure_heavy_models_loaded()  # defense in depth -- see _set_enabled's mode reset for the actual fix
+                            # See the push-to-talk worker's identical
+                            # comment above -- closed by _handle_transcript's
+                            # own finally block, not here.
+                            hud.begin_flash(hud.THINKING)
+                            state["current_timings"] = {}
                             _t0 = time.perf_counter()
                             text, confident, quality = _transcribe(audio)
                             _record_timing("transcribe", time.perf_counter() - _t0)
@@ -2702,6 +3485,20 @@ def main():
         hotkey_stream.stop()
         hotkey_stream.close()
         output_monitor.stop()
+        # After the main stream is closed above, so no callback can be
+        # mid-process() when the canceller is released.
+        echo_canceller.stop()
+        timers.stop()
+        # Snapshot of what's open, read back by the next boot's
+        # morning_briefing (see actions.save_current_layout's own
+        # docstring for why shutdown, not boot, is the right write
+        # point). Never allowed to block or crash shutdown over a
+        # win32gui hiccup -- the worst case is next boot's briefing
+        # just falls back to plain current-state phrasing.
+        try:
+            save_current_layout()
+        except Exception:
+            _log_event("save_layout_failed", traceback=traceback.format_exc())
         # Both directions, not just input. Every audio handle this
         # process holds is released here, before the (potentially slow)
         # model teardown below -- on the sleep-triggered quit this is a
@@ -2801,6 +3598,8 @@ def main():
                         seconds_since_listener_beat=time.time() - state["listener_beat"],
                         input_silent=state["input_silent"],
                         speaking=is_speaking(),
+                        render_error=hud.last_render_error(),
+                        aec=_aec_coverage()[1],
                     )
                 elif command == "stats":
                     reply = _format_stats(state["stats"])
@@ -2834,6 +3633,21 @@ def main():
                     else:
                         hud.set_debug(not hud.is_debug())
                     reply = f"debug output {'on' if hud.is_debug() else 'off'}"
+                elif command.startswith("aec"):
+                    # Live A/B and safety valve for echo cancellation:
+                    # "off" puts the output gate straight back to "any
+                    # system audio pauses the wake word", no restart --
+                    # same reasoning as the debug toggle above, so the
+                    # next misbehaviour can be caught or ruled out
+                    # without losing the state that produced it.
+                    argument = command[len("aec"):].strip()
+                    if argument in ("on", "off"):
+                        echo_canceller.set_enabled(argument == "on")
+                    elif argument == "":
+                        echo_canceller.set_enabled(not echo_canceller.is_enabled())
+                    _log_event("control_aec", enabled=echo_canceller.is_enabled())
+                    _covering, _reason = _aec_coverage()
+                    reply = f"echo cancellation {_reason.replace('_', ' ')}"
                 elif command in ("quit", "quit silent"):
                     # Announced *after* this connection closes, not
                     # before. jarvisctl.py reads until EOF on a socket

@@ -119,7 +119,7 @@ def test_pending_is_rewritten_in_place_not_appended(captured):
     """
     hud.utterance("run ls command")
     hud.pending("consulting local model", spinner=True)
-    hud.resolve("count_files_in_folder")
+    hud.resolve("count_app_windows")
     out = captured.getvalue()
     assert out.count("run ls command") == 1
     assert "\r\x1b[2K" in out
@@ -166,6 +166,44 @@ def test_end_flash_leaves_a_timed_flash_alone():
     assert hud._hud._effective_state() == hud.ERROR
 
 
+def test_reply_with_ok_false_flashes_error_state(captured):
+    """
+    Regression test for a real gap: hud.reply()'s ok parameter existed
+    all along, but was called with ok=False from exactly nowhere in the
+    running application (every action returned a bare string, so
+    success and failure were indistinguishable) -- hud.ERROR was
+    reachable in code but never actually reached. actions.Outcome fixes
+    the caller side; this pins the hud.py side of the same fix.
+    """
+    hud._hud.state = hud.ARMED
+    hud.reply("That didn't take, sir.", ok=False)
+    assert hud._hud._effective_state() == hud.ERROR
+
+
+def test_reply_with_ok_true_does_not_flash_error_state(captured):
+    hud._hud.state = hud.ARMED
+    hud.reply("Minimised, sir.", ok=True)
+    assert hud._hud._effective_state() != hud.ERROR
+
+
+def test_main_only_references_glyph_kinds_that_exist():
+    """
+    A `kind` string with no matching _GLYPH entry doesn't raise -- line()
+    falls back to _GLYPH["system"]'s dim grey silently (same "missing
+    key degrades to something else silent" shape as phrases.pick()).
+    Caught for real: main.py called line(..., "ok") from the start, with
+    no "ok" key in _GLYPH at all, so mic-signal-recovery looked exactly
+    like a routine dim system note.
+    """
+    import main
+
+    source = open(main.__file__, encoding="utf-8").read()
+    used = set(re.findall(r'hud\.line\(\s*[^,]+,\s*"([^"]+)"', source))
+    assert used, "expected main.py to use hud.line's kind argument somewhere"
+    missing = used - set(hud._GLYPH)
+    assert not missing, f"main.py uses unknown hud.line kinds: {missing}"
+
+
 def test_confidence_bar_colour_tracks_the_score():
     strong = hud.confidence_bar(0.95)
     weak = hud.confidence_bar(0.30)
@@ -179,6 +217,68 @@ def test_meter_is_empty_when_silent_and_fills_when_loud():
     assert hud._hud._meter().strip() == ""
     hud._hud._level = 1.0
     assert "█" in hud._hud._meter()
+
+
+def test_meter_goes_flat_when_input_is_blocked():
+    """
+    A live level is meaningless while input is being ignored -- showing
+    one anyway (even an honest, quiet one) reads as "still listening",
+    exactly the wrong impression during the stretch this exists to
+    correct.
+    """
+    hud._hud._level = 1.0  # loud, would otherwise show a full meter
+    hud.set_input_blocked("speaking")
+    try:
+        meter = hud._hud._meter()
+        assert "█" not in meter
+        assert "▁" not in meter
+        # Distinct from an all-empty (genuinely-silent-room) meter --
+        # someone glancing at the room lights should be able to tell
+        # "blocked" apart from "just quiet right now".
+        assert meter.strip() != ""
+    finally:
+        hud.set_input_blocked(None)
+
+
+def test_status_text_shows_the_blocked_reason_and_clears_it():
+    hud.set_input_blocked("push-to-talk held")
+    try:
+        assert "push-to-talk held" in hud._hud._status_text(120)
+    finally:
+        hud.set_input_blocked(None)
+    assert "push-to-talk held" not in hud._hud._status_text(120)
+
+
+def test_status_text_is_identical_whether_reason_was_ever_set_or_not():
+    """
+    set_input_blocked(None) must leave no trace -- not just "the old
+    reason string is gone" (covered above) but byte-for-byte the same
+    text a session that was never blocked at all would produce.
+    """
+    hud.set_input_blocked(None)
+    never_blocked = hud._hud._status_text(120)
+    hud.set_input_blocked("speaking")
+    hud.set_input_blocked(None)
+    was_blocked_then_cleared = hud._hud._status_text(120)
+    assert never_blocked == was_blocked_then_cleared
+
+
+def test_status_text_shows_the_timer_countdown_and_clears_it():
+    hud.set_timer_countdown("9 minutes")
+    try:
+        assert "9 minutes" in hud._hud._status_text(120)
+    finally:
+        hud.set_timer_countdown(None)
+    assert "9 minutes" not in hud._hud._status_text(120)
+
+
+def test_status_text_is_identical_whether_a_timer_was_ever_set_or_not():
+    hud.set_timer_countdown(None)
+    never_had_one = hud._hud._status_text(120)
+    hud.set_timer_countdown("5 minutes")
+    hud.set_timer_countdown(None)
+    had_one_then_cleared = hud._hud._status_text(120)
+    assert never_had_one == had_one_then_cleared
 
 
 def test_feed_level_never_allocates_or_raises_on_extremes():
@@ -195,6 +295,23 @@ def test_recording_band_brightness_tracks_level():
     hud._hud._level = 1.0
     loud = hud._hud._band_colour()
     assert sum(loud) > sum(quiet)
+
+
+def test_asleep_and_armed_are_different_hues_not_just_brightness():
+    """
+    They used to be the same warm red-orange at two brightnesses (26,8,5
+    vs 120,28,16 -- both red-dominant in roughly the same ratio), so
+    deep sleep and armed-but-awake were indistinguishable at a glance and
+    on the room lights -- the one thing this band design exists for.
+    """
+    asleep = hud._STATES[hud.ASLEEP][0]
+    armed = hud._STATES[hud.ARMED][0]
+    assert asleep != armed
+    # ARMED is warm (red the dominant channel); ASLEEP must not share
+    # that shape merely dimmed -- confirmed by channel dominance, which
+    # brightness alone can't fake.
+    assert armed[0] == max(armed)
+    assert asleep[0] != max(asleep)
 
 
 def test_disabled_hud_emits_no_escape_sequences(disabled):

@@ -1,5 +1,5 @@
 @echo off
-rem Unified jarvis command -- "jarvis start|status|stats|debug|pause|resume|quit".
+rem Unified jarvis command -- "jarvis start|status|stats|debug|aec|pause|resume|quit".
 rem "start" launches a fresh visible instance (jarvisctl.py can't do
 rem this itself -- it only talks to an already-running one). Everything
 rem else is forwarded straight to jarvisctl.py.
@@ -12,7 +12,7 @@ if "%1"=="start" (
 )
 
 if "%1"=="" (
-    echo Usage: jarvis {start^|status^|stats^|debug^|pause^|resume^|quit}
+    echo Usage: jarvis {start^|status^|stats^|debug^|aec^|pause^|resume^|quit}
     exit /b 1
 )
 

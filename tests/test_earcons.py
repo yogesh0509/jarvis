@@ -101,3 +101,25 @@ def test_unknown_cue_is_a_no_op(monkeypatch):
     monkeypatch.setattr(tts, "play_samples", lambda *a, **k: called.append(a))
     earcons.play("no_such_cue")
     assert called == []
+
+
+def test_no_effect_is_acoustically_distinct_from_decline_and_error():
+    """
+    actions.Outcome's three statuses need three genuinely different
+    sounds -- "no_effect" (nothing to do) must not be confusable with
+    "decline" (refused on purpose) or "error" (something broke).
+    """
+    no_effect = earcons._LIBRARY["no_effect"]
+    decline = earcons._LIBRARY["decline"]
+    error = earcons._LIBRARY["error"]
+    # Different overall length -- decline's double-tap and error's
+    # two-part fall are both longer than one plain beep.
+    assert len(no_effect) != len(decline)
+    assert len(no_effect) != len(error)
+    # Different peak frequency content -- a flat tone at a pitch none
+    # of the others use should not share dominant energy with either.
+    def dominant_bin(samples):
+        spectrum = np.abs(np.fft.rfft(samples))
+        return int(np.argmax(spectrum))
+    assert dominant_bin(no_effect) != dominant_bin(decline)
+    assert dominant_bin(no_effect) != dominant_bin(error)

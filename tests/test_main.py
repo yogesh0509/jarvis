@@ -95,6 +95,27 @@ def test_should_reject_transcript_rejects_high_compression_ratio():
     assert main._should_reject_transcript("some words here", quality) == "compression_ratio"
 
 
+def test_should_reject_transcript_rejects_clipped_audio():
+    quality = {**_CLEAN_QUALITY, "clipped_fraction": 0.35}
+    assert main._should_reject_transcript("some words here", quality) == "clipped"
+
+
+def test_should_reject_transcript_tolerates_a_few_clipped_samples():
+    # A handful of saturated samples in an otherwise clean utterance
+    # isn't the flat-topped-waveform signature that indicates real
+    # clipping -- see _CLIP_SAMPLE_FLOOR's comment.
+    quality = {**_CLEAN_QUALITY, "clipped_fraction": 0.01}
+    assert main._should_reject_transcript("some words here", quality) is None
+
+
+def test_should_reject_transcript_missing_clipped_fraction_defaults_clean():
+    # _CLEAN_QUALITY (like real quality dicts from before this field
+    # existed) has no clipped_fraction key at all -- must default to
+    # "not clipped", not KeyError or a false rejection.
+    assert "clipped_fraction" not in _CLEAN_QUALITY
+    assert main._should_reject_transcript("some words here", _CLEAN_QUALITY) is None
+
+
 def test_should_reject_transcript_denylist_is_exact_match_not_substring():
     # The failure mode this guards against is real: a naive substring
     # check would eat a legitimate command just because it happens to
@@ -179,7 +200,7 @@ def test_looks_interrogative_false_for_commands_including_polite_ones():
 def test_is_dangerous_interrogative_match_excludes_query_shaped_actions():
     # These actions exist specifically to answer a question -- must
     # never be declined just because they were phrased as one.
-    for action in ("describe_screen", "count_app_windows", "count_files_in_folder", "none", "no_match", "start_dictation"):
+    for action in ("describe_screen", "count_app_windows", "none", "no_match", "start_dictation"):
         assert main._is_dangerous_interrogative_match(action, "what's on my screen") is False
 
 
@@ -223,3 +244,74 @@ def test_looks_deictic_false_for_ordinary_commands_that_reach_the_llm():
         "take dictation for me",
     ):
         assert main._looks_deictic(phrase) is False, phrase
+
+
+# --- session log rotation ------------------------------------------
+
+
+def test_rotate_leaves_a_small_file_alone(tmp_path, monkeypatch):
+    log = tmp_path / "session.jsonl"
+    log.write_text("small\n", encoding="utf-8")
+    monkeypatch.setattr(main, "SESSION_LOG_PATH", log)
+    monkeypatch.setattr(main, "SESSION_LOG_BACKUP_PATH", tmp_path / "session.jsonl.1")
+
+    main._rotate_session_log_if_needed()
+
+    assert log.read_text(encoding="utf-8") == "small\n"
+    assert not (tmp_path / "session.jsonl.1").exists()
+
+
+def test_rotate_backs_up_an_oversized_file_and_clears_the_original(tmp_path, monkeypatch):
+    log = tmp_path / "session.jsonl"
+    backup = tmp_path / "session.jsonl.1"
+    log.write_bytes(b"x" * (main._LOG_ROTATE_MAX_BYTES + 1))
+    monkeypatch.setattr(main, "SESSION_LOG_PATH", log)
+    monkeypatch.setattr(main, "SESSION_LOG_BACKUP_PATH", backup)
+
+    main._rotate_session_log_if_needed()
+
+    assert backup.stat().st_size == main._LOG_ROTATE_MAX_BYTES + 1
+    assert not log.exists()  # replace() moved it, not copied
+
+
+def test_rotate_overwrites_a_previous_backup_generation(tmp_path, monkeypatch):
+    """Single-generation rotation, by design -- see the function's own docstring."""
+    log = tmp_path / "session.jsonl"
+    backup = tmp_path / "session.jsonl.1"
+    backup.write_text("old backup\n", encoding="utf-8")
+    log.write_bytes(b"y" * (main._LOG_ROTATE_MAX_BYTES + 1))
+    monkeypatch.setattr(main, "SESSION_LOG_PATH", log)
+    monkeypatch.setattr(main, "SESSION_LOG_BACKUP_PATH", backup)
+
+    main._rotate_session_log_if_needed()
+
+    assert backup.read_bytes() != b"old backup\n"
+    assert backup.stat().st_size == main._LOG_ROTATE_MAX_BYTES + 1
+
+
+def test_rotate_on_a_missing_file_does_not_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "SESSION_LOG_PATH", tmp_path / "does_not_exist.jsonl")
+    monkeypatch.setattr(main, "SESSION_LOG_BACKUP_PATH", tmp_path / "does_not_exist.jsonl.1")
+    main._rotate_session_log_if_needed()  # must not raise
+
+
+def test_log_event_rotates_automatically_once_the_size_threshold_is_crossed(tmp_path, monkeypatch):
+    log = tmp_path / "session.jsonl"
+    backup = tmp_path / "session.jsonl.1"
+    log.write_bytes(b"x" * (main._LOG_ROTATE_MAX_BYTES + 1))
+    monkeypatch.setattr(main, "SESSION_LOG_PATH", log)
+    monkeypatch.setattr(main, "SESSION_LOG_BACKUP_PATH", backup)
+    monkeypatch.setattr(main, "_log_event_call_count", 0)
+
+    for _ in range(main._LOG_ROTATE_CHECK_EVERY):
+        main._log_event("boot")
+
+    assert backup.exists(), "rotation never triggered within one check interval"
+    # The event that crossed the check boundary landed in the fresh file.
+    assert '"kind": "boot"' in log.read_text(encoding="utf-8")
+
+
+def test_log_event_never_raises_even_if_rotation_itself_fails(monkeypatch):
+    monkeypatch.setattr(main, "_rotate_session_log_if_needed", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(main, "_log_event_call_count", main._LOG_ROTATE_CHECK_EVERY - 1)
+    main._log_event("boot")  # must not raise -- logging must never take the listener down

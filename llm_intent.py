@@ -48,15 +48,20 @@ Windows' 260-char MAX_PATH during extraction.
 """
 
 import datetime
+import hashlib
 import json
+import pickle
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+import numpy as np
 
 from apps_registry import CURATED_APP_KEYS
 
 if TYPE_CHECKING:
     from llama_cpp import Llama
+    from llama_cpp.llama import LlamaState
     from llama_cpp.llama_grammar import LlamaGrammar
 
 MODEL_PATH = Path(__file__).parent / "models" / "qwen2.5-1.5b-instruct-gguf" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
@@ -92,7 +97,6 @@ _ACTION_NAMES = [
     "snap_window",
     "focus_vscode_repo",
     "count_app_windows",
-    "count_files_in_folder",
     "describe_screen",
     "now_playing",
     "move_to_monitor",
@@ -103,6 +107,13 @@ _ACTION_NAMES = [
     "media_next_track",
     "media_previous_track",
     "lock_workstation",
+    "set_timer",
+    "cancel_timer",
+    "list_timers",
+    "system_status",
+    "open_snipping_tool",
+    "screenshot_full",
+    "screenshot_window",
     # Not a real dispatchable action (nothing in actions.py handles it) --
     # a meta intent main.py intercepts itself, same as it already does
     # for the embedding matcher's disable_listening/enable_listening.
@@ -130,6 +141,13 @@ _NO_PARAM_ACTION_NAMES = (
     "describe_screen",
     "now_playing",
     "move_to_monitor",
+    "set_timer",
+    "cancel_timer",
+    "list_timers",
+    "system_status",
+    "open_snipping_tool",
+    "screenshot_full",
+    "screenshot_window",
 )
 
 SCHEMA = {
@@ -193,19 +211,22 @@ Rules:
 - A specific app is clearly meant but it's not in the app list -> action MUST be "none" (never any app action, even with app "none"), say in "reply" you don't have it registered. Never guess the closest-sounding one.
 - move_to_monitor sends the focused window to a different physical screen; snap_window only splits the current screen in half.
 - Garbled, fragmentary, or not something a person would actually say (a transcriber's best guess at noise) -> action no_match, empty "reply". Say nothing rather than guess.
+- Screenshot, unqualified -> screenshot_full. "this/current window" -> screenshot_window. "snip"/"select an area"/"snipping tool" -> open_snipping_tool.
 
 Examples:
 "open chrome"->{{"action":"focus_or_launch_app","app":"chrome","direction":"none","repo":"","reply":""}}
 "maximize chrome"->{{"action":"maximize_app","app":"chrome","direction":"none","repo":"","reply":""}}
 "go to the next desktop"->{{"action":"switch_desktop","app":"none","direction":"next","repo":"","reply":""}}
 "switch to the payments api window in vscode"->{{"action":"focus_vscode_repo","app":"vscode","direction":"none","repo":"payments_api","reply":""}}
-"how many files are in this folder"->{{"action":"count_files_in_folder","app":"none","direction":"none","repo":"","reply":""}}
 "what's on my screen right now"->{{"action":"describe_screen","app":"none","direction":"none","repo":"","reply":""}}
 "what's playing right now"->{{"action":"now_playing","app":"none","direction":"none","repo":"","reply":""}}
 "open photoshop"->{{"action":"none","app":"none","direction":"none","repo":"","reply":"I don't have Photoshop registered, sir."}}
 "what's the weather like"->{{"action":"none","app":"none","direction":"none","repo":"","reply":"I'm afraid I've no access to live weather data, sir -- fully offline, I'm blind to anything outside this machine."}}
 "shu programming bitcoin bitshaka"->{{"action":"no_match","app":"none","direction":"none","repo":"","reply":""}}
 (context: app is "chrome") "minimize it"->{{"action":"minimize_app","app":"chrome","direction":"none","repo":"","reply":""}}
+"set a timer for ten minutes"->{{"action":"set_timer","app":"none","direction":"none","repo":"","reply":""}}
+"how's my battery"->{{"action":"system_status","app":"none","direction":"none","repo":"","reply":""}}
+"screenshot this window"->{{"action":"screenshot_window","app":"none","direction":"none","repo":"","reply":""}}
 """
 
 
@@ -296,6 +317,108 @@ _prewarm_state = "cold"
 # for this purpose since what's being warmed is the *system prompt's*
 # prefix, not anything about this specific text.
 PREWARM_UTTERANCE = "open chrome"
+
+# Persisted KV cache -- see tools/_spike_kv_cache.py for the investigation
+# this came from (kept in the repo as the record of what was measured,
+# same convention as tools/_spike_desktop_move.py). Confirmed live,
+# against the real model, not assumed: loading a saved state on a fresh
+# Llama() instance -- what a process restart looks like from llama.cpp's
+# own perspective -- turned a 20.03s cold call into a 2.46-2.83s one
+# (matching ordinary warm-call latency), correct both with the loaded
+# state's exact original date/time and with one shifted 47 minutes
+# later. Lives in logs/ alongside this project's other gitignored,
+# locally-regenerable runtime state (learned_seeds.json,
+# seed_promotion_state.json) -- not a model file, not a log line, but
+# the same category of "derived, safe to delete, regenerates itself".
+KV_CACHE_PATH = Path(__file__).parent / "logs" / "llm_kv_cache.pkl"
+
+
+def _prompt_template_fingerprint() -> str:
+    """
+    A cached state is only valid for the exact prompt prefix it was
+    built from. The live date/time _system_prompt() appends doesn't
+    need to match (confirmed in the spike above -- llama.cpp/the model
+    are robust to that specific trailing mismatch), but SYSTEM_PROMPT_
+    TEMPLATE itself changing is a different, bigger kind of mismatch
+    that spike never tested and this doesn't assume is equally safe.
+    Hashed (not compared as a raw string in the pickle) so the cache
+    file doesn't carry a second copy of the ~3.5KB template alongside
+    the multi-megabyte state for no reason.
+    """
+    return hashlib.sha256(SYSTEM_PROMPT_TEMPLATE.encode("utf-8")).hexdigest()
+
+
+def _slim_llama_state(state: "LlamaState") -> "LlamaState":
+    """
+    LlamaState.scores is a full-vocabulary logits array, one row per
+    retained token position -- meant for a caller that wants to inspect
+    past per-token probabilities, which nothing in this codebase's use
+    case does. Confirmed directly (tools/_spike_kv_cache.py) that
+    load_state() doesn't need it populated: zeroing it to a minimal
+    placeholder shape leaves load_state() and the inference that follows
+    both working exactly as before, while dropping the dominant,
+    wasteful contributor to the saved size -- .scores alone measured
+    ~297MB against an actual KV payload (llama_state_size) of ~25MB at
+    this prompt's real length, a >10x difference for data nothing reads
+    back.
+    """
+    from llama_cpp.llama import LlamaState as _LlamaState
+
+    return _LlamaState(
+        input_ids=state.input_ids,
+        scores=np.zeros((1, state.scores.shape[1]), dtype=state.scores.dtype),
+        n_tokens=state.n_tokens,
+        llama_state=state.llama_state,
+        llama_state_size=state.llama_state_size,
+        seed=getattr(state, "seed", 0),
+    )
+
+
+def _save_kv_cache(llm: "Llama") -> None:
+    """
+    Best-effort by design, same discipline as main.py's _log_event --
+    a failure to persist the cache must never propagate out of prewarm()
+    (see that function's own docstring: it already must never raise).
+    Worst case on failure is simply paying the cold cost again next
+    time, not a broken boot.
+    """
+    try:
+        KV_CACHE_PATH.parent.mkdir(exist_ok=True)
+        payload = {
+            "template_fingerprint": _prompt_template_fingerprint(),
+            "state": _slim_llama_state(llm.save_state()),
+        }
+        tmp_path = KV_CACHE_PATH.with_suffix(".pkl.tmp")
+        with open(tmp_path, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        # Atomic on the same filesystem (Windows included, since
+        # Python 3.3) -- a crash mid-write leaves the old cache or
+        # nothing, never a half-written file that load_kv_cache would
+        # then try to unpickle.
+        tmp_path.replace(KV_CACHE_PATH)
+    except Exception:
+        pass
+
+
+def _load_kv_cache(llm: "Llama") -> bool:
+    """
+    Returns whether the cache was present, matched this exact prompt
+    template, and loaded successfully. Any failure at any step -- file
+    missing, corrupt pickle, template changed since it was saved,
+    load_state() itself rejecting the state -- falls through to False
+    rather than raising, so the caller's only job is deciding what to do
+    next (run a real inference instead), never handling an exception
+    from this.
+    """
+    try:
+        with open(KV_CACHE_PATH, "rb") as fh:
+            payload = pickle.load(fh)
+        if payload.get("template_fingerprint") != _prompt_template_fingerprint():
+            return False  # SYSTEM_PROMPT_TEMPLATE changed since this was saved -- stale, discard
+        llm.load_state(payload["state"])
+        return True
+    except Exception:
+        return False
 
 
 def _get_llm() -> "Llama":
@@ -484,15 +607,20 @@ def infer(
 
 def prewarm() -> bool:
     """
-    Runs one real inference (PREWARM_UTTERANCE, discarded) purely to
-    populate the KV cache with the system prompt's prefix before a real
-    command needs it. This is NOT the same as loading the model:
-    constructing the Llama object (inside _get_llm, called from here
-    too) is only ~1.5-1.8s -- the ~13-27s cost this project measured is
-    prompt *prefill*, paid by whichever call is first to actually run
-    one, cold-model or not. See main.py's _start_llm_prewarm for when
-    this gets called (a background daemon thread, never inline on a
-    real command).
+    Populates the KV cache with the system prompt's prefix before a real
+    command needs it, one of two ways: loading a state file persisted by
+    a previous prewarm (KV_CACHE_PATH -- see its own comment for the
+    measured win: a ~20s cold call down to ~0.1-0.3s), or, when that
+    cache is missing, unreadable, or built from a different prompt
+    template, running one real inference (PREWARM_UTTERANCE, discarded)
+    the way this always worked before the cache existed, then persisting
+    its result for next time. Either way this is NOT the same as loading
+    the model: constructing the Llama object (inside _get_llm, called
+    from here too) is only ~1.5-1.8s -- the ~13-27s cost this project
+    measured (absent a valid cache) is prompt *prefill*, paid by
+    whichever call is first to actually run one, cold-model or not. See
+    main.py's _start_llm_prewarm for when this gets called (a background
+    daemon thread, never inline on a real command).
 
     Never propagates an exception -- meant to be called from a thread
     with nothing to catch one, where a raised exception would simply
@@ -501,13 +629,26 @@ def prewarm() -> bool:
     treat "warming" as "already in progress, don't start another").
     Returns whether the model ended up warm.
     """
-    global _prewarm_state
+    global _prewarm_state, _call_count
     if _prewarm_state in ("warming", "warm"):
         return _prewarm_state == "warm"
     _prewarm_state = "warming"
     try:
         with _lock:
-            _run_inference(PREWARM_UTTERANCE)
+            llm = _get_llm()
+            if _load_kv_cache(llm):
+                # Loaded, not inferred -- call_count still needs to
+                # reflect that this session has already paid the cold
+                # cost, the same as a real prewarm inference would have
+                # left it, since main.py's llm_cold field (call_count()
+                # == 0 right before a call) is what tells "resolved"
+                # log events apart -- a real fallback right after this
+                # genuinely isn't a cold call anymore, and shouldn't be
+                # logged as one.
+                _call_count = max(_call_count, 1)
+            else:
+                _run_inference(PREWARM_UTTERANCE)
+                _save_kv_cache(llm)
         _prewarm_state = "warm"
         return True
     except Exception:

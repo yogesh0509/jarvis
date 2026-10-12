@@ -39,6 +39,7 @@ import numpy as np
 import sounddevice as sd
 
 import hud
+import phrases
 from piper.voice import PiperVoice
 from piper.config import SynthesisConfig
 
@@ -46,12 +47,16 @@ VOICE = "northern_english_male"  # or "alan"
 MODEL_DIR = Path(__file__).parent / "models" / f"piper-en_GB-{VOICE}-medium"
 MODEL_FILE = f"en_GB-{VOICE}-medium.onnx"
 
-# length_scale scales phoneme duration -- <1 is faster. Started at 1/1.5
-# (50% faster), then 1/1.25, now settled at 1/1.1 (10% faster than the
-# voice's natural pace) -- each step down because the previous one felt
-# too rushed, especially once all conversational replies started being
-# spoken, not just state transitions.
-_SYN_CONFIG = SynthesisConfig(length_scale=1 / 1.1)
+# length_scale scales phoneme duration -- <1 is faster, 1.0 is the
+# voice's natural pace. Went 1/1.5 (50% faster) -> 1/1.25 -> 1/1.1 ->
+# now back to 1.0, each step down because the previous one felt too
+# rushed, especially once all conversational replies started being
+# spoken, not just state transitions -- and 1/1.1 still wasn't enough of
+# a step by request. Natural pace also makes the "write two short
+# sentences rather than one" phrasing habit (phrases.py) matter more,
+# not less: Piper chunks per sentence, so a shorter first sentence still
+# gets audio out sooner regardless of how fast each word is spoken.
+_SYN_CONFIG = SynthesisConfig(length_scale=1.0)
 
 _voice = None
 _playback_lock = threading.Lock()
@@ -359,7 +364,12 @@ def _speak_now(text: str, utterance_id: int) -> None:
             else:
                 time.sleep(_ECHO_TAIL_SECONDS)
     except Exception:
-        hud.line("Couldn't get a word out there -- audio output is having trouble.", "warn")
+        # phrases.PHRASES["audio_trouble"] was defined but never picked
+        # from anywhere -- this line hardcoded its own near-duplicate of
+        # the same wording instead, which is exactly the kind of drift
+        # the pool exists to prevent (a wording tweak here would have
+        # had to remember to also happen to the unused pool, or not).
+        hud.line(phrases.pick("audio_trouble"), "warn")
         hud.note(traceback.format_exc())
     finally:
         _end_speaking()

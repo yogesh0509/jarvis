@@ -107,8 +107,9 @@ def foreground_monitor_key() -> Optional[str]:
     """
     Which monitor the current foreground window is on -- used as the
     "current screen" bias in rank_windows. Fails closed to None (no
-    monitor preference applied) on a 0/stale handle, same guard as
-    actions.count_files_in_active_explorer_folder's documented crash fix.
+    monitor preference applied) on a 0/stale handle -- GetForegroundWindow
+    can return 0 or a handle gone stale before the next call, and win32gui
+    throws on either (crashed the listener thread once).
     """
     fg_hwnd = win32gui.GetForegroundWindow()
     if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):

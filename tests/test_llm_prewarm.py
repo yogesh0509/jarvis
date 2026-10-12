@@ -11,7 +11,9 @@ is never reached here.
 import threading
 import time
 
+import numpy as np
 import pytest
+from llama_cpp.llama import LlamaState
 
 import llm_intent
 
@@ -30,11 +32,42 @@ def _reset_llm_intent_state():
     llm_intent.unload()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_kv_cache_path(tmp_path, monkeypatch):
+    """
+    KV_CACHE_PATH defaults to a real path under this project's own
+    logs/ directory -- every test in this file (existing ones included,
+    once _FakeLlama grows save_state/load_state below) must be
+    physically unable to write there, not merely unlikely to by
+    accident of what methods a fake happens to define.
+    """
+    monkeypatch.setattr(llm_intent, "KV_CACHE_PATH", tmp_path / "llm_kv_cache.pkl")
+
+
+def _fake_llama_state(n_tokens=4) -> LlamaState:
+    """A minimal but real LlamaState -- lightweight to construct, no native backend or model weights touched."""
+    return LlamaState(
+        input_ids=np.arange(n_tokens, dtype=np.int32),
+        scores=np.zeros((1, 8), dtype=np.float32),
+        n_tokens=n_tokens,
+        llama_state=b"fake-kv-bytes",
+        llama_state_size=len(b"fake-kv-bytes"),
+        seed=0,
+    )
+
+
 class _FakeLlama:
     """
     Stands in for a real Llama object: records every call and returns a
     canned, schema-valid JSON string. `on_call` (if given) runs before
     returning, so a test can block/raise/count from inside a call.
+
+    save_state/load_state are real enough to exercise
+    _save_kv_cache/_load_kv_cache's own logic (pickling, unpickling,
+    calling back into this object) without a real GGUF model anywhere
+    in the loop -- load_state just records what it was handed, so a
+    test can assert on it directly instead of inferring success from
+    timing the way the real spike (tools/_spike_kv_cache.py) had to.
     """
 
     def __init__(
@@ -45,12 +78,19 @@ class _FakeLlama:
         self.response_json = response_json
         self.on_call = on_call
         self.calls = []
+        self.loaded_states = []
 
     def create_chat_completion(self, messages, grammar, temperature, max_tokens):
         self.calls.append(messages)
         if self.on_call:
             self.on_call()
         return {"choices": [{"message": {"content": self.response_json}}]}
+
+    def save_state(self):
+        return _fake_llama_state()
+
+    def load_state(self, state):
+        self.loaded_states.append(state)
 
 
 def test_prewarm_runs_one_inference_and_marks_warm(monkeypatch):
@@ -205,3 +245,137 @@ def test_unload_during_inflight_prewarm_does_not_crash(monkeypatch):
     prewarm_thread.join(timeout=5)
     assert not prewarm_thread.is_alive()
     assert errors == []
+
+
+# --- persisted KV cache (tools/_spike_kv_cache.py) ----------------------
+#
+# Confirmed live, against the real model: loading a saved state on a
+# fresh Llama() instance turned a ~20s cold call into ~0.1-0.3s, correct
+# both with the state's exact original date/time and one 47 minutes
+# stale. These test the logic (fingerprinting, slimming, save/load,
+# and prewarm()'s own branching between them) without needing that real
+# model in the loop -- _FakeLlama's save_state/load_state are real
+# enough to exercise the actual pickle round-trip.
+
+
+def test_prompt_template_fingerprint_is_deterministic():
+    assert llm_intent._prompt_template_fingerprint() == llm_intent._prompt_template_fingerprint()
+
+
+def test_prompt_template_fingerprint_changes_with_the_template(monkeypatch):
+    before = llm_intent._prompt_template_fingerprint()
+    monkeypatch.setattr(llm_intent, "SYSTEM_PROMPT_TEMPLATE", llm_intent.SYSTEM_PROMPT_TEMPLATE + " edited")
+    after = llm_intent._prompt_template_fingerprint()
+    assert before != after
+
+
+def test_slim_llama_state_shrinks_scores_and_keeps_everything_else():
+    state = _fake_llama_state(n_tokens=7)
+    slim = llm_intent._slim_llama_state(state)
+    assert slim.scores.shape == (1, state.scores.shape[1])
+    assert slim.n_tokens == state.n_tokens
+    assert slim.llama_state == state.llama_state
+    assert slim.llama_state_size == state.llama_state_size
+    assert np.array_equal(slim.input_ids, state.input_ids)
+
+
+def test_save_then_load_kv_cache_round_trips(monkeypatch):
+    fake = _FakeLlama()
+    assert not llm_intent.KV_CACHE_PATH.exists()
+
+    llm_intent._save_kv_cache(fake)
+
+    assert llm_intent.KV_CACHE_PATH.exists()
+    loaded_ok = llm_intent._load_kv_cache(fake)
+    assert loaded_ok is True
+    assert len(fake.loaded_states) == 1
+    assert fake.loaded_states[0].n_tokens == 4  # _fake_llama_state's default
+
+
+def test_load_kv_cache_on_a_missing_file_returns_false_without_raising():
+    assert not llm_intent.KV_CACHE_PATH.exists()
+    assert llm_intent._load_kv_cache(_FakeLlama()) is False
+
+
+def test_load_kv_cache_rejects_a_stale_template_fingerprint(monkeypatch):
+    fake = _FakeLlama()
+    llm_intent._save_kv_cache(fake)
+
+    # Simulate SYSTEM_PROMPT_TEMPLATE having changed since the cache was
+    # written -- the one scenario the real spike never tested, and the
+    # one this project's own "never trust a single layer" habit says
+    # not to just assume is safe.
+    monkeypatch.setattr(llm_intent, "SYSTEM_PROMPT_TEMPLATE", llm_intent.SYSTEM_PROMPT_TEMPLATE + " edited")
+
+    assert llm_intent._load_kv_cache(fake) is False
+    assert fake.loaded_states == [], "a stale cache must never reach load_state() at all"
+
+
+def test_load_kv_cache_on_a_corrupt_file_returns_false_without_raising():
+    llm_intent.KV_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    llm_intent.KV_CACHE_PATH.write_bytes(b"not a valid pickle")
+    assert llm_intent._load_kv_cache(_FakeLlama()) is False
+
+
+def test_save_kv_cache_never_raises_even_if_save_state_itself_fails():
+    class ExplodingLlama:
+        def save_state(self):
+            raise RuntimeError("simulated llama.cpp failure")
+
+    llm_intent._save_kv_cache(ExplodingLlama())  # must not raise
+    assert not llm_intent.KV_CACHE_PATH.exists()
+
+
+def test_prewarm_saves_a_cache_on_a_cold_run(monkeypatch):
+    fake = _FakeLlama()
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: fake)
+
+    assert llm_intent.prewarm() is True
+
+    assert llm_intent.KV_CACHE_PATH.exists()
+    assert len(fake.calls) == 1  # no cache yet -- ran the real inference
+
+
+def test_prewarm_loads_the_cache_instead_of_running_inference_when_one_exists(monkeypatch):
+    fake = _FakeLlama()
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: fake)
+    llm_intent.prewarm()  # first run: cold, saves a cache
+    llm_intent.unload()  # simulates a fresh process -- resets state, cache file survives on disk
+
+    second_fake = _FakeLlama()
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: second_fake)
+    assert llm_intent.prewarm() is True
+
+    assert second_fake.calls == [], "a valid cache exists -- must not run a real inference at all"
+    assert len(second_fake.loaded_states) == 1
+
+
+def test_prewarm_from_cache_reports_call_count_as_already_warm(monkeypatch):
+    """
+    main.py's llm_cold field (call_count() == 0 right before a call) is
+    what a real dispatch after this checks -- loading from cache must
+    leave that check reporting "not cold" the same as a real prewarm
+    inference would have, or every session's first real fallback would
+    be mislabeled cold in the log despite genuinely not paying that cost.
+    """
+    fake = _FakeLlama()
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: fake)
+    llm_intent.prewarm()
+    llm_intent.unload()
+
+    assert llm_intent.call_count() == 0
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: _FakeLlama())
+    llm_intent.prewarm()
+
+    assert llm_intent.call_count() >= 1
+
+
+def test_prewarm_falls_back_to_real_inference_when_the_cache_is_corrupt(monkeypatch):
+    llm_intent.KV_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    llm_intent.KV_CACHE_PATH.write_bytes(b"garbage, not a pickle")
+    fake = _FakeLlama()
+    monkeypatch.setattr(llm_intent, "_get_llm", lambda: fake)
+
+    assert llm_intent.prewarm() is True
+
+    assert len(fake.calls) == 1, "corrupt cache must fall back to a real inference, not fail prewarm entirely"

@@ -77,7 +77,15 @@ _STATES = {
     THINKING: ((255, 160, 40), "THINKING"),
     ACTING: ((255, 190, 90), "ACTING"),
     ERROR: ((255, 42, 31), "PROBLEM"),
-    ASLEEP: ((26, 8, 5), "LOW POWER"),
+    # A genuinely different hue from ARMED (120, 28, 16), not just a
+    # darker version of the same warm red-orange -- the two used to be
+    # close enough (same ratio of R:G:B, just dimmer) that deep sleep
+    # and armed-but-awake were indistinguishable at a glance and on the
+    # room lights, which is the one thing this whole band design exists
+    # to avoid. A dim blue-violet reads as "powered down" the way a
+    # standby LED does, and can't collapse into "a dim version of red"
+    # regardless of how far the eased colour lerp has settled.
+    ASLEEP: ((14, 10, 34), "LOW POWER"),
     OFFLINE: ((70, 70, 78), "OFF DUTY"),
     DICTATING: ((120, 190, 120), "DICTATING"),
 }
@@ -90,6 +98,7 @@ _AMBER = (255, 176, 64)
 _RED = (255, 82, 68)
 _DIM = (122, 96, 88)
 _WHITE = (240, 230, 225)
+_GREEN = (110, 220, 130)
 
 _GLYPH = {
     "user": ("⟩", _CYAN),
@@ -98,6 +107,13 @@ _GLYPH = {
     "system": ("◇", _DIM),
     "warn": ("⚠", _RED),
     "dim": ("·", _DIM),
+    # There was no green in this table at all until now -- "Mic signal
+    # is back" (main.py) called line(..., "ok") from the start, but with
+    # no matching key it silently fell back to _GLYPH["system"]'s dim
+    # grey, identical to routine notes like "dropping models to save
+    # memory." Mic recovery is arguably the single most reassuring event
+    # in this system; it should look like one.
+    "ok": ("✓", _GREEN),
 }
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -158,6 +174,19 @@ class _Hud:
         # means a HUD that quietly freezes with no way to find out
         # why. Kept so there is something to look at.
         self.last_render_error = None
+        # Persistent "you are not being heard right now" indicator --
+        # see set_input_blocked's own docstring. None means "listening
+        # normally"; any other value is shown in the status strip
+        # instead of scrolling away as a one-off line the way every one
+        # of these conditions used to (see DECISIONS.md/
+        # KNOWN_LIMITATIONS.md: NO MIC SIGNAL once reached `jarvis
+        # status` only, for 50 minutes, while the band kept showing
+        # ordinary ARMED red).
+        self._input_blocked_reason = None
+        # Persistent "time remaining" indicator -- see
+        # set_timer_countdown's own docstring. None means no timer is
+        # currently running.
+        self._timer_countdown = None
 
     def _out(self):
         return self._stream if self._stream is not None else sys.stdout
@@ -269,6 +298,42 @@ class _Hud:
     def set_counters(self, **values):
         with self.lock:
             self._counters.update(values)
+
+    def set_input_blocked(self, reason):
+        """
+        reason: None (listening normally) or a short string. Deliberately
+        one flat mechanism for both the routine, frequent conditions
+        (Jarvis is speaking, system audio is playing, push-to-talk is
+        held, the mic is deliberately paused) and the rare hard fault
+        (the capture device delivering constant silence) -- callers
+        distinguish severity themselves via *which* reason string and
+        whether they also call begin_flash(ERROR)/end_flash() alongside
+        this (see main.py's input-health check), not via a second
+        parameter here.
+
+        Rendered persistently in the status strip for as long as it's
+        set, with the mic meter going flat instead of showing a
+        (meaningless, while blocked) live level -- not a scrolling line
+        that's gone the moment something else prints.
+        """
+        with self.lock:
+            self._input_blocked_reason = reason
+
+    def set_timer_countdown(self, text):
+        """
+        text: None (no timer running) or a short "time remaining"
+        string (timers.py's own slots.format_duration output).
+
+        A push, not something the render loop pulls -- timers.py has its
+        own once-a-second tick already (to check for a due timer), and
+        pushing the freshly-computed remaining time from there each tick
+        keeps hud.py a leaf module with no knowledge of timers.py's
+        existence, the same relationship it already has with every
+        other business-logic module (set_state/set_counters/
+        set_input_blocked are all pushes for the identical reason).
+        """
+        with self.lock:
+            self._timer_countdown = text
 
     # --- scrolling content ------------------------------------------
 
@@ -479,6 +544,14 @@ class _Hud:
         return tuple(base)
 
     def _meter(self):
+        if self._input_blocked_reason is not None:
+            # A live level is meaningless while input is being ignored
+            # -- showing one anyway (even an honestly-quiet one) reads
+            # as "still listening", which is exactly the wrong
+            # impression during the one stretch this indicator exists
+            # to correct. A flat row of mid-dots is visually distinct
+            # from both a live meter and an all-empty (silent-room) one.
+            return "·" * _METER_CELLS
         filled = self._level * _METER_CELLS
         out = []
         for i in range(_METER_CELLS):
@@ -491,8 +564,10 @@ class _Hud:
         up = int(time.time() - self._started)
         uptime = f"{up // 3600:d}:{(up // 60) % 60:02d}:{up % 60:02d}"
         counts = "  ".join(f"·{v} {k}" for k, v in self._counters.items() if v)
-        left = f" ◉ {label:<13} {self._meter()} "
-        right = f" up {uptime}   {counts} "
+        blocked = f"  {self._input_blocked_reason}" if self._input_blocked_reason else ""
+        left = f" ◉ {label:<13} {self._meter()}{blocked} "
+        timer = f"  ⏱ {self._timer_countdown}" if self._timer_countdown else ""
+        right = f" up {uptime}{timer}   {counts} "
         pad = max(1, cols - len(left) - len(right))
         return f"{left}{' ' * pad}{right}"[:cols]
 
@@ -628,6 +703,8 @@ flash = _hud.flash
 begin_flash = _hud.begin_flash
 end_flash = _hud.end_flash
 set_counters = _hud.set_counters
+set_input_blocked = _hud.set_input_blocked
+set_timer_countdown = _hud.set_timer_countdown
 line = _hud.line
 utterance = _hud.utterance
 pending = _hud.pending
@@ -693,7 +770,7 @@ if __name__ == "__main__":
     demo = [
         (ARMED, "open chrome for me", "focus_or_launch_app", 0.95, "Already up on this desktop, sir."),
         (SESSION, "move to the previous window", "switch_desktop", 0.87, "Moving previous."),
-        (SESSION, "run the ls command", None, 0.0, "No File Explorer window is focused, sir."),
+        (SESSION, "run the ls command", None, 0.0, "I'm afraid I can't run commands, sir."),
         (SESSION, "okay close this terminal", "minimize_app", 0.62, "Out of your way, sir."),
     ]
     try:
@@ -715,7 +792,7 @@ if __name__ == "__main__":
                     pending("consulting local model", spinner=True)
                     time.sleep(2.2)
                     end_flash()
-                    resolve("count_files_in_folder · terminal   local llm  2.2s")
+                    resolve("none   local llm  2.2s")
                     reply(answer, ok=False)
                 else:
                     resolve(f"{intent}   {score:.2f} {confidence_bar(score)}")

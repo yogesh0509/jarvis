@@ -94,6 +94,18 @@ def test_unknown_key_returns_empty_rather_than_raising():
     assert phrases.pick("no_such_key") == ""
 
 
+def test_unknown_key_is_noted_not_just_silently_swallowed(monkeypatch):
+    """
+    The silence itself stays exactly as designed (see the test above) --
+    but it used to be completely untraceable afterward, with no record
+    anywhere that anything had gone wrong.
+    """
+    noted = []
+    monkeypatch.setattr(phrases.hud, "note", lambda text: noted.append(text))
+    phrases.pick("no_such_key")
+    assert noted and "no_such_key" in noted[0]
+
+
 def test_sir_is_not_on_every_single_line():
     """
     The original replies ended in "sir" 100% of the time, which reads as
@@ -126,7 +138,6 @@ def test_frequent_action_confirmations_are_not_all_sir():
         ("switch_desktop", {"direction": "next"}),
         ("snap", {"direction": "left"}),
         ("count_many", {"count": 3}),
-        ("folder_count", {"count": 12}),
         ("screen_summary_known", {"app": "Chrome", "title": "New Tab", "monitor": "your monitor"}),
         ("screen_summary_unknown", {"title": "Some Window", "monitor": "your laptop screen"}),
         ("screen_other_summary", {"monitor": "your laptop screen", "summary": "two Chrome and VS Code"}),
@@ -134,6 +145,8 @@ def test_frequent_action_confirmations_are_not_all_sir():
         ("screen_empty", {"monitor": "your laptop screen"}),
         ("move_monitor_ok", {"monitor": "your monitor"}),
         ("move_monitor_already_there", {"monitor": "your laptop screen"}),
+        ("volume_at", {"percent": 40}),
+        ("input_level_high", {"percent": 92}),
     ],
 )
 def test_call_sites_render_cleanly(key, kwargs):
@@ -163,3 +176,34 @@ def test_main_only_references_keys_that_exist():
     assert used, "expected main.py to use the phrase pools"
     missing = used - set(phrases.PHRASES)
     assert not missing, f"main.py references unknown phrase keys: {missing}"
+
+
+def test_tts_only_references_keys_that_exist():
+    import tts
+
+    source = open(tts.__file__, encoding="utf-8").read()
+    used = set(re.findall(r'phrases\.pick\(\s*"([^"]+)"', source))
+    assert used, "expected tts.py to use the phrase pools"
+    missing = used - set(phrases.PHRASES)
+    assert not missing, f"tts.py references unknown phrase keys: {missing}"
+
+
+def test_every_phrase_pool_is_referenced_by_some_call_site():
+    """
+    The other half of the "typo'd key is silent" problem: a key nobody
+    ever picks isn't broken, but it's dead weight at best and a sign
+    something meant to use it doesn't -- confirmed for real with
+    "audio_trouble", defined here since early on and picked from
+    nowhere for just as long, while the one call site that should have
+    used it hardcoded its own near-duplicate wording instead.
+    """
+    import main
+    import timers
+    import tts
+
+    source = "".join(
+        open(module.__file__, encoding="utf-8").read() for module in (actions, main, timers, tts)
+    )
+    referenced = set(re.findall(r'phrases\.pick\(\s*"([^"]+)"', source))
+    unreferenced = set(phrases.PHRASES) - referenced
+    assert not unreferenced, f"phrase pools defined but never picked anywhere: {unreferenced}"

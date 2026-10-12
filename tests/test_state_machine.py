@@ -26,6 +26,7 @@ rest of tests/.
 """
 
 import queue
+import types
 import sys
 import threading
 import time
@@ -33,6 +34,8 @@ import time
 import numpy as np
 import pytest
 
+import actions
+import hud
 import main
 
 
@@ -129,6 +132,17 @@ def test_a_quiet_listener_says_nothing_about_speaking():
         enabled=True, mode="wake", whisper_loaded=True, dictating=False, llm_state="warm", speaking=False
     )
     assert "speaking" not in line
+
+
+def test_echo_cancellation_state_is_reported_when_given():
+    # "Will hey jarvis work over the music right now" -- the reason names
+    # come straight from echo_canceller.Canceller.coverage.
+    line = main._status_line(
+        enabled=True, mode="wake", whisper_loaded=True, dictating=False, llm_state="warm", aec="residual_high"
+    )
+    assert f"{main.DOT} AEC residual high" in line
+    bare = main._status_line(enabled=True, mode="wake", whisper_loaded=True, dictating=False, llm_state="warm")
+    assert "AEC" not in bare
 
 
 def test_int16_conversion_saturates_instead_of_wrapping():
@@ -231,6 +245,33 @@ def test_a_paused_mic_is_not_reported_as_a_fault():
     )
     assert "NO MIC SIGNAL" not in line
     assert "Paused" in line
+
+
+def test_a_hud_render_error_is_surfaced():
+    """
+    hud.last_render_error() existed all along -- a render-thread
+    exception is swallowed by design, since a drawing bug must never
+    take the listener down -- but nothing ever actually called it from
+    here, so it was surfaced nowhere at all. This is the regression test
+    for actually wiring it in.
+    """
+    line = main._status_line(
+        enabled=True,
+        mode="wake",
+        whisper_loaded=True,
+        dictating=False,
+        llm_state="warm",
+        render_error="Traceback (most recent call last):\n  ...\nValueError: bad tuple shape",
+    )
+    assert "HUD render error" in line
+    assert "ValueError: bad tuple shape" in line
+    # The full traceback has no place in a one-line status reply.
+    assert "Traceback (most recent call last)" not in line
+
+
+def test_no_render_error_by_default():
+    line = main._status_line(enabled=True, mode="wake", whisper_loaded=True, dictating=False, llm_state="warm")
+    assert "render error" not in line
 
 
 def test_the_silence_floor_sits_above_one_16_bit_lsb():
@@ -364,6 +405,15 @@ def live():
         mp.setattr(main.hud, "init", lambda: None)
         mp.setattr(main, "speak", lambda *a, **k: None)
         mp.setattr(main.earcons, "play", lambda *a, **k: None)
+        # Without this, main()'s boot sequence calls the real
+        # morning_briefing(), which enumerates real windows via win32gui
+        # and virtual_desktop's real COM manager -- exactly the kind of
+        # thing the module docstring says tests must stay mockable
+        # against (confirmed directly: this polluted
+        # virtual_desktop._thread_local.manager for every test in this
+        # process, breaking test_virtual_desktop.py's isolation
+        # assertion when the suite ran in full).
+        mp.setattr(main, "morning_briefing", lambda: "")
         mp.setattr(main, "WhisperModel", lambda *a, **k: _FakeWhisper())
         mp.setattr(main, "IntentMatcher", _FakeMatcher)
         mp.setattr(main, "WakeWordModel", lambda **k: _FakeWakeWord())
@@ -380,6 +430,13 @@ def live():
         mp.setattr(main.output_monitor, "start", lambda: None)
         mp.setattr(main.output_monitor, "stop", lambda: None)
         mp.setattr(main.output_monitor, "is_output_playing", lambda: False)
+        # Same reasoning for echo cancellation: the real start() loads
+        # livekit's native library and opens a WASAPI loopback stream.
+        # Left unstarted, echo_canceller reports (False, "unavailable")
+        # -- i.e. the output gate behaves exactly as it did before echo
+        # cancellation existed -- unless a test overrides coverage().
+        mp.setattr(main.echo_canceller, "start", lambda: None)
+        mp.setattr(main.echo_canceller, "stop", lambda: None)
         with pytest.raises(_StopHere):
             main.main()
 
@@ -392,9 +449,18 @@ def live():
             "callback": local["audio_callback"],
             "check_signal": local["_check_input_signal"],
             "check_output_gate": local["_check_output_gate"],
+            "is_session_speech": local["_is_session_speech"],
             "reopen": local["_reopen_input_stream"],
             "lock": local["_processing_lock"],
             "hotwords": local["TRANSCRIBE_HOTWORDS"],
+            "record_timing": local["_record_timing"],
+            "record_stat": local["_record_stat"],
+            "on_press": local["on_press"],
+            "on_release": local["on_release"],
+            "handle_transcript": local["_handle_transcript"],
+            "matcher": local["matcher"],
+            "confirm_hotkey_hold": local["_confirm_hotkey_hold"],
+            "hotkey_pre_buffer": local["hotkey_pre_buffer"],
             "streams": streams,
         }
 
@@ -416,7 +482,7 @@ def test_hotwords_no_longer_carries_repo_name_hallucination_bait(live):
     for bait in ("bdk", "hashstack", "djed", "bitshala", "bitshaka", "bitcoin", "shu programming"):
         assert bait not in hotwords
     # The removal shouldn't have taken real command vocabulary with it.
-    for real in ("chrome", "how many files"):
+    for real in ("chrome", "how many"):
         assert real in hotwords
 
 
@@ -758,6 +824,83 @@ def test_signal_coming_back_clears_the_latch(live):
     assert state["input_silent"] is False
 
 
+# --- the persistent HUD indicator for a wedge, not just the flag ------
+#
+# Historically NO MIC SIGNAL reached `jarvis status` only -- for 50
+# minutes straight in the real incident this project has on record --
+# while the band kept showing ordinary ARMED red the whole time. These
+# pin the fix: the flag alone isn't the point, the room lights actually
+# changing is.
+
+
+def test_a_latched_wedge_flashes_error_and_sets_the_indicator(live):
+    state, check = live["state"], live["check_signal"]
+    hud.set_input_blocked(None)
+    hud.end_flash()
+    try:
+        _go_frozen(live)
+        check()
+        assert state["input_silent"] is True
+        assert hud._hud._effective_state() == hud.ERROR
+        assert hud._hud._input_blocked_reason == "NO MIC SIGNAL"
+    finally:
+        hud.end_flash()
+        hud.set_input_blocked(None)
+
+
+def test_signal_returning_clears_both_the_flash_and_the_indicator(live):
+    state, check = live["state"], live["check_signal"]
+    hud.set_input_blocked(None)
+    hud.end_flash()
+    try:
+        _go_frozen(live)
+        check()
+        assert hud._hud._input_blocked_reason == "NO MIC SIGNAL"
+
+        for _ in range(main.INPUT_SIGNAL_FRAMES):
+            live["callback"](_frame(0.5), main.FRAME_SAMPLES, None, None)
+        check()
+
+        assert state["input_silent"] is False
+        assert hud._hud._effective_state() != hud.ERROR
+        assert hud._hud._input_blocked_reason is None
+    finally:
+        hud.end_flash()
+        hud.set_input_blocked(None)
+
+
+def test_recovery_does_not_claim_listening_again_while_still_gated(live):
+    """
+    Confirmed live as a real overlap, not a hypothetical one:
+    KNOWN_LIMITATIONS.md's actual wedge incident records push-to-talk
+    being tried *during* it. If the hotkey is still held the instant the
+    mic itself recovers, the indicator must not flip to "nothing wrong"
+    a beat before the hold actually ends.
+    """
+    state, check = live["state"], live["check_signal"]
+    hud.set_input_blocked(None)
+    hud.end_flash()
+    try:
+        _go_frozen(live)
+        check()
+        state["hotkey_active"] = True
+
+        for _ in range(main.INPUT_SIGNAL_FRAMES):
+            live["callback"](_frame(0.5), main.FRAME_SAMPLES, None, None)
+        check()
+
+        assert state["input_silent"] is False
+        # Flash still clears -- the wedge itself is genuinely over --
+        # but the persistent reason is left for the routine gating
+        # check to re-assert on its own very next pass, not silently
+        # dropped to "nothing blocking" while the hotkey is still down.
+        assert hud._hud._input_blocked_reason is not None
+    finally:
+        state["hotkey_active"] = False
+        hud.end_flash()
+        hud.set_input_blocked(None)
+
+
 def test_real_audio_resets_the_frozen_value_tracking(live):
     # Otherwise a stretch of genuinely frozen frames before some real
     # speech would leave lo/hi equal and armed, and the next quiet
@@ -798,6 +941,34 @@ def test_resume_rearms_the_silence_tracker_before_reopening(live):
 
     assert state["input_silent"] is False
     assert time.time() - state["main_signal_at"] < 5
+
+
+def test_resume_clears_a_wedge_flash_and_indicator_left_over_from_before_the_pause(live):
+    """
+    _check_input_signal's own recovery path (which also clears these)
+    never runs for this transition -- pausing and resuming resets
+    input_silent directly. Without its own clearing, a wedge that was
+    still latched (and therefore still ERROR-flashing) right before a
+    pause would leave that flash stuck open-ended through the resume,
+    with nothing left in the system that would ever call end_flash()
+    again.
+    """
+    state = live["state"]
+    hud.set_input_blocked(None)
+    hud.end_flash()
+    try:
+        live["set_enabled"](False)
+        state["input_silent"] = True
+        hud.begin_flash(hud.ERROR)
+        hud.set_input_blocked("NO MIC SIGNAL")
+
+        live["set_enabled"](True)
+
+        assert hud._hud._effective_state() != hud.ERROR
+        assert hud._hud._input_blocked_reason is None
+    finally:
+        hud.end_flash()
+        hud.set_input_blocked(None)
 
 
 def test_signal_confirmation_requires_more_than_one_frame():
@@ -857,6 +1028,474 @@ def test_no_drain_fires_when_output_was_never_playing(live, monkeypatch):
     check()
 
     assert audio_q.qsize() == 1
+
+
+# --- echo cancellation: the gate only holds while it isn't covering -----
+
+
+def _coverage(monkeypatch, covering, reason):
+    monkeypatch.setattr(main.echo_canceller, "coverage", lambda: (covering, reason))
+
+
+def test_output_playing_with_echo_cancellation_covering_is_not_gated(live, monkeypatch):
+    # The whole point of echo_canceller.py: music playing, cancellation
+    # demonstrably working -> frames go on to the wake word, no drain.
+    state, check, audio_q = live["state"], live["check_output_gate"], live["audio_q"]
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+    _coverage(monkeypatch, True, "covering")
+    audio_q.put(object())
+
+    assert check() is False
+    assert state["output_was_playing"] is True
+    assert audio_q.qsize() == 1
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "off", "converging", "residual_high", "unhealthy", "idle"])
+def test_anything_short_of_covering_gates_exactly_as_before(live, monkeypatch, reason):
+    # Fail closed: every non-covering state, including `jarvis aec off`,
+    # is the old unconditional gate.
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+    _coverage(monkeypatch, False, reason)
+    assert live["check_output_gate"]() is True
+
+
+def test_a_coverage_query_that_raises_gates_rather_than_lets_audio_through(live, monkeypatch):
+    def explode():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+    monkeypatch.setattr(main.echo_canceller, "coverage", explode)
+    assert live["check_output_gate"]() is True
+
+
+def test_losing_and_regaining_coverage_mid_playback(live, monkeypatch):
+    state, check, audio_q = live["state"], live["check_output_gate"], live["audio_q"]
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+
+    _coverage(monkeypatch, True, "covering")
+    assert check() is False
+    _coverage(monkeypatch, False, "residual_high")
+    assert check() is True
+    for _ in range(5):
+        audio_q.put(object())
+    state["reset_acoustic"] = False
+    _coverage(monkeypatch, True, "covering")
+    assert check() is False
+
+    # Regaining coverage is a gate falling edge like any other: drain the
+    # backlog and restart the acoustic models, so the audio either side
+    # of the gap isn't stitched together.
+    assert audio_q.empty()
+    assert state["reset_acoustic"] is True
+    coverage_events = [kw["covering"] for kind, kw in events if kind == "aec_coverage"]
+    assert coverage_events == [False, True]
+
+
+def test_playback_stop_reports_how_much_of_it_was_deaf(live, monkeypatch):
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    check = live["check_output_gate"]
+
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+    _coverage(monkeypatch, True, "covering")
+    check()
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: False)
+    check()
+
+    stopped = [kw for kind, kw in events if kind == "output_playing_stopped"]
+    assert stopped and stopped[0]["gated_seconds"] == 0.0
+
+
+def test_covered_playback_stopping_resets_the_acoustic_models(live, monkeypatch):
+    # The regression: with coverage, Jarvis's own reply never gates, so
+    # the gate-release reset never fired and Silero carried the reply's
+    # residual into the next listen -- calling the silence after it
+    # speech, ~1s after every reply.
+    state, check, audio_q = live["state"], live["check_output_gate"], live["audio_q"]
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: True)
+    _coverage(monkeypatch, True, "covering")
+    check()
+    state["reset_acoustic"] = False
+    audio_q.put(object())
+
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: False)
+    check()
+
+    assert state["reset_acoustic"] is True
+    assert audio_q.qsize() == 1  # never held back, so nothing stale to drain
+
+
+def test_no_acoustic_reset_when_output_was_never_playing(live, monkeypatch):
+    state, check = live["state"], live["check_output_gate"]
+    monkeypatch.setattr(main.output_monitor, "is_output_playing", lambda: False)
+    state["reset_acoustic"] = False
+
+    check()
+
+    assert state["reset_acoustic"] is False
+
+
+# Loud enough to clear the silence floor, so the echo-floor tests below
+# exercise the echo floor and nothing else.
+_SPEECH_LEVEL_CHUNK = np.full(main.FRAME_SAMPLES, 0.05, dtype=np.float32)
+
+
+def test_session_speech_needs_to_clear_the_echo_floor_only_while_output_plays(live, monkeypatch):
+    state, is_speech = live["state"], live["is_session_speech"]
+    chunk = _SPEECH_LEVEL_CHUNK
+    monkeypatch.setattr(main.echo_canceller, "above_echo_floor", lambda frame: False)
+
+    state["output_was_playing"] = False
+    assert is_speech(chunk, 0.9) is True  # nothing playing: VAD alone, as ever
+
+    state["output_was_playing"] = True
+    assert is_speech(chunk, 0.9) is False  # residual echo, not the user
+
+    monkeypatch.setattr(main.echo_canceller, "above_echo_floor", lambda frame: True)
+    assert is_speech(chunk, 0.9) is True
+    assert is_speech(chunk, 0.0) is False  # the floor never overrides VAD saying no
+
+
+def test_echo_floor_rejections_are_logged_but_rate_limited(live, monkeypatch):
+    state, is_speech = live["state"], live["is_session_speech"]
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    monkeypatch.setattr(main.echo_canceller, "above_echo_floor", lambda frame: False)
+    state["output_was_playing"] = True
+    chunk = _SPEECH_LEVEL_CHUNK
+
+    for _ in range(50):
+        is_speech(chunk, 0.9)
+
+    rejected = [kw for kind, kw in events if kind == "echo_onset_rejected"]
+    assert len(rejected) == 1
+    assert state["echo_rejected_frames"] == 49  # banked for the next flush
+
+
+def test_a_failing_echo_floor_check_refuses_the_frame(live, monkeypatch):
+    state, is_speech = live["state"], live["is_session_speech"]
+
+    def explode(frame):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main.echo_canceller, "above_echo_floor", explode)
+    state["output_was_playing"] = True
+    assert is_speech(_SPEECH_LEVEL_CHUNK, 0.9) is False
+
+
+# --- the silence floor: digital silence is never session speech --------
+
+
+_ONE_LSB = 1.0 / 32768
+
+
+@pytest.mark.parametrize("output_playing", [False, True])
+def test_digital_silence_is_never_session_speech_however_sure_silero_is(live, monkeypatch, output_playing):
+    # The phantom recordings this exists for: raw peak 0.0 or 1-2 LSB,
+    # every frame of them scored as speech by a Silero whose state still
+    # held the residual of Jarvis's own reply.
+    state, is_speech = live["state"], live["is_session_speech"]
+    monkeypatch.setattr(main.echo_canceller, "above_echo_floor", lambda frame: True)
+    state["output_was_playing"] = output_playing
+    one_lsb = np.zeros(main.FRAME_SAMPLES, dtype=np.float32)
+    one_lsb[::7] = _ONE_LSB
+    one_lsb[3::7] = -_ONE_LSB
+
+    assert is_speech(np.zeros(main.FRAME_SAMPLES, dtype=np.float32), 0.9) is False
+    assert is_speech(one_lsb, 0.9) is False
+
+
+def test_a_frame_just_above_the_silence_floor_is_left_to_the_vad(live):
+    state, is_speech = live["state"], live["is_session_speech"]
+    state["output_was_playing"] = False
+    chunk = np.zeros(main.FRAME_SAMPLES, dtype=np.float32)
+    chunk[0] = main.INPUT_SILENCE_FLOOR * 2
+
+    assert is_speech(chunk, 0.9) is True
+    assert is_speech(chunk, 0.0) is False
+
+
+def test_silent_frame_refusals_are_logged_but_rate_limited(live, monkeypatch):
+    state, is_speech = live["state"], live["is_session_speech"]
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    state["output_was_playing"] = False
+    chunk = np.zeros(main.FRAME_SAMPLES, dtype=np.float32)
+
+    for _ in range(50):
+        is_speech(chunk, 0.9)
+    is_speech(chunk, 0.0)  # Silero saying no is not a refusal worth counting
+
+    rejected = [kw for kind, kw in events if kind == "silent_vad_rejected"]
+    assert len(rejected) == 1
+    assert state["silent_rejected_frames"] == 49  # banked for the next flush
+
+
+# --- social intents and the acoustic gate on their fast-path seeds ------
+#
+# _handle_transcript here uses the *real* matcher (loaded for real as
+# part of live's own boot sequence, the same as every other test in this
+# file that reaches this far) -- these seeds are real enough to match
+# for real, which is the point: this is the one class of fast-path
+# intent that also has to survive an acoustic check, and that check has
+# to see a real quality dict, not a mocked match result.
+
+_CLEAN_QUALITY = {"no_speech_prob": 0.02, "avg_logprob": -0.30, "compression_ratio": 1.30, "clipped_fraction": 0.0}
+_NOISE_QUALITY = {"no_speech_prob": 0.02, "avg_logprob": -1.40, "compression_ratio": 1.30, "clipped_fraction": 0.0}
+
+
+def _stub_match(live, monkeypatch, intent, score, closest_seed):
+    """
+    live's own matcher is a deliberate trap (_FakeMatcher.match raises
+    "not reached in this test") -- nothing before this exercised
+    _handle_transcript at all. Overriding just the match() method on
+    that same live instance, per test, is what lets these be the first.
+    """
+    result = types.SimpleNamespace(intent=intent, score=score, closest_seed=closest_seed)
+    monkeypatch.setattr(live["matcher"], "match", lambda text: result)
+
+
+def test_a_confident_thank_you_gets_a_reply(live, monkeypatch):
+    spoken = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    _stub_match(live, monkeypatch, "social_thanks", 1.0, "thank you")
+
+    should_close = live["handle_transcript"]("thank you", True, _CLEAN_QUALITY, via_session=True)
+
+    assert should_close is False
+    assert spoken and spoken[0] in main.phrases.PHRASES["social_thanks_reply"]
+
+
+def test_a_low_confidence_thank_you_is_rejected_silently(live, monkeypatch):
+    """
+    The exact scenario _ACOUSTICALLY_GATED_SEEDS exists for: "thank you"
+    is a confirmed near-silence Whisper hallucination (it's in
+    _HALLUCINATION_DENYLIST for that reason), so a cosine match on it
+    alone must not be trusted the way every other fast-path intent's
+    match is.
+    """
+    spoken = []
+    events = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    _stub_match(live, monkeypatch, "social_thanks", 0.95, "thank you")
+
+    should_close = live["handle_transcript"]("thank you", False, _NOISE_QUALITY, via_session=True)
+
+    assert should_close is False
+    assert spoken == [], "a rejected candidate must produce no speech at all, not a quieter reply"
+    # "transcript" is logged unconditionally before the gate ever runs
+    # (see _handle_transcript_inner) -- the rejection event is somewhere
+    # in the log, not necessarily first.
+    rejected_events = [kw for kind, kw in events if kind == "social_intent_rejected"]
+    assert rejected_events, "expected a social_intent_rejected event"
+    assert rejected_events[0]["intent"] == "social_thanks"
+
+
+def test_a_confident_okay_gets_acknowledged(live, monkeypatch):
+    spoken = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    _stub_match(live, monkeypatch, "social_ack", 1.0, "okay")
+
+    live["handle_transcript"]("okay", True, _CLEAN_QUALITY, via_session=True)
+
+    assert spoken and spoken[0] in main.phrases.PHRASES["social_ack_reply"]
+
+
+def test_a_confident_bye_closes_the_session_like_disable_listening(live, monkeypatch):
+    """
+    "bye" is folded into disable_listening's own seeds (see
+    intent_matcher.py), not a separate farewell intent -- ending the
+    conversation is what "bye" said to an assistant most naturally
+    means, the same thing this intent already does.
+    """
+    spoken = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    _stub_match(live, monkeypatch, "disable_listening", 1.0, "bye")
+
+    should_close = live["handle_transcript"]("bye", True, _CLEAN_QUALITY, via_session=True)
+
+    assert should_close is True
+    assert spoken and spoken[0] in main.phrases.PHRASES["session_close"]
+
+
+def test_a_low_confidence_bye_does_not_close_a_real_session(live, monkeypatch):
+    """The highest-stakes version of the gate: a hallucinated "bye" must not silently end a real conversation."""
+    spoken = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    _stub_match(live, monkeypatch, "disable_listening", 0.95, "bye")
+
+    should_close = live["handle_transcript"]("bye", False, _NOISE_QUALITY, via_session=True)
+
+    assert should_close is False
+    assert spoken == []
+
+
+def test_the_gate_does_not_touch_an_ungated_fast_path_intent(live, monkeypatch):
+    """
+    Confirms the gate is narrowly scoped to _ACOUSTICALLY_GATED_SEEDS,
+    not applied broadly -- an ordinary fast-path match on noise-quality
+    audio must keep working exactly as it did before this existed.
+    dispatch_llm_action is mocked here specifically because the real
+    "mute" action taps a real volume key -- unlike the social intents
+    above, this one really would dispatch, and a test must not actually
+    change this machine's mute state to prove it.
+    """
+    spoken = []
+    dispatched = []
+    monkeypatch.setattr(main, "speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(main, "dispatch_llm_action", lambda parsed, text: dispatched.append(parsed) or actions.Outcome("Muted.", "ok"))
+    _stub_match(live, monkeypatch, "toggle_mute", 0.9, "mute")
+
+    live["handle_transcript"]("mute", True, _NOISE_QUALITY, via_session=True)
+
+    assert dispatched and dispatched[0]["action"] == "toggle_mute"
+
+
+# --- push-to-talk hold threshold ----------------------------------------
+#
+# Diagnosed directly from logs/session.jsonl: 215 of 216 logged
+# push-to-talk presses produced no speech at all. Requiring
+# HOTKEY_HOLD_THRESHOLD_SECONDS of hold before arming capture fixes
+# that without costing the leading audio of a deliberate press -- see
+# hotkey_pre_buffer's own comment in main.py.
+
+
+def test_hotkey_pre_buffer_always_covers_the_full_hold_threshold():
+    """
+    HOTKEY_PRE_BUFFER_FRAMES exists only to guarantee this: whatever was
+    said between press and confirmation must still be sitting in
+    hotkey_pre_buffer when _confirm_hotkey_hold reads it. If this ever
+    regresses (someone raises HOTKEY_HOLD_THRESHOLD_SECONDS again
+    without this derived constant keeping pace), the start of every
+    deliberate press gets silently clipped -- exactly the bug
+    PRE_BUFFER_FRAMES was originally written to prevent, just
+    reintroduced on the push-to-talk path instead.
+    """
+    buffered_seconds = main.HOTKEY_PRE_BUFFER_FRAMES * main.FRAME_SECONDS
+    assert buffered_seconds > main.HOTKEY_HOLD_THRESHOLD_SECONDS
+
+
+def test_a_tap_never_arms_capture_or_logs_anything(live, monkeypatch):
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    on_press, on_release, state = live["on_press"], live["on_release"], live["state"]
+
+    on_press(None)
+    on_release(None)  # released immediately -- well under the threshold
+
+    assert state["hotkey_active"] is False
+    assert events == [], "a tap must leave no trace at all, not a quieter one"
+
+
+def test_a_tap_does_not_barge_in_on_a_reply(live, monkeypatch):
+    """
+    Confirmed as the actual risk, not a hypothetical one: on_press used
+    to call interrupt_speech() unconditionally and instantly, so any
+    stray tap while Jarvis was mid-reply would cut it off.
+    """
+    interrupted = []
+    monkeypatch.setattr(main, "is_speaking", lambda: True)
+    monkeypatch.setattr(main, "interrupt_speech", lambda: interrupted.append(True))
+    on_press, on_release = live["on_press"], live["on_release"]
+
+    on_press(None)
+    on_release(None)
+
+    assert interrupted == []
+
+
+def test_a_confirmed_hold_arms_capture_and_seeds_from_the_pre_buffer(live):
+    state, on_press = live["state"], live["on_press"]
+    confirm, pre_buffer = live["confirm_hotkey_hold"], live["hotkey_pre_buffer"]
+    # What would have accumulated in the pre-buffer during the hold-
+    # confirmation window, if real audio had been arriving.
+    pre_buffer.append(np.zeros(main.FRAME_SAMPLES, dtype=np.float32))
+    pre_buffer.append(np.ones(main.FRAME_SAMPLES, dtype=np.float32))
+
+    on_press(None)
+    confirm()  # called directly -- see the real-timer test below for the wiring itself
+
+    assert state["hotkey_active"] is True
+    assert len(state["hotkey_frames"]) == 2
+    assert len(pre_buffer) == 0, "the pre-buffer must be drained once its contents are handed off"
+
+
+def test_a_confirmed_hold_barges_in_on_a_reply(live, monkeypatch):
+    interrupted = []
+    monkeypatch.setattr(main, "is_speaking", lambda: True)
+    monkeypatch.setattr(main, "interrupt_speech", lambda: interrupted.append(True))
+    on_press, confirm = live["on_press"], live["confirm_hotkey_hold"]
+
+    on_press(None)
+    confirm()
+
+    assert interrupted == [True]
+
+
+def test_confirming_after_release_is_a_no_op(live):
+    """
+    The race this project's own stream-lock incident is the precedent
+    for: on_release runs on keyboard's callback thread, confirmation
+    runs on the Timer's own thread, and a release landing before
+    confirmation actually runs must leave nothing armed.
+    """
+    state, on_press, on_release = live["state"], live["on_press"], live["on_release"]
+    confirm = live["confirm_hotkey_hold"]
+
+    on_press(None)
+    on_release(None)  # released before the (never-fired, in this test) timer would confirm
+    confirm()  # simulates the timer firing anyway, racing behind the release
+
+    assert state["hotkey_active"] is False
+
+
+def test_os_auto_repeat_does_not_restart_the_hold_window(live):
+    """
+    Held keys fire repeated native press events on Windows -- a second
+    on_press while already down must not push the confirmation window
+    back out indefinitely, or a long hold could never arm at all.
+    """
+    state, on_press = live["state"], live["on_press"]
+    on_press(None)
+    first_pressed_at = state["hotkey_pressed_at"]
+
+    on_press(None)  # simulated OS auto-repeat, key never actually released
+
+    assert state["hotkey_pressed_at"] == first_pressed_at
+
+
+def test_the_real_timer_confirms_a_hold_without_a_direct_call(live, monkeypatch):
+    """
+    The one test that exercises the actual threading.Timer wiring
+    end-to-end rather than calling _confirm_hotkey_hold directly --
+    everything above tests the logic; this catches a wiring mistake
+    (wrong function passed to Timer, wrong attribute name) that a
+    direct call would never see.
+    """
+    monkeypatch.setattr(main, "HOTKEY_HOLD_THRESHOLD_SECONDS", 0.01)
+    state, on_press = live["state"], live["on_press"]
+
+    on_press(None)
+    for _ in range(50):  # up to ~0.5s -- generous headroom over the 0.01s threshold
+        if state["hotkey_active"]:
+            break
+        time.sleep(0.01)
+
+    assert state["hotkey_active"] is True
+
+
+def test_the_real_timer_is_cancelled_by_a_release_before_it_fires(live, monkeypatch):
+    monkeypatch.setattr(main, "HOTKEY_HOLD_THRESHOLD_SECONDS", 0.05)
+    state, on_press, on_release = live["state"], live["on_press"], live["on_release"]
+
+    on_press(None)
+    on_release(None)  # released well before the 0.05s threshold
+    time.sleep(0.15)  # past where the timer would have fired, had it not been cancelled
+
+    assert state["hotkey_active"] is False
 
 
 def test_output_gate_does_not_touch_hotkey_processing(live, monkeypatch):
@@ -953,6 +1592,61 @@ def test_output_gate_transitions_are_logged_structurally(live, monkeypatch):
     kinds = [k for k, _ in events]
     assert kinds == ["output_playing_started", "output_playing_stopped"]
     assert "seconds" in events[1][1]
+
+
+# --- durable per-stage timings -----------------------------------------
+#
+# _TIMED_STAGES used to live only in an in-memory rolling deque (see
+# state["stats"]["timings"]), which `jarvis stats` reads but which dies
+# at every restart -- 40 `shutdown` records in the real log meant 40
+# discarded sessions' worth of where-the-time-went data. current_timings
+# is the durable half: a per-utterance snapshot, logged once into that
+# utterance's own "outcome" event.
+
+
+def test_record_timing_populates_the_current_utterance_snapshot(live):
+    state, record_timing = live["state"], live["record_timing"]
+    state["current_timings"] = {}
+
+    record_timing("transcribe", 0.42)
+    record_timing("match", 0.01)
+
+    assert state["current_timings"] == {"transcribe": 0.42, "match": 0.01}
+    # The rolling per-stage view jarvis stats reads from keeps working
+    # unchanged alongside it.
+    assert list(state["stats"]["timings"]["transcribe"]) == [0.42]
+
+
+def test_record_stat_logs_the_current_utterance_timings(live, monkeypatch):
+    state, record_stat = live["state"], live["record_stat"]
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    state["current_timings"] = {"transcribe": 0.4567, "action": 0.001}
+
+    record_stat("fast_path", "open chrome", "focus_or_launch_app:chrome")
+
+    kind, payload = events[-1]
+    assert kind == "outcome"
+    # Rounded for log readability, not truncated to uselessness --
+    # fast-path stages can be single-digit milliseconds.
+    assert payload["timings"] == {"transcribe": 0.457, "action": 0.001}
+
+
+def test_record_stat_logs_an_empty_timings_dict_when_nothing_was_timed(live, monkeypatch):
+    """
+    A meta/off-duty/no-match exit never calls record_timing at all --
+    the field should still be present and well-formed (an empty dict),
+    not missing or raising.
+    """
+    state, record_stat = live["state"], live["record_stat"]
+    events = []
+    monkeypatch.setattr(main, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    state["current_timings"] = {}
+
+    record_stat("off_duty", "hey jarvis")
+
+    kind, payload = events[-1]
+    assert payload["timings"] == {}
 
 
 def test_pause_clears_stale_output_gate_bookkeeping(live, monkeypatch):

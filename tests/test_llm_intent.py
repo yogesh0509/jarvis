@@ -202,9 +202,37 @@ def test_system_prompt_template_stays_within_a_shrink_budget():
     # SYSTEM_PROMPT_TEMPLATE) -- this just catches it silently creeping
     # back up over time. Generous headroom since char count is only a
     # proxy for token count.
+    #
+    # Raised twice since the original 3600, both recorded here rather
+    # than silently changed:
+    #
+    # 3600 -> 4000 (tools/_spike_kv_cache.py, Phase 2): every
+    # prefill-token argument that motivated the original tight budget
+    # was specifically about *cold-call* latency, and a cold call is no
+    # longer paid on every restart -- llm_intent.prewarm() now loads a
+    # persisted KV cache in well under a second instead, falling back to
+    # full prefill only once per install (or once after this exact
+    # template changes, which invalidates that cache by design -- see
+    # KV_CACHE_PATH's own comment).
+    #
+    # 4000 -> 4400 (Phase 3, adding set_timer/system_status/the three
+    # screenshot actions): checked directly rather than assumed --
+    # "screenshot this window" without a dedicated JSON example (a rule
+    # line alone wasn't enough) had the model pick "snap_window" instead
+    # and claim it "can't take screenshots directly," the same failure
+    # mode LLM_APP_KEYS' own comment already documents ("the model can't
+    # compare against an option it was never shown in the first time").
+    # Adding one compact example fixed it, verified against the real
+    # model (6/6 on a held-out phrasing set), and cost the size below.
+    #
+    # Still a real ceiling, not removed outright: a *warm* call still
+    # pays some decode-time cost proportional to prompt length, and an
+    # unbounded prompt is still worth catching before it creeps -- 4400
+    # leaves room to breathe while staying well under the original
+    # 4830-char pre-shrink size.
     from llm_intent import SYSTEM_PROMPT_TEMPLATE
 
-    assert len(SYSTEM_PROMPT_TEMPLATE) < 3600
+    assert len(SYSTEM_PROMPT_TEMPLATE) < 4400
 
 
 def test_prompt_repo_example_is_not_a_real_user_repo_name_regression():

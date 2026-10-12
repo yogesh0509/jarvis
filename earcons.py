@@ -71,7 +71,7 @@ def _seq(*parts):
 # Frequencies picked off a pentatonic-ish set so any two cues landing
 # close together still sound intentional rather than accidental.
 _A5, _CS6, _E6, _A6 = 880.0, 1108.7, 1318.5, 1760.0
-_E4, _A4, _CS5 = 329.6, 440.0, 554.4
+_E4, _A4, _CS5, _E5 = 329.6, 440.0, 554.4, 659.3
 
 _LIBRARY = {
     # Wake word caught -- the fastest possible "I heard you".
@@ -82,6 +82,15 @@ _LIBRARY = {
     "error": _seq(_tone(_CS5, _CS5, 0.055), _gap(0.02), _tone(_A4, _E4, 0.110)),
     # Understood, but deliberately not doing it (desktop numbers, off duty).
     "decline": _seq(_tone(_A4, _A4, 0.050), _gap(0.025), _tone(_A4, _A4, 0.050)),
+    # Attempted, correctly, and there was genuinely nothing to do
+    # (already focused, single-screen machine, already on that monitor)
+    # -- actions.Outcome's "no_effect" status. Deliberately a single
+    # flat tone at a pitch none of the other cues use, so it can't be
+    # mistaken for "decline" (a double-tap, same pitch both halves) or
+    # "error" (two parts, the second one falling): this is one plain,
+    # unresolved beep, neither rising nor falling, because nothing
+    # changed either way.
+    "no_effect": _seq(_tone(_E5, _E5, 0.090)),
     # Session closed on its own or on request.
     "session_close": _seq(_tone(_E6, _A5, 0.120)),
     # Dropping the heavy models -- arc reactor easing down.
@@ -102,6 +111,16 @@ _LIBRARY = {
     "power_down": _seq(_tone(_A6, _E4, 0.520, harmonic=0.12)),
     "dictation_on": _seq(_tone(_A5, _CS6, 0.070)),
     "dictation_off": _seq(_tone(_CS6, _A5, 0.070)),
+    # A timer or reminder went off. Deliberately the one cue that
+    # repeats the same pitch three times -- every other cue here is
+    # distinguished by its glide/fall shape, but this one wants the
+    # classic "kitchen timer" cadence, which reads as three flat beeps,
+    # not a melodic phrase. A6 is already the brightest pitch in the
+    # library (the "boot" flourish's final note), reused rather than
+    # adding a new one.
+    "timer_done": _seq(
+        _tone(_A6, _A6, 0.080), _gap(0.050), _tone(_A6, _A6, 0.080), _gap(0.050), _tone(_A6, _A6, 0.080)
+    ),
 }
 
 

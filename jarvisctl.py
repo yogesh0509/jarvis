@@ -7,6 +7,7 @@ quit, or basic usage stats.
 Usage (from D:\\jarvis):
     .venv\\Scripts\\python.exe jarvisctl.py status
     .venv\\Scripts\\python.exe jarvisctl.py stats
+    .venv\\Scripts\\python.exe jarvisctl.py aec [on|off]
     .venv\\Scripts\\python.exe jarvisctl.py pause
     .venv\\Scripts\\python.exe jarvisctl.py resume
     .venv\\Scripts\\python.exe jarvisctl.py quit
@@ -17,8 +18,11 @@ import sys
 
 HOST = "127.0.0.1"
 PORT = 47123
-COMMANDS = {"status", "stats", "debug", "pause", "resume", "quit"}
-# "debug" alone toggles; "debug on"/"debug off" set it explicitly.
+COMMANDS = {"status", "stats", "debug", "aec", "pause", "resume", "quit"}
+# "debug" alone toggles; "debug on"/"debug off" set it explicitly. "aec"
+# works the same way for echo cancellation (see echo_canceller.py):
+# "aec off" puts the wake word back to pausing whenever system audio
+# plays, without a restart.
 # "quit silent" skips the spoken goodbye and the spin-down earcon and
 # goes straight to releasing the audio devices -- it exists for the
 # sleep-triggered scheduled task, which fires once Windows has already
@@ -26,7 +30,7 @@ COMMANDS = {"status", "stats", "debug", "pause", "resume", "quit"}
 # is the difference between finishing the teardown before the suspend
 # and straddling it (see main.py's _announce_and_shutdown). Anyone
 # quitting by hand wants the goodbye, so it is opt-in, not the default.
-ARGUMENTS = {"debug": {"on", "off"}, "quit": {"silent"}}
+ARGUMENTS = {"debug": {"on", "off"}, "aec": {"on", "off"}, "quit": {"silent"}}
 
 
 def main():
@@ -39,6 +43,7 @@ def main():
     if not valid:
         print(f"Usage: jarvisctl.py {{{'|'.join(sorted(COMMANDS))}}}")
         print("       jarvisctl.py debug [on|off]")
+        print("       jarvisctl.py aec [on|off]")
         print("       jarvisctl.py quit [silent]")
         sys.exit(1)
 

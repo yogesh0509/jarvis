@@ -132,6 +132,38 @@ INTENTS: dict[str, list[str]] = {
     "describe_screen": ["what's on my screen", "what's on screen right now", "what am I looking at"],
     "now_playing": ["what's playing", "what's currently playing", "what song is this", "what's on spotify"],
     "move_to_monitor": ["move this to my laptop", "move this to my monitor", "move this to the other screen"],
+    # Duration/label are lexical hints pulled from the raw utterance
+    # (slots.parse_duration/extract_reminder_label), same zero-cost
+    # pattern as move_to_monitor's screen hint above -- these seeds only
+    # need to get the *action* right, not the specific time or label.
+    # Validated against the real embedder before picking these exact
+    # phrasings (not guessed): "set a timer for twenty minutes"/"remind
+    # me in an hour to stretch"/"can you set a timer for five minutes"
+    # all score 0.87-0.90 against these seeds, comfortably clear of the
+    # 0.80 threshold, while unrelated phrases ("thank you", "is chrome
+    # open") stay below 0.65.
+    "set_timer": ["set a timer", "set a timer for ten minutes", "start a timer", "remind me in ten minutes"],
+    "cancel_timer": ["cancel the timer", "cancel my timer", "stop the timer"],
+    "list_timers": ["how much time is left", "how much time do i have left", "what timers do i have"],
+    # Validated against the real embedder: "how's my battery"/"how much
+    # ram am i using"/"how full is my disk" all score 0.87-0.99 against
+    # these, while "what time is it"/"set a timer" (real, different
+    # intents) stay below 0.70 -- comfortable separation both ways.
+    "system_status": [
+        "how is my battery",
+        "how much battery do i have",
+        "how much memory am i using",
+        "is my disk full",
+        "how much space do i have left",
+    ],
+    # Validated against the real embedder: all three stay well-separated
+    "open_snipping_tool": ["open snipping tool", "take a snip", "let me select an area to screenshot"],
+    "screenshot_full": ["take a screenshot", "screenshot my screen", "capture my screen"],
+    "screenshot_window": [
+        "screenshot this window",
+        "screenshot the current window",
+        "take a screenshot of this window",
+    ],
     # Meta intents -- handled specially in main.py (they toggle the
     # listener's own state), not routed through actions.py's allowlist.
     # Dual meaning, resolved in main.py by context: said mid-session,
@@ -147,6 +179,17 @@ INTENTS: dict[str, list[str]] = {
         "we're done",
         "I'm done",
         "that's it",
+        # "bye"/"goodbye" read most naturally as ending the conversation,
+        # the same thing this intent already means -- not a separate
+        # farewell reply that leaves the session open. Both are also
+        # _ACOUSTICALLY_GATED_SEEDS (main.py): "bye" is in
+        # _HALLUCINATION_DENYLIST for the LLM path already, and a
+        # hallucinated "bye" silently closing a real session is worse
+        # than the existing seeds above being wrong, none of which are
+        # short enough to be a near-silence hallucination risk the same
+        # way.
+        "bye",
+        "goodbye",
     ],
     "enable_listening": [
         "start listening",
@@ -154,6 +197,17 @@ INTENTS: dict[str, list[str]] = {
         "wake up",
         "come back online",
     ],
+    # Meta intents, not real dispatchable actions -- handled directly in
+    # main.py the same way disable_listening/enable_listening are, by
+    # speaking a reply with nothing routed through actions.py at all
+    # (there's genuinely nothing to *do* for "thank you"). Both are also
+    # _ACOUSTICALLY_GATED_SEEDS: every one of these exact phrases is
+    # already in _HALLUCINATION_DENYLIST as a known near-silence
+    # hallucination, so a cosine match alone isn't treated as sufficient
+    # evidence the way it is for every other fast-path intent -- see
+    # that set's own comment in main.py for the full reasoning.
+    "social_thanks": ["thank you", "thanks"],
+    "social_ack": ["okay", "ok"],
     # Dictation mode -- only meaningful within an open session (see
     # main.py's start_dictation handling); said via push-to-talk it's
     # declined with a clarifying message instead. A phrasing this list

@@ -14,8 +14,8 @@ being ignored, and nothing in the current command set is destructive
 
 **Talking to it**
 - "hey jarvis", wait for "Yes, sir?", then speak -- hands-free, for everyday use
-- Hold Right Ctrl, speak, let go -- push-to-talk; works in any state, including paused
-- "hey jarvis" won't trigger while system audio (music/video/a call) is playing through the speakers -- push-to-talk always works instead, even to control that audio itself
+- Hold Right Ctrl, speak, let go -- push-to-talk; works in any state, including paused.
+- "hey jarvis" works over music, a video or a call -- Jarvis cancels out whatever your computer is playing and listens for your voice underneath it.
 - Hold Right Ctrl while it's talking to cut off a long reply and speak immediately
 - An unfamiliar phrasing takes a couple seconds longer (local AI fallback) -- it says "One moment, sir" while it thinks; that's normal, not a hang
 
@@ -40,7 +40,6 @@ being ignored, and nothing in the current command set is destructive
 - "switch to the bdk_wallet window in vscode" -- jumps to the open window whose title contains that name
 
 **Read-only questions**
-- "how many files are in this folder" -- the currently-focused File Explorer window
 - "what's playing" / "what song is this" -- Spotify's current track, or an honest "can't tell" if it's paused or idle
 
 **Screens** (laptop + external monitor)
@@ -50,6 +49,7 @@ being ignored, and nothing in the current command set is destructive
 
 **Small talk**
 - Greetings, "what time is it", "tell me a joke" -- an in-character reply; genuinely offline, so no weather/news/live search, and it says so rather than making something up
+- "thank you" / "thanks" / "okay" / "bye" get an instant, in-character acknowledgment. 
 - "open chrome" then "minimize it" -- remembers the last app an action touched, for one turn
 
 **Dictation**
@@ -105,6 +105,7 @@ stateDiagram-v2
 (GitHub renders this natively; VS Code's Markdown preview needs a Mermaid extension.)
 
 A few things the diagram alone doesn't show:
+- On the way into `Running`, Jarvis speaks a short proactive briefing instead of a flat "online" line -- a time-of-day greeting, your battery level if this machine has one, and a plain count of what's already open (and whether that matches what was open when it last shut down cleanly).
 - Closing/pausing share one word list ("power down", "stop listening", ...); resuming uses a different one ("start listening", "wake up") -- they aren't interchangeable.
 - "hey jarvis" never resumes from Paused, with or without Ctrl -- nothing is listening for it in that state. Only Ctrl + a resume word (or `jarvis resume`) works.
 - Saying a "stop" word without Ctrl only closes the conversation; the same word with Ctrl pauses entirely, conversation open or not.
@@ -127,6 +128,7 @@ jarvis start           # launch it (auto-starts at login/wake too)
 jarvis status          # current state, LLM warm/cold, NO MIC SIGNAL if the mic's dead
 jarvis stats           # usage counts, per-stage timings, last 20 utterances
 jarvis debug [on|off]  # toggle detailed terminal output, no restart needed
+jarvis aec [on|off]    # echo cancellation; "off" = system audio pauses "hey jarvis" again
 jarvis pause           # mic off, stop listening entirely
 jarvis resume          # bring it back
 jarvis quit            # stop it completely, with the spoken goodbye
@@ -134,10 +136,4 @@ jarvis quit silent     # ...without the goodbye -- used by the sleep-triggered q
 ```
 
 `NO MIC SIGNAL` in `status` means the microphone itself has gone dead
-(not a Jarvis bug) -- see `KNOWN_LIMITATIONS.md` for recovery steps.
-`listener stalled Ns` means restart Jarvis. Everything is also logged to
-`logs\session.jsonl` regardless of the `debug` setting.
-
-(`jarvis` forwards to `jarvisctl.py`'s control socket; `jarvisctl.py` can't
-launch a fresh instance itself, hence `start` being handled separately.
-Long form from `D:\jarvis`: `.venv\Scripts\python.exe jarvisctl.py <command>`.)
+(not a Jarvis bug).

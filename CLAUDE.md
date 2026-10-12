@@ -41,6 +41,8 @@ jarvis start
 # control an already-running instance (talks to localhost:47123)
 jarvis status | stats | pause | resume | quit
 jarvis debug [on|off]        # toggle terminal verbosity without restart
+jarvis aec [on|off]          # echo cancellation; off = system audio pauses
+                             # the wake word again, no restart
 jarvis quit silent           # skip the spoken goodbye -- the sleep task uses
                              # this so the audio teardown finishes before
                              # Windows suspends (see scheduler/README.md)
@@ -57,6 +59,11 @@ jarvis quit silent           # skip the spoken goodbye -- the sleep task uses
 # llm_intent.py's model/prompt/schema)
 .\.venv\Scripts\python.exe tools\_bench_llm.py
 
+# echo-cancellation measurement on the current default output (plays a
+# stimulus through the speakers; --talk = you speak over it). Run once
+# per output device after touching echo_canceller.py/loopback.py
+.\.venv\Scripts\python.exe tools\_spike_aec.py [--talk] [--clip song.wav]
+
 # promote frequently-seen LLM-resolved phrases into the fast path
 # (manual only — restart jarvis afterward for new seeds to take effect)
 .\.venv\Scripts\python.exe seed_promotion.py
@@ -67,7 +74,8 @@ There is no separate lint/format/build step configured in this repo.
 ## Architecture
 
 ```
-mic --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
+mic --> echo_canceller.py (AEC3 vs loopback.py's speaker reference)
+      --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
       --> faster-whisper small.en (transcription)
       --> intent_matcher.py (fast embedding match)
             |-- confident match --> actions.py (dispatch)
@@ -78,7 +86,8 @@ mic --> openWakeWord ("hey jarvis") --> Silero VAD (utterance segmentation)
 
 Push-to-talk (Right Ctrl) is a second, independent entry point into the
 same `intent_matcher.py` -> `llm_intent.py` -> `actions.py` -> `tts.py`
-pipeline, bypassing the wake-word/VAD-session layer entirely. `main.py`
+pipeline, bypassing the wake-word/VAD-session layer (and echo
+cancellation -- it stays on the raw mic) entirely. `main.py`
 runs a three-mode listener loop (`wake` / `session_listening` /
 `session_recording`) plus the control server and single-instance guard.
 
@@ -111,11 +120,13 @@ any action with real side effects like delete/send).
 | `vad.py` | Silero VAD wrapper — carries recurrent state, so never share one instance across independent audio streams |
 | `virtual_desktop.py` | `IVirtualDesktopManager` COM wrapper (current-desktop check); thread-local, `CLSCTX_INPROC_SERVER` |
 | `tts.py` | Piper TTS playback, mic-mute-while-speaking (count-based, not boolean), persistent output stream with device-failure recovery |
-| `output_monitor.py` | detects whether the system's default audio output is playing anything at all (Spotify, a video, anything -- not just Jarvis's own voice) via `IAudioMeterInformation`; gates wake-word detection and session dispatch while true, push-to-talk unaffected |
+| `output_monitor.py` | detects whether the system's default audio output is playing anything at all (Spotify, a video, anything -- not just Jarvis's own voice) via `IAudioMeterInformation`; gates wake-word detection and session dispatch while true *and* echo cancellation isn't covering, push-to-talk unaffected |
+| `loopback.py` | WASAPI loopback capture of the default output (hand-rolled comtypes, 16kHz mono via `AUTOCONVERTPCM`) -- the echo canceller's reference; gap-fills idle silence, reopens on a default-device change |
+| `echo_canceller.py` | WebRTC AEC3 (`livekit`'s `AudioProcessingModule`, lazily imported) run inside the main capture callback; `coverage()` is the fail-closed "is cancellation demonstrably working on this output right now" answer the output gate uses; also the reference delay aligner and the session echo floor |
 | `hud.py` | single locked writer for all user-facing terminal output; degrades to plain `print()` when stdout isn't a terminal |
 | `earcons.py` | short non-verbal audio cues synthesized with numpy at import; routed through `tts._begin_speaking`/`_end_speaking` so they get mic-muted too |
 | `phrases.py` | reply phrasing as pools of variants — the one file to change for wording/tone |
-| `jarvisctl.py` | one-shot control-socket client (`127.0.0.1:47123`) for status/stats/debug/pause/resume/quit |
+| `jarvisctl.py` | one-shot control-socket client (`127.0.0.1:47123`) for status/stats/debug/aec/pause/resume/quit |
 | `jarvis.cmd` | `jarvis <command>` wrapper; `start` launches `wt.exe -F -p Jarvis` directly since `jarvisctl.py` can only talk to an already-running instance |
 
 ### Conventions that matter here
@@ -147,12 +158,23 @@ any action with real side effects like delete/send).
   See DECISIONS.md's "stream-lock race" section.
 - **System audio output (Spotify, a video, a call) is a different
   problem from Jarvis hearing its own voice.** `is_speaking()` only
-  covers Jarvis's own TTS; `output_monitor.py` gates wake-word detection
-  and session dispatch while *anything* is playing through the speakers
-  — confirmed necessary after a real false-trigger (a session opened on
-  music, with lyrics dispatched as volume commands). Push-to-talk stays
-  exempt, same as every other override here. See DECISIONS.md's "System
-  output" section.
+  covers Jarvis's own TTS. For everything else, `echo_canceller.py`
+  subtracts what the speakers are playing (`loopback.py`'s reference)
+  from the mic, and `output_monitor.py`'s gate holds wake-word
+  detection and session dispatch only while output plays *and*
+  `echo_canceller.coverage()` isn't `covering`. The gate is what stopped
+  a real false-trigger (a session opened on music, lyrics dispatched as
+  volume commands), so any doubt about coverage must keep it closed.
+  The reference must reach AEC3 *before* its echo: never let the
+  loopback queue sit deep -- 16 frames of slack once made AEC3 useless
+  (6dB). Input health is judged on the raw signal, before cancellation.
+  A session frame at or below `INPUT_SILENCE_FLOOR` is never speech,
+  whatever Silero says, and every playback stop resets the acoustic
+  models: Silero's state after a reply's residual calls the exact
+  zeros AEC3 outputs "speech" (see DECISIONS.md's "Ghost speech after
+  replies").
+  Push-to-talk stays raw and exempt, same as every other override here.
+  See DECISIONS.md's "System output" and "System output, round two".
 - **Fail closed, not open**, for anything security/correctness-adjacent
   (e.g. virtual-desktop membership checks) — a redundant extra window is
   a fine worst case; silently doing the wrong destructive-adjacent thing

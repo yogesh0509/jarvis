@@ -56,7 +56,6 @@ TEST_UTTERANCES = [
     ("can you go to the bdk wallet repo in vscode", "focus_vscode_repo"),
     ("switch over to the hashstack window in vs code", "focus_vscode_repo"),
     ("how many chrome windows do i have open right now", "count_app_windows"),
-    ("how many files are in this folder", "count_files_in_folder"),
     ("what's the weather like today", "none"),  # should map to none + a spoken reply
     ("what time is it", "none"),  # should map to none + the actual current time
     ("thank you", "none"),  # should map to none + a short acknowledgement

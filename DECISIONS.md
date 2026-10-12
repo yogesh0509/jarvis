@@ -17,6 +17,7 @@ design choice from scratch. Project overview and setup live in
 - [Input health: a running stream that hears nothing](#input-health-a-running-stream-that-hears-nothing)
 - [The stream-lock race: two threads, one capture device](#the-stream-lock-race-two-threads-one-capture-device)
 - [System output: Spotify is not Jarvis's own voice](#system-output-spotify-is-not-jarviss-own-voice)
+- [System output, round two: echo cancellation](#system-output-round-two-echo-cancellation)
 - [State-machine audit against the documented diagram](#state-machine-audit-against-the-documented-diagram)
 - [Command-line control (`jarvisctl.py`), not a tray icon](#command-line-control-jarvisctlpy-not-a-tray-icon)
 - [Idle unload after 30 minutes ("deep sleep")](#idle-unload-after-30-minutes-deep-sleep)
@@ -27,6 +28,15 @@ design choice from scratch. Project overview and setup live in
 - [Virtual-desktop awareness](#virtual-desktop-awareness)
 - [Screen and window context](#screen-and-window-context)
 - [Voice replies and terminal theming](#voice-replies-and-terminal-theming)
+- [Exact volume control via IAudioEndpointVolume](#exact-volume-control-via-iaudioendpointvolume)
+- [Repairing mishearings after the fact, not biasing decode toward them](#repairing-mishearings-after-the-fact-not-biasing-decode-toward-them)
+- [Feedback integrity: actions.Outcome, and the room lights actually knowing](#feedback-integrity-actionsoutcome-and-the-room-lights-actually-knowing)
+- [Observability: durable timings, log rotation, and tools/_report.py](#observability-durable-timings-log-rotation-and-tools_reportpy)
+- [The push-to-talk hold threshold](#the-push-to-talk-hold-threshold)
+- [Persisted KV cache: a spike that won](#persisted-kv-cache-a-spike-that-won)
+- [Social intents and the acoustic gate](#social-intents-and-the-acoustic-gate)
+- [Proactive briefing on boot](#proactive-briefing-on-boot)
+- [Removed: "how many files are in this folder"](#removed-how-many-files-are-in-this-folder)
 
 ## Listening: wake-word sessions, not per-command push-to-talk
 
@@ -326,7 +336,9 @@ echo cancellation -- it doesn't attempt to isolate a real voice speaking
 over music, only answers "is the render endpoint active". A future
 "pause the music with your voice while it's still audibly playing"
 request would need actual AEC (subtracting a loopback reference from the
-mic signal), which this deliberately does not attempt.
+mic signal), which this deliberately does not attempt. *(That request
+came -- see "System output, round two" below. The gate stays, but only
+holds while echo cancellation isn't demonstrably covering the output.)*
 
 Two smaller decisions fell out of the debounce values chosen
 (`ON_SECONDS`/`OFF_SECONDS`, deliberately asymmetric): engaging fast
@@ -345,6 +357,164 @@ over 30 minutes would have pinned the heavy models in memory for as long
 as the output kept playing, since the check would never have run at all
 while gated. It now runs independent of the output gate, immediately
 above it.
+
+## System output, round two: echo cancellation
+
+The request the section above predicted: "a lot of time I want to voice
+control when system audio is playing, such as movies, Spotify songs" --
+over laptop speakers, an HDMI monitor's speakers, a Bluetooth speaker,
+and earbuds. The cost of the hard gate, from `tools/_report.py` at the
+time: 550 playback stretches, ~29.5h deaf to hands-free wake in total
+(4.5% of the 660h the log spanned), and 94 of 99 `listener_gate_stuck`
+events were this gate.
+
+**What it does now.** `loopback.py` captures exactly what Windows is
+sending to the default output (WASAPI loopback), and `echo_canceller.py`
+subtracts its echo from the mic with WebRTC's AEC3 (via the `livekit`
+package's `AudioProcessingModule`), inside the main capture callback,
+before wake word / VAD / Whisper see anything. The output gate is kept,
+but `_check_output_gate()` now returns *playing and not covered*:
+cancellation has to be demonstrably working -- reference flowing for the
+current endpoint, canceller healthy, converged, and a low percentile of
+the post-cancellation level under `AEC_RESIDUAL_MAX_DBFS`. Anything else
+(`unavailable`, `off`, `converging`, `residual_high`, `unhealthy`) is
+the old gate exactly. `jarvis aec off` forces that at runtime.
+
+**Measured before trusting it** (`tools/_spike_aec.py`, laptop speakers,
+70% volume, Piper saying "Hey Jarvis, turn the volume down. Hey Jarvis,
+skip this track. Pause the music. Open Chrome for me." -- echo only,
+nobody speaking):
+
+| pipeline | level during playback | VAD onsets | wake max | transcript |
+|---|---|---|---|---|
+| raw (the old capture path) | -37 dBFS | 4 | 0.99 | the whole stimulus, word for word |
+| raw + AEC3 (now shipped) | -86 dBFS | 0 | 0.00 | *(empty)* |
+| WASAPI, SPEECH category | -86 dBFS | 0 | 0.00 | *(empty)* |
+| WASAPI, COMMUNICATIONS category | -85 dBFS | 0 | 0.00 | "you" |
+
+~49dB of cancellation, ~2ms of CPU per 80ms block.
+
+**The first two runs failed, and why is the most important thing here.**
+AEC3 initially managed 6dB and let the wake word straight through. The
+reference was arriving ~125ms *after* its own echo -- the reference
+queue was allowed to sit 16 frames deep before being trimmed, and every
+queued 10ms frame makes the reference 10ms later relative to the mic. An
+echo that arrives before its reference can't be predicted by any
+canceller. (The first run's analysis misread this as a 513ms *capture*
+latency -- the spike was comparing windows that didn't line up. Fixed in
+the spike too: it now analyses exactly what AEC3 was fed, frame for
+frame.) The queue is now trimmed all the way back to the hold-back once
+it runs `REFERENCE_SLACK_FRAMES` (6) past it. The real echo path on the
+laptop speakers is short: ~25ms from loopback tap to captured frame.
+
+`DelayAligner` covers outputs where it isn't short: it re-measures the
+delay AEC3 is being asked to find (GCC-PHAT, on the fed pair, while
+audio plays) and holds the reference back so AEC3 is left ~80ms. AEC3's
+own delay search spans only about half a second, and a Bluetooth
+speaker adds its latency *after* the loopback tap. It starts at zero
+hold-back and moves only on a clear correlation peak and by more than
+30ms. Every move makes AEC3 re-adapt, so coverage restarts convergence.
+
+**Why software AEC rather than the driver's built-in modes, which
+measured just as well.** The mic driver here (Intel SST array, Waves APO
+plus Intel's Voca effect pack) advertises SPEECH and COMMUNICATIONS
+processing modes, and sounddevice can request them via
+`PaWasapiStreamInfo.streamCategory`. Both cancelled the laptop speakers
+as well as AEC3. Not chosen as the shipped path, for now:
+- **Coverage.** A DSP-internal echo reference most likely covers only
+  the internal speaker path. HDMI and Bluetooth outputs are a must here
+  and are unmeasured. Loopback taps whatever the default output is.
+- **Signal.** Those modes gate silence to exact digital zero (-120 dBFS
+  between words in the spike). That is exactly what `_check_input_signal`'s
+  constant-quiet test reads as a wedged capture driver (see "Input
+  health" above). Switching modes would also change the NS/AGC every
+  wake/VAD/Whisper threshold was tuned on.
+- **Fail-closed.** The software path can measure its own residual and
+  say "not covering". A driver mode gives no such signal.
+
+The spike measures all four pipelines on every run, so this can be
+revisited per output with data rather than re-argued.
+
+Other choices:
+- **Transparent while nothing plays.** After 2s of silent reference,
+  `process()` returns the raw mic (still feeding AEC3 so its state stays
+  continuous). With nothing playing, the pipeline is bit-identical to
+  before, so no threshold needed re-tuning.
+- **Echo cancellation and the high-pass filter only.** No WebRTC noise
+  suppression or AGC: the SST DSP already does its own ahead of us.
+- **Input health is judged on the raw signal**, before `process()`.
+  Cancelled audio can sit far quieter than anything the device actually
+  delivered.
+- **Push-to-talk stays raw.** It's the independent override, and it
+  keeps working even if every piece of this fails.
+- **Echo floor for sessions.** Residual lyrics can still look like
+  speech to Silero at 0.15. While output plays, a session frame also
+  has to clear the median post-cancellation level by
+  `ECHO_ONSET_MARGIN_DB` (12dB). The user's near-field voice does;
+  residual doesn't. Applied to end-of-utterance as well, so a command
+  spoken over music ends when the speaker stops, not at
+  `MAX_COMMAND_FRAMES`. Refusals are logged (`echo_onset_rejected`,
+  rate-limited), so a real command being refused would show.
+- **Gate release now resets the acoustic models.** Frames are thrown
+  away for the whole gated stretch, so openWakeWord's rolling window
+  and Silero's recurrent state used to stitch the audio either side of
+  the gap together. The falling edge now sets `reset_acoustic`, the same
+  as a stream reopen or a resume. **So does every playback stop**,
+  gated or not -- see "Ghost speech after replies" below.
+- **Hand-rolled comtypes for loopback**, like `output_monitor.py`.
+  sounddevice's bundled PortAudio exposes no loopback devices at all.
+  The stream asks for 16kHz mono float directly (`AUTOCONVERTPCM`), so
+  there's no resampler of ours. An idle endpoint sends *no* packets, so
+  `GapFiller` synthesizes the silence. The default device is re-checked
+  every second, and the reader reopens on a change, which also resets
+  the canceller and its delay.
+
+Every threshold in `echo_canceller.py` is provisional in the
+`WAKE_THRESHOLD` sense. The spike runs above are one output at one
+volume. `aec_stats` (every 30s of playback), `aec_coverage` and
+`echo_onset_rejected` in `session.jsonl`, plus section 5 of
+`tools/_report.py`, are what to revisit them from. Still to measure:
+- double talk (`--talk`);
+- the HDMI monitor, the Bluetooth speaker and earbuds;
+- real music and film audio rather than TTS.
+
+### Ghost speech after replies
+
+The first live session with echo cancellation on looped: about a
+second after every reply, a recording nobody spoke into, transcribed as
+"you you" or "how many files" (the `TRANSCRIBE_HOTWORDS` tail), answered,
+and that answer primed the next one. Every one of those transcripts
+logged a raw peak of 1-2 LSB or 0.0. Whisper was being handed digital
+silence. Across the month of logs before echo cancellation there were
+182 transcripts and none quieter than 4e-3.
+
+**Cause.** Silero v4's recurrent state, after even a faint residual of
+speech (-40 to -85 dBFS) followed by *exact* zeros, climbs (0.37 ->
+0.62) and holds above `VAD_SPEECH_THRESHOLD` for 3-20 frames. That is
+enough for `SPEECH_ONSET_FRAMES`. This was reproduced offline with the
+real model and Piper audio of the real replies. From a reset, the same
+zeros score 0.04. AEC3's suppressor outputs exact zeros, and this mic's
+SST DSP floors a quiet room to 1-3 LSB anyway. Before echo cancellation
+this never surfaced: Jarvis's own reply tripped the output gate, and
+the gate's release reset Silero. With coverage, a reply no longer
+gates, so nothing reset it. The echo floor refused the ghost frames only
+while `output_was_playing` held, and the onset landed right after.
+
+**Fix, two halves.**
+- `_is_session_speech` refuses any frame whose peak is at or below
+  `INPUT_SILENCE_FLOOR`, whatever Silero says. That covers onset and
+  end-of-utterance, so a real command also stops being padded with a
+  second of ghost zeros. Refusals are logged as `silent_vad_rejected`,
+  rate-limited like `echo_onset_rejected`.
+- Every playback stop sets `reset_acoustic`, covered or gated. This
+  restores the invariant that Silero's state never carries a reply, or a
+  song, into the next listen. It is the half that still works on a mic
+  whose quiet floor isn't digital zero.
+
+**Rejected: dithering the VAD's input.** A -80 or -90 dBFS noise floor
+under the zeros shrank the ghost but didn't remove it. In some runs it
+still held for 3+ frames, which is an onset. A floor that sometimes
+works isn't a fix.
 
 ## State-machine audit against the documented diagram
 
@@ -527,12 +697,15 @@ actual pasted transcripts, not assumption:
   against a domain word, not a volume problem. `hotwords` boosts
   recognition of specific terms without conditioning on them as literal
   prior text (unlike `initial_prompt`). `TRANSCRIBE_HOTWORDS` covers app
-  names, desktop-navigation vocabulary, window-action verbs, query
-  phrasing, and the user's actual repo names -- update it as new
-  vocabulary gets added. Tradeoff (see the VAD-gating fixes above): a
-  hotwords bias can make Whisper hallucinate fragments of that same
-  vocabulary out of near-silent audio, so this is never applied without
-  a VAD gate confirming real speech was present first.
+  names, desktop-navigation vocabulary, window-action verbs, and query
+  phrasing -- update it as new vocabulary gets added, but see the "bdk
+  wallet" section below for why real repo/project names specifically no
+  longer belong here (they did once; this paragraph is corrected from an
+  earlier version that still described that). Tradeoff (see the
+  VAD-gating fixes above): a hotwords bias can make Whisper hallucinate
+  fragments of that same vocabulary out of near-silent audio, so this is
+  never applied without a VAD gate confirming real speech was present
+  first.
 - **`VAD_SPEECH_THRESHOLD`**: needed three rounds of reduction (0.5 ->
   0.35 -> 0.2 -> 0.1) before "have to speak louder than normal" actually
   resolved -- 0.1 confirmed working at normal speaking volume, but proved
@@ -546,12 +719,32 @@ actual pasted transcripts, not assumption:
 - **`SILENCE_HANG_FRAMES`** (end-of-utterance silence hang): started at
   0.8s, halved to 0.4s -- felt laggy for one-sentence commands.
 
-A manual check of the actual Windows microphone input level (Sound
-settings -> input device -> volume/boost) is still worth doing
-independently -- there's no simple built-in PowerShell way to read or
-adjust this, so it wasn't automated, but software-side tuning can only
-compensate so much if the mic's own recorded level is set low at the OS
-level.
+**Update (2026-09-29): the "no simple way to check this" half of the
+above is no longer true, and the actual finding was the opposite of
+what this section anticipated.** This paragraph originally worried about
+the mic's level being set too *low*. Diagnosed instead from real
+session data: the reference machine's mic was at **100%** (read via
+`audio_endpoint.get_input_volume()` -- `IAudioEndpointVolume` on the
+capture endpoint, the same Core Audio interface `output_monitor.py`
+already used one layer up), and a real, distinct population of
+mishearings in the log was consistent with clipping, not quiet input --
+peak pinned at exactly 1.0 across six different manglings of "hey
+jarvis" ("hey jobis"/"jobbers"/"jawless"/"jobters"), each with Whisper
+*confident* (`avg_logprob` -0.55 to -1.2) and still wrong, a different
+shape entirely from the near-silence hallucination class this project
+already had a fix for. `main.py` now boots with a one-time, read-only
+warning (`_HIGH_INPUT_LEVEL_WARNING`) when the capture level measures
+suspiciously high, and logs a per-utterance `clipped_fraction` (fraction
+of samples pinned at/near full scale, computed pre-normalization) that
+feeds `_should_reject_transcript`'s existing shadow-only gate as a new
+"clipped" reason -- same discipline as every other reason there:
+logged, not yet enforced, pending real shadow data. `audio_endpoint.py`
+deliberately never *writes* the capture level -- see its module
+docstring for why (that setting may already be tuned for a call or a
+recording this process knows nothing about). Software-side tuning
+genuinely can't fix clipping after the fact either way, in either
+direction: the fix is the physical level, which is why this stays a
+detect-and-warn design, not a silent auto-correct.
 
 ## Intent resolution: local embedding match, local LLM fallback
 
@@ -1123,11 +1316,31 @@ project already fought through, for something this frequent.
   `en_GB-alan-medium` per a request for something a bit friendlier/less
   formal while keeping a British-male "Jarvis" feel; `VOICE` in `tts.py`
   swaps back easily, both models stay on disk).
-- **Speed**: `SynthesisConfig(length_scale=1/1.1)` -- tuned down twice
-  from an initial 1.5x (too fast), then 1.25x, settling at 1.1x once
-  *all* conversational replies started being spoken (not just state
-  transitions), since a faster rate that was fine for occasional short
-  status lines felt rushed once every reply was read aloud.
+- **Speed**: `SynthesisConfig(length_scale=1.0)` -- went 1.5x (too fast)
+  -> 1.25x -> 1.1x once *all* conversational replies started being
+  spoken (not just state transitions), since a faster rate that was
+  fine for occasional short status lines felt rushed once every reply
+  was read aloud. **Reverted to the voice's natural 1.0x** (2026-09-28)
+  on direct request -- 1.1x still read as rushed once it was actually
+  lived with day to day. If speed becomes worth revisiting again, treat
+  it as a per-category question rather than one global constant: an
+  error or a decline might reasonably stay slower/clearer than a terse
+  one-word confirmation, which `_SYN_CONFIG` doesn't currently
+  distinguish.
+- **Tone: "warmer by default", reversing `phrases.py`'s own original
+  "no time-of-day asides" rule** (2026-09-30), on direct request. The
+  original rule was a deliberate reaction to a worse problem --
+  *generated*-sounding replies from 100%-"sir"-density templates -- and
+  that reasoning still holds everywhere else in the file (still no
+  jokes, still no commentary on what's being done). The one exception
+  is the boot-time proactive briefing (see "Proactive briefing on
+  boot" below), which opens with a real time-of-day greeting
+  (`briefing_greeting_morning`/`_afternoon`/`_evening`/`_night`) --
+  narrow enough that it doesn't reopen the original problem (still no
+  per-reply commentary, still pooled variants, still capped at one
+  greeting per boot rather than per reply) while giving the one thing
+  "warmer by default" was actually asking for: an assistant that
+  sounds like it knows what time it is when it first speaks to you.
 - **All conversation replies are spoken now**, not just the six original
   state transitions (startup, pause, resume, deep-sleep entry/exit,
   quit) -- action confirmations, "I'm not sure how to do that yet, sir,"
@@ -1397,3 +1610,614 @@ bypassing `wt.exe`, to isolate launcher from program):
 2. `wt.exe`'s fullscreen flag must come *before* the profile flag --
    `wt.exe -F -p Jarvis` works, `wt.exe -p Jarvis -F` silently launches
    nothing at all.
+
+## Exact volume control via IAudioEndpointVolume
+
+The log showed a repeated, confirmed failure: "reduce the volume by 5",
+"reduce volume by 10" (twice), "reduce the volume by 10" -- all asking
+for an amount `volume_up`/`volume_down` had no way to honour, since both
+were a single `VK_VOLUME_UP`/`VK_VOLUME_DOWN` tap (~2% per press) with
+no notion of "by how much" at all.
+
+**The amount is a lexical hint, not a schema field** -- continuing the
+pattern `describe_screen`/`move_to_monitor` already established (see
+"Screen and window context" above): `slots.parse_amount()` reads the
+raw utterance text for a relative step ("by 10") or an absolute target
+("to 30", or a bare "volume 30"), returning `None` when nothing was
+said so the caller falls back to the old single-tap behaviour
+unchanged. Zero prompt tokens, works identically on both the fast path
+and the LLM fallback, same reasoning as every other hint-based
+parameter in this codebase.
+
+**No new action was added.** "Set the volume to 30" carries no
+"up"/"down" of its own, so which of `volume_up`/`volume_down` catches
+it by cosine similarity is arbitrary -- confirmed directly (`local_
+embedder`, live): both phrasings land on `volume_up`'s seeds at
+0.83-0.85, comfortably clear of the 0.80 threshold, purely because of
+surface resemblance to "turn the volume up", not because either means
+"up". This turned out to not matter: an *absolute* amount is applied
+exactly regardless of which action fired, and only a *relative* amount
+("by 10") needs the matched direction at all -- which the seeds
+resolved correctly in every case tested. Adding a dedicated
+`set_volume` action was considered and rejected as unnecessary
+complexity once this was confirmed.
+
+**The actual control surface is `audio_endpoint.py`**, a new module
+wrapping `IAudioEndpointVolume` -- the interface behind Windows' own
+volume slider, both the speaker one (read/write, for this) and the
+microphone one (read-only, see the next entry). Same COM shape
+`output_monitor.py` already established (`IMMDeviceEnumerator` ->
+`GetDefaultAudioEndpoint` -> `Activate`), one interface deeper: 7 vtable
+slots declared (only 2 ever called -- `SetMasterVolumeLevelScalar`/
+`GetMasterVolumeLevelScalar`; the 5 ahead of them are declared with
+accurate signatures purely to keep vtable offsets correct, per
+KNOWN_LIMITATIONS.md's own standing caution about hand-declared
+vtables). Thread-local COM apartment, exactly `virtual_desktop.py`'s
+`_get_manager` pattern -- volume actions dispatch from either the
+listener thread or a per-press push-to-talk worker thread, and a COM
+pointer can't safely cross threads without marshalling.
+
+Verified live end to end, not just unit-tested: a relative down-by-5
+followed by up-by-5 round-tripped the system volume exactly (80% ->
+75% -> 80%, confirmed via readback); an absolute set to the
+already-current value was a confirmed no-op; the old no-amount tap
+path was confirmed unchanged.
+
+## Repairing mishearings after the fact, not biasing decode toward them
+
+A second look at the "bdk wallet" false-dispatch problem (see that
+section above), after the mic-clipping finding made clear the
+transcription complaints weren't one problem but at least two.
+`TRANSCRIBE_HOTWORDS` primed repo names at decode time and got reverted
+because that biases recognition *toward* those words regardless of
+what's in the audio -- the fix can't be "prime the words better," it
+has to work a different way entirely.
+
+**Tested and rejected: a whole-transcript word-repair pass.** The
+original idea was a general fuzzy-correction step -- any word close to
+a known command vocabulary gets rewritten before the text reaches the
+matcher/LLM ("bng up chrome" -> "bring up chrome"), using
+`difflib.SequenceMatcher.ratio()` against a small, closed vocabulary
+derived from `intent_matcher.INTENTS`' own real seed words (deliberately
+not a new hand-guessed list -- and this caught a real mistake: "launch"
+was in an early draft of the vocabulary despite never actually
+appearing in a real seed phrase, only in the internal action name
+`focus_or_launch_app`).
+
+Checked against real English words before shipping it, per this
+project's stated method of deciding from data rather than a guess --
+and it failed. At the one cutoff that catches the target correction
+("bng"/"bring", ratio 0.75), ordinary conversational words score
+*higher* against unrelated vocabulary entries than the real target
+does: "love"/"move" 0.75, "star"/"start" 0.89, "sleepy"/"sleep" 0.91,
+"man"/"many" 0.86. There is no threshold that keeps the wanted
+correction and excludes those -- plain per-word edit-distance can't
+tell "a genuine mistranscription" apart from "a real, different, shorter
+word that happens to be nearby" without more context than one isolated
+word carries. Shelved, not shipped; `fuzzy_match.py`'s own docstring
+keeps this account so the idea doesn't get quietly retried without
+re-deriving why it didn't work.
+
+**What shipped instead: `focus_vscode_repo`'s fallback, narrowed to a
+domain where the failure mode is actually safe.** Same scoring
+primitive (`fuzzy_match.best_match`/`ngrams`), applied only when the
+existing exact-substring check finds nothing, and only against
+titles of VS Code windows that are *actually open* -- a handful of real
+candidates, never "any English word." The candidate set being small and
+real is what makes a looser cutoff (0.72, vs. 0.80 elsewhere in this
+codebase) defensible here specifically: the worst case is focusing a
+different real, already-open repo, not corrupting arbitrary
+conversational text into a false command.
+
+Verified against the live machine's actual open windows, not just
+synthetic examples -- four real VS Code windows were open at the time
+(`jarvis`, `haystack`, `notes`, and, notably, `bdk wallet` -- the exact
+repo from the original false-dispatch incident). A simulated mishearing
+("big wallet") correctly resolved to the real "bdk wallet" window;
+mishearings of the other three each resolved to their own correct
+window and no other; three genuinely unrelated conversational phrases
+("i love you my friend", "what is the weather today", "thank you very
+much" -- the last one drawn straight from `_HALLUCINATION_DENYLIST`)
+each correctly matched nothing at all.
+
+## Feedback integrity: actions.Outcome, and the room lights actually knowing
+
+Found while auditing this codebase for gaps, not reported as a live
+symptom -- but confirmed as a real, structural correctness defect, not
+a theoretical one. Every one of `actions.py`'s 18 functions returned a
+bare `str`: the spoken reply, and nothing else. `main.py`'s dispatch
+site played the `understood` chirp, called the action, and handed its
+return value straight to `hud.reply()` and `speak()` with no way for
+either to tell "Minimised, sir." apart from "That didn't take, sir --
+it's still where it was." Checked directly rather than assumed:
+`hud.reply()` has taken an `ok` parameter since it was written, and
+`hud.ERROR` (colour `(255, 42, 31)`, label `PROBLEM`) has been in
+`_STATES` the whole time -- grepping every call site in the running
+application found exactly two calls to `hud.reply()`, both with the
+default `ok=True`. The most alarming colour in the palette, on a band
+that drives the room's monitor-sync lights, had never once fired.
+Same story one level down: `jarvis stats` counted every dispatch under
+`fast_path`/`llm_action` regardless of outcome, so the one number meant
+to answer "is this working" was silently counting failures as
+successes.
+
+**`actions.Outcome(text, status)`** -- a `NamedTuple`, not a dataclass
+or a dict, so it destructures like the plain string every existing
+caller/test already expected while adding exactly one more field.
+Three statuses, not two, because the phrase pools already drew this
+distinction and always had: `"ok"` (it worked), `"no_effect"`
+(understood correctly, genuinely nothing to do -- already focused,
+single-screen machine, already muted), and `"failed"` (attempted and it
+didn't, or the request couldn't be serviced at all). Classified by
+hand against every one of the ~45 return sites across all 18 actions,
+reading each phrase's actual wording rather than guessing from the key
+name alone -- caught real distinctions a name-based guess would have
+missed: `now_playing_unknown` ("nothing seems to be playing") is `ok`,
+an honest answer, not a failure, per that function's own stated design
+of degrading to "can't tell" rather than guessing; `screen_single`
+("there's only the one screen") is `ok` for the *query*
+(`describe_screen`) but `no_effect` for the *command*
+(`move_window_to_monitor`) asking to move something there, since a
+command that structurally cannot be carried out is a different thing
+from a question that got its true, complete answer.
+
+`dispatch_llm_action` normalizes: a bare `str` (an action not yet
+converted, or a test's monkeypatched stand-in -- `test_actions.py` mocks
+`ACTIONS` entries with plain lambdas throughout) becomes
+`Outcome(text, "ok")` automatically, so nothing else needed to change
+in lockstep. An unrouted action name is itself `Outcome(..., "failed")`
+now, not just a decline -- dispatch failing to even place the request is
+a real failure to service it.
+
+**The `understood` chirp stays exactly where it was -- before dispatch,
+not after.** Moving it to reflect the real outcome would mean delaying
+the one immediate "heard you" signal by however long dispatch takes (up
+to ~5s for a cold app launch), which is precisely the latency this cue
+exists to hide (see "Voice replies and terminal theming" above). A
+second, quieter cue fires *after*, only for `no_effect`/`failed` --
+success stays silent, since the spoken reply already carries that.
+`no_effect` gets a new earcon (a single flat tone at a pitch none of
+the others use, so it can't be mistaken for `decline`'s double-tap or
+`error`'s falling two-parter); `failed` reuses `error`, the same cue an
+exception already played, rather than growing the palette for what the
+room lights already treat as "something is wrong."
+
+**`ACTING` was a 0.45s flash-after, never a steady state during** -- a
+cold app launch (up to ~5s, `focus_or_launch_app` polling for the new
+window every 0.25s) showed nothing at all for that whole stretch.
+`begin_flash(ACTING)` right before dispatch, closed out for free by
+`hud.reply()`'s own `flash()` call once the outcome is known (that call
+already unconditionally overwrites whatever's in the flash slot, gold
+again on success or red on a real failure, so no separate `end_flash()`
+was needed). Whisper transcription got the identical treatment for the
+identical reason: nothing showed between "recording stopped" and
+"resolved" except when the LLM fallback happened to run -- fast-path
+matches, the majority of dispatches, transcribed in total silence,
+band-wise. `begin_flash(THINKING)` now brackets both `_transcribe()`
+call sites (push-to-talk and session-listening), closed by
+`_handle_transcript`'s existing `finally: hud.end_flash()`, which
+already ran unconditionally regardless of how far processing got --
+including the empty-text early return.
+
+**A persistent "you are not being heard" indicator** --
+`hud.set_input_blocked(reason | None)`, rendered in the status strip
+with the mic meter going flat instead of showing a level that's
+meaningless while blocked. Five conditions gate the listener
+(`is_speaking()`, system output playing, push-to-talk held, paused, and
+the wedged-capture-device latch); before this, exactly one of them
+printed anything at all, and it scrolled away. The worst case is
+already on this record (see "Input health" above): `NO MIC SIGNAL`
+reached `jarvis status` only, for 50 minutes, while the band kept
+showing ordinary `ARMED` red throughout.
+
+The four routine conditions share one slot with a priority order
+(paused outranks the three transient ones, since it's the one actually
+asked for); the wedge is a hard fault and outranks all four of *those*
+-- confirmed worth the extra care by re-reading this project's own
+incident record rather than assuming: KNOWN_LIMITATIONS.md's actual
+wedge incident notes push-to-talk being tried *during* it, which is
+exactly the overlap that would otherwise let a routine "push-to-talk
+held" silently paper over a genuine "no mic signal at all" for as long
+as the key stayed down, and then *clear* the wedge indicator entirely
+the moment it was released, even though the wedge itself was never
+resolved. The wedge also gets its own band state
+(`begin_flash(hud.ERROR)`) in addition to the text -- reusing `ERROR`
+rather than growing the palette further, since a dispatch failure and a
+hard input fault are both, at the level the room lights operate at,
+"something is wrong." A resume that lands right after a pause that
+started mid-wedge clears both explicitly too:
+`_check_input_signal`'s own recovery path (which also clears these)
+never runs for that transition, so without its own clearing the flash
+would have been left stuck open-ended, with nothing left in the system
+that would ever call `end_flash()` again.
+
+**`ASLEEP` was a darker version of `ARMED`'s exact hue** ((26, 8, 5) vs
+(120, 28, 16) -- same warm red-orange ratio, just dimmer), so deep sleep
+and armed-but-awake were indistinguishable at a glance and on the room
+lights, the one thing the whole band design exists to avoid. Changed to
+a dim blue-violet -- a genuinely different hue family, not just a
+different brightness, so it can't collapse into "a dim version of red"
+regardless of where the eased colour lerp has settled.
+
+**Three smaller fixes, found while touching the adjacent code, not
+sought out separately:**
+- `hud.line("Mic signal is back.", "ok")` has read this way from the
+  start, but `_GLYPH` had no `"ok"` entry at all -- it silently fell
+  back to `_GLYPH["system"]`'s dim grey, identical to routine notes like
+  "dropping models to save memory." There was no green anywhere in the
+  glyph table. Mic recovery is arguably the single most reassuring
+  event in this system; it now looks like one. A regression test scans
+  every `hud.line(..., "kind")` call site in `main.py` against
+  `_GLYPH`'s actual keys, the same shape as `test_phrases.py`'s existing
+  key-existence checks, so this exact class of typo can't recur silently
+  again.
+- `hud.last_render_error()` existed as a public function, and its own
+  comment said it was "surfaced by `jarvis status`" -- nothing had ever
+  actually called it from there. Wired into `_status_line` as one more
+  optional, testable parameter (last traceback line only; the full
+  trace has no place in a one-line status reply).
+- `phrases.PHRASES["audio_trouble"]` was defined and picked from
+  nowhere; the one call site that should have used it (`tts.py`'s
+  playback-exception handler) hardcoded its own near-duplicate wording
+  instead, so a wording tweak would have had to remember to happen
+  twice. A new test (`test_every_phrase_pool_is_referenced_by_some_call_site`)
+  scans `actions.py`/`main.py`/`tts.py` together and fails if any pool
+  is ever orphaned like this again. `phrases.pick()`'s own unknown-key
+  path (returns `""`, by design -- a missing phrase must degrade to
+  silence, not take down an action that already succeeded) now also
+  calls `hud.note()`, so that silence is at least traceable afterward
+  instead of leaving zero record anywhere that anything had gone wrong.
+
+## Observability: durable timings, log rotation, and tools/_report.py
+
+`_TIMED_STAGES` (transcribe/match/llm/action) only ever lived in an
+in-memory rolling deque (`state["stats"]["timings"]`), read by `jarvis
+stats`. It dies at every restart -- 40 `shutdown` records in the real
+log meant 40 discarded sessions' worth of where-the-time-went data, on
+a project whose own stated method is to decide from logged data, not a
+guess. Fixed with a second, parallel structure: `state["current_
+timings"]`, reset once per utterance (at the earliest point one starts
+processing -- right before `_transcribe`, the same place `THINKING`'s
+new `begin_flash` call landed) and read once by `_record_stat`, which
+now logs it into that utterance's own `"outcome"` event. The rolling
+deque keeps working unchanged for `jarvis stats`'s live view; this is
+the durable half nothing read before.
+
+**`logs/session.jsonl` now rotates.** `KNOWN_LIMITATIONS.md` used to say
+it "grows without bound... delete it whenever; nothing reads it back" --
+true until `tools/_report.py` (below), which does now read it back.
+Single-generation (`session.jsonl.1`, one backup, nothing older) at
+10MB, checked every 50th `_log_event` call rather than on every one --
+a `stat()` syscall on a line written several times per utterance is
+needless overhead on what both the audio and control-socket paths treat
+as latency-sensitive.
+
+**`tools/_report.py`** -- a hand-run reader, same "not part of the live
+pipeline, not wired into jarvisctl.py" convention as `_bench_llm.py` and
+`seed_promotion.py` (the control socket has a 3s client read timeout;
+this reads the whole log, which can take longer on a long-running
+install). Answers exactly what this project's own decision log says is
+blocked on data, not a guess: the clipping-vs-confidence correlation
+this project diagnosed by hand once (now repeatable), the
+`transcript_would_reject`-vs-real-dispatch check `TRANSCRIPT_GATE_
+ENFORCED` is waiting on, `wake_triggered` scores against `WAKE_
+THRESHOLD` (tuned, by its own comment, without ever having a record of
+what a real trigger scores), `llm_seconds` split by `llm_cold`, and
+total time spent deaf to system output.
+
+**The would-reject/real-dispatch check needed a real correction before
+it was trustworthy.** The first version counted any `would_reject`
+candidate whose exact text *ever* also appeared in a successful
+`resolved` event as counter-evidence the gate would reject a real
+command. Checked directly against this project's own log rather than
+trusted on paper -- and it produced a false positive immediately: "oh"
+and "mobile key" both "resolved to a real action" (via_llm=True, a
+plausible-looking action attached) exactly once each, but that
+resolution *is* the LLM hallucinating a confident action from noise --
+precisely the failure mode this gate exists to catch, not a
+counter-example to it. A `resolved` event records "the LLM produced
+*something*", never "the user actually meant this." Fixed to require
+the *same* text resolving to the *same* action *more than once* --
+real, recurring intent is far less likely to repeat identically by
+chance than a one-off hallucination landing on a plausible action is.
+This is also, checked directly, exactly how this project's own prior
+manual finding about "how many files" was actually reasoned about, not
+a new standard invented for this tool -- and running the corrected
+version surfaced a second thing worth recording: "bdk" repeating 3x to
+`focus_vscode_repo` is the exact historical false-dispatch case this
+project already has on record, caused by a hotwords bias removed since
+(see "Mid-session wake-word swallow" above) -- a real illustration that
+even "resolved the same way more than once" isn't airtight proof of
+intent, just the strongest signal this log can offer. The tool's own
+output says so rather than overclaiming; the remaining judgment call is
+left to whoever reads it, on purpose.
+
+## The push-to-talk hold threshold
+
+Diagnosed directly from `logs/session.jsonl`: 215 of 216 logged
+push-to-talk presses produced no speech at all. The instinct to blame
+the specific key (Right Ctrl, a modifier held constantly while typing)
+doesn't survive contact with the actual fix, though: swapping it for
+Esc or any other single key would move the accidental-press problem,
+not solve it. What actually fixes it is requiring the press carry some
+minimum duration before anything commits to treating it as real --
+`HOTKEY_HOLD_THRESHOLD_SECONDS = 0.22`, imperceptible for a press
+someone means, comfortably above an incidental one.
+
+**Both of the hotkey's jobs move behind the threshold, not just
+capture.** `on_press` used to call `interrupt_speech()` (the barge-in
+that cuts off a reply mid-sentence) instantly and unconditionally --
+left alone, a stray tap while Jarvis was speaking would cut it off for
+no reason. Confirming a hold now gates both: arming capture and the
+barge-in happen at the same moment, for the same reason, which also
+makes the key's two behaviours consistent with each other instead of
+one being instant and the other debounced.
+
+**A rolling pre-buffer, so the threshold costs no leading audio** --
+the exact same trick the session-listening path already uses
+(`PRE_BUFFER_FRAMES`, 0.3s), reused rather than reinvented. Without it,
+confirming a hold at 220ms would mean the first 220ms of whatever was
+actually said, starting right at the press, is exactly what gets
+clipped off -- the opposite of what a hold-threshold fix should cost.
+The buffer stays live at all times regardless of key state, and gets
+handed off to `hotkey_frames` (and cleared) the instant a hold is
+confirmed.
+
+**Confirmation runs on its own `threading.Timer` thread, deliberately
+neither inline in `on_press` nor inside the audio callback.** Not
+`on_press`: the whole point is waiting out the threshold before
+committing to anything, and `on_press` only fires once, at the start.
+Not `hotkey_callback`: that runs on sounddevice's realtime audio
+thread, where HUD writes and `interrupt_speech()`'s bookkeeping do not
+belong -- this project's own standing rule that nothing may block an
+audio callback (see the audio-callback-exception containment section
+above) applies just as much to *slow*, non-exception-raising work as it
+does to a crash. A dedicated lock (not `_processing_lock`, which can be
+held up to 30s by an in-flight LLM call and has no business gating a
+key-hold decision) serializes the timer's confirmation against
+`on_release`, which runs on `keyboard`'s own callback thread and can
+genuinely race it -- a release landing at the exact instant the timer
+fires needs one consistent answer to "did this count as a hold", not
+two threads independently guessing. Whichever side reaches the lock
+first decides correctly either way: a release-first path leaves nothing
+armed; a confirm-first path means the hold is processed as real, which
+it was, if only by a hair.
+
+A tap now produces zero trace at all -- no `hotkey_no_speech` log
+event, no HUD line, nothing -- matching what 215 of 216 real presses
+actually were. Verified with real `threading.Timer` wiring in the test
+suite, not just by calling the confirmation function directly: one test
+drops the threshold to 10ms and waits for the real timer to fire; a
+second confirms a release before a (slightly longer) real threshold
+genuinely cancels it, rather than just asserting the logic would do so
+in isolation.
+
+**Update (2026-10-08): raised to 1.0s, on direct request, once the
+0.22s threshold had been live long enough to log its own result.**
+`hotkey_no_speech`/`vad_gate` events -- a confirmed hold (passed 0.22s)
+that still captured no real speech -- numbered 813 in `session.jsonl`
+by this point, 97% of them under peak 0.01 (near silence, not a quiet
+real attempt). The exact hold duration isn't logged directly, but the
+also-logged `frames` count reconstructs it: `hotkey_frames` always
+starts from the pre-buffer's frames at confirm time (4, at the 0.22s
+threshold) plus whatever's appended afterward, so `duration ≈ 0.22 +
+max(0, frames - 4) * FRAME_SECONDS` (80ms/frame). Reconstructed median
+was 0.54s. Checked every round-number candidate against this
+distribution before picking one: 0.6s would have caught 59.2% of these
+813 before they ever reached `RECORDING`, 0.8s catches 78.2%, 1.0s
+catches 83.9%, and 1.2s only adds another 5.5 points to that --
+1.0s sits right where the marginal gain per extra 0.1-0.2s drops off,
+which is as close to data-driven as a single global threshold gets
+here. **No equivalent data exists for genuine quick commands** --
+nothing in the log distinguishes a push-to-talk-origin dispatch from a
+wake-word-session one, so there's no way to directly check how often a
+real one-word command (press, say "mute", release) finishes inside the
+new, longer window. This is a real, currently-unmeasured trade-off,
+not a free win: revisit if short deliberate presses start getting
+silently dropped, the same failure mode this whole mechanism exists to
+avoid, just on the other side of the threshold now.
+
+**`HOTKEY_PRE_BUFFER_FRAMES` had to be introduced as its own constant,
+not just bumped in place, because `PRE_BUFFER_FRAMES` (0.3s) already
+had a different job.** The session-listening path's own pre-buffer
+(covering VAD detection lag, a few lines below `hotkey_pre_buffer` in
+`main.py`) happened to share that same module-level constant purely by
+coincidence of both landing on a similar tuning value, not because the
+two problems are the same one. Reusing it for the hotkey side would
+have meant either leaving the hotkey's pre-buffer at 0.3s (too short
+to cover a 1.0s hold threshold -- reopening the exact clipping bug
+`PRE_BUFFER_FRAMES` was written to prevent, just on push-to-talk) or
+accidentally changing the session path's VAD-lag buffer along with it
+for no reason connected to this change at all. `HOTKEY_PRE_BUFFER_FRAMES
+= _frames(HOTKEY_HOLD_THRESHOLD_SECONDS + FRAME_SECONDS)` keeps the
+same one-frame-of-margin relationship the original 0.22s/0.3s pair had,
+automatically, if this threshold is ever tuned again.
+
+## Persisted KV cache: a spike that won
+
+`tools/_spike_kv_cache.py` (kept in the repo as the record, same
+convention as `tools/_spike_desktop_move.py`, whichever way a spike
+lands) set out to answer three questions before wiring anything real:
+how big is a saved KV state, does loading one on a fresh `Llama()`
+instance -- what a process restart looks like from llama.cpp's own
+perspective -- actually beat the documented 13-15s cold-prefill
+baseline, and does it survive `_system_prompt()`'s live date/time
+having moved on since the state was saved. All three came back
+favorable, measured against the real model and a genuinely separate
+process invocation, not simulated: a ~20-24s cold call fell to
+well under a second to reload, correct both against the exact original
+date/time and one 47 minutes stale.
+
+**The naive version would have shipped something needlessly bloated.**
+`Llama.save_state()`'s return value pickled at over 300MB -- checked
+directly why, not assumed acceptable: `LlamaState.scores` is a
+full-vocabulary logits array (151936-wide for Qwen2.5) with one row per
+retained token position, meant for a caller that wants to inspect past
+per-token probabilities. Nothing in this codebase's use case does that;
+confirmed live that zeroing it to a minimal placeholder shape leaves
+`load_state()` and the inference that follows both working exactly the
+same, correctness and speed both intact, while dropping the ~10x
+majority of the file that was dead weight. The real payload
+(`llama_state_size`) is ~25MB at this prompt's length; the persisted
+file is that same ~25-26MB, not the ~322MB the naive approach would
+have written to disk on every prewarm.
+
+**Wired into `llm_intent.prewarm()` itself, not left as a spike-only
+finding**, since the plan this was scoped from was explicit that a
+winning result should be wired in, and this one won clearly.
+`KV_CACHE_PATH` (`logs/llm_kv_cache.pkl`) lives alongside this
+project's other gitignored, locally-regenerable runtime state
+(`learned_seeds.json`, `seed_promotion_state.json`) -- not a model
+file, not a log line, but the same category of "derived, safe to
+delete, regenerates itself". `prewarm()` tries loading it first; only
+falls back to the original real-inference path (unchanged) on any
+failure at all -- file missing, corrupt pickle, or a fingerprint
+mismatch against the *current* `SYSTEM_PROMPT_TEMPLATE` (hashed, not
+stored as a raw string copy) protecting against the one scenario the
+spike itself didn't test: the prompt template actually changing, a
+bigger mismatch than a shifted date/time string and not assumed to be
+equally safe just because that one measured fine. A successful cache
+load also updates `call_count()` the same way a real prewarm inference
+would have, so `main.py`'s `llm_cold` log field keeps telling the truth
+about whether the next real dispatch is actually paying a cold cost --
+it usually now isn't, for every boot after the first.
+
+## Social intents and the acoustic gate
+
+`"thank you"`, `"thanks"`, `"okay"`, `"bye"` needed handling -- real
+conversation, logged verbatim in `session.jsonl` with no reply at all
+today -- but every one of them is also a confirmed near-silence Whisper
+hallucination, sitting in `_HALLUCINATION_DENYLIST` for exactly that
+reason (the same list also carries `"subscribe"` and `"thanks for
+watching"`, straight out of YouTube training data). That denylist only
+ever gated the LLM-bound branch; the fast embedding-match path has no
+acoustic gate at all by design, on the reasoning that a >=0.80 cosine
+match against a seeded phrase is its own evidence something real was
+said. Seeding these four as ordinary fast-path intents would have
+bypassed the denylist entirely -- a hallucinated `"thank you"` on
+silence would come back as an unprompted "You're welcome, sir."
+
+**Resolution: social intents are the one fast-path class that also
+gets an acoustic confidence check**, narrowly justified by the denylist
+being about these exact phrases and nothing else --
+`_ACOUSTICALLY_GATED_SEEDS` in `main.py`, checked against
+`MatchResult.closest_seed` right after the match, before either social
+intent or the context-dependent half of `disable_listening` can fire.
+A rejection is treated as though nothing were heard at all: no cue, no
+reply, nothing on the HUD -- silence answered with silence, the same
+treatment `TRANSCRIPT_GATE_ENFORCED`'s shadow gate gives a rejected
+LLM-bound transcript.
+
+**The first implementation reused `_should_reject_transcript` wholesale
+for this check, which was a real bug, not just an untested corner: it
+never once let a social reply through, on any audio quality.**
+`_should_reject_transcript`'s last two checks reject on denylist/wake-
+echo *membership*, and every single `_ACOUSTICALLY_GATED_SEEDS` phrase
+is, by construction, also a `_HALLUCINATION_DENYLIST` entry -- that's
+*why* those five phrases were picked as the gated set in the first
+place (see `intent_matcher.py`'s own comment on `social_thanks`/
+`social_ack`). So calling the full function against "thank you" hit
+the denylist branch every time, regardless of `avg_logprob`/
+`no_speech_prob`/anything acoustic -- confirmed directly with a clean
+quality dict (`avg_logprob -0.30`, no clipping) still getting rejected.
+Caught by writing the first real end-to-end tests for this code path
+(`test_state_machine.py`, driving `_handle_transcript` itself rather
+than just the predicate in isolation) and finding all four "confident"
+cases failed, not just the deliberately-noisy ones. Fixed by splitting
+the acoustic-only checks into their own `_acoustic_reject_reason(quality)`,
+used by the social-intent gate; `_should_reject_transcript` keeps its
+full lexical-plus-acoustic behaviour for the pre-LLM gate, which
+genuinely wants both.
+
+**This path had never been exercised by any test before**, confirmed
+directly: `test_state_machine.py`'s shared `_FakeMatcher.match()`
+deliberately raises `AssertionError("not reached in this test")`, and
+every test using the `live` fixture up to this point had avoided ever
+calling it. Testing the gate meant giving individual tests a way to
+control what the matcher returns without losing that trap for
+everything else -- the fixture now also exposes the real matcher
+instance (`live["matcher"]`), and a small `_stub_match()` helper
+overrides just its `.match()` method per test via the test's own
+`monkeypatch`, leaving the shared trap intact for every test that
+doesn't opt in.
+
+## Proactive briefing on boot
+
+Half of what `main.py` says at boot was a single flat phrase --
+"Online and at your service, sir." -- while `psutil` (battery/memory/
+disk, already wired for `system_status`) and the window-enumeration
+`describe_screen` already answers on demand both sat unused at exactly
+the moment they'd matter most: the first thing Jarvis says after
+starting up.
+
+**`actions.morning_briefing()` replaces that flat phrase**, composing
+up to three sentences from real state rather than reusing
+`describe_screen`/`system_status`'s machinery a second, parallel way:
+a time-of-day greeting, the battery fact (`_battery_fact`, unchanged),
+and a plain count of what's already open (`_describe_screen_entries`/
+`_count_by_app`/`_phrase_app_counts`, the same three functions
+`describe_screen` itself calls). Any piece with nothing true to report
+-- no battery sensor, an empty desktop -- is silently omitted rather
+than guessed at; a bare greeting with nothing else to add is a
+complete, honest briefing on a machine with no battery and nothing
+open, not a broken one. Wired at the exact call site the old
+`phrases.pick("boot")` used to occupy, with a `try`/`except` fallback
+back to that same flat phrase -- a `psutil`/`win32gui` hiccup at boot
+must never cost the one thing that already worked, an audible sign the
+process is up.
+
+**"Still where you left them" is only said when it's genuinely true.**
+`memory.json`'s `last_layout` key existed before this (in `_DEFAULTS`)
+but nothing read or wrote it -- this is what finally gives it a job.
+`actions.save_current_layout()` snapshots the current window summary
+and is called from `main.py`'s `_shutdown()`, not from boot: shutdown
+is the last true state of the session that just ended, which is
+exactly what the *next* boot needs to compare against, and writing it
+at boot instead would compare a session against itself. An unclean
+shutdown (crash, kill) just leaves the snapshot stale until the next
+clean one -- a known, low-stakes gap, not worth a second write path
+for. `memory.json` also defines `notes` and `preferences` keys, and
+the briefing deliberately says nothing about either: nothing in this
+project writes to them yet (both are placeholders for a feature that
+was never built), and inventing content to fill them would be a guess
+dressed up as a fact -- the same reasoning `_battery_fact`'s "honest
+omission, not a guess" already applies to a missing sensor.
+
+**Confirmed live against this machine**, not just against mocks:
+`morning_briefing()` correctly read real battery/window state
+("Battery at 55 percent, plugged in. You've got three Chrome, three VS
+Code, and Spotify open, sir."), and a `save_current_layout()` /
+`morning_briefing()` round-trip correctly produced the "still where you
+left them" phrasing on the second call once the snapshot matched.
+
+**This surfaced the same class of test-infrastructure gap as the
+social-intent gate above, for the same underlying reason.** Two test
+helpers run `main.main()` for real up to a stop point --
+`test_state_machine.py`'s `live` fixture and `test_audio_callbacks.py`'s
+`_callbacks_from_a_live_main` -- and both predate this feature, so
+neither mocked it. `morning_briefing()` sitting in the middle of the
+real boot sequence meant every test built on either helper was making a
+real, unmocked `win32gui`/COM call (via `_describe_screen_entries` ->
+`window_context.enrich_windows` -> `virtual_desktop`'s
+`is_window_on_current_desktop`), caching a real COM manager onto
+`virtual_desktop._thread_local` for the rest of the pytest process --
+confirmed directly as the cause of `test_virtual_desktop.py`'s own
+isolation test failing, but only when the full suite ran, never in
+isolation. Both helpers now mock `morning_briefing` the same way they
+already mock `speak`/`WhisperModel`/`output_monitor.start`/everything
+else heavy at that point in `main()` -- the module docstring's rule
+("no real audio device, no real models, no real window manager") always
+implied this, it just didn't have a name to mock yet.
+
+## Removed: "how many files are in this folder"
+
+`count_files_in_folder` (read the focused File Explorer window's path via
+`Shell.Application` COM, count files with `os.scandir`) is gone from
+`actions.ACTIONS`, the LLM schema/prompt, and the query-shaped exclusion
+list. Its phrasing also came out of `TRANSCRIBE_HOTWORDS` -- "files
+folder" were there only for this action, and were among the fragments
+Whisper hallucinated back from near-silence (see "the 'bdk wallet' false
+dispatches" above); "how many windows" stays for `count_app_windows`.
+Earlier sections still mention it as history. An LLM that somehow emits
+the old name fails the enum re-validation in `infer()`, and
+`dispatch_llm_action` would decline it as an unknown action regardless.

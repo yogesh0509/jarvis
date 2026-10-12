@@ -30,10 +30,9 @@ def test_compound_label_for_snap_window():
 
 
 def test_compound_label_for_free_text_actions_is_none():
-    # focus_vscode_repo/count_files_in_folder have no fixed bucket to
-    # promote an arbitrary repo name or query phrasing into.
+    # focus_vscode_repo has no fixed bucket to promote an arbitrary repo
+    # name into.
     assert sp.compound_label("focus_vscode_repo", "vscode", "none") is None
-    assert sp.compound_label("count_files_in_folder", "none", "none") is None
 
 
 def test_compound_label_for_no_param_actions_is_none():

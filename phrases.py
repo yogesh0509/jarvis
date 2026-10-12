@@ -10,11 +10,20 @@ thing about the system -- far more than anything about the voice model
 itself. Every reply also ended in "sir", at 100% density, which reads as
 a template rather than a butler.
 
-Deliberately straight -- no jokes, no time-of-day asides, no commentary
-on what you're doing. The goal is that it stops sounding *generated*,
-not that it becomes a character. Roughly half the variants carry "sir"
-and the rest don't, and where it appears it isn't always trailing; that
-alone does most of the work.
+Deliberately straight -- no jokes, no commentary on what you're doing.
+The goal is that it stops sounding *generated*, not that it becomes a
+character. Roughly half the variants carry "sir" and the rest don't,
+and where it appears it isn't always trailing; that alone does most of
+the work.
+
+One deliberate exception: the boot-time proactive briefing
+(briefing_greeting_*, see actions.morning_briefing) opens with a
+time-of-day greeting. "No time-of-day asides" was the original rule
+here -- reversed on direct request once "warmer by default" became the
+stated direction for tone generally (see DECISIONS.md's "Voice replies
+and terminal theming" for the full reasoning). This is the one place
+that reversal applies; everywhere else in this file, the original rule
+still holds.
 
 pick() never returns the same variant twice in a row for a given key,
 which matters more than the pool size -- back-to-back repeats are what
@@ -27,6 +36,8 @@ Nothing else in the codebase would need to change.
 """
 
 import random
+
+import hud
 
 _last_choice: "dict[str, str]" = {}
 
@@ -111,20 +122,33 @@ PHRASES = {
     # --- media / system ---------------------------------------------
     "volume_up": ("Turning it up, sir.", "Up it goes.", "Louder, sir.", "Raising the volume."),
     "volume_down": ("Turning it down, sir.", "Down a little.", "Quieter, sir.", "Bringing it down."),
+    # An exact amount was given ("by 10", "to 30") and applied via
+    # IAudioEndpointVolume -- {percent} is the resulting level, always
+    # spoken back rather than echoing what was asked for, since a
+    # relative step or a clamp at 0/100 can make the two differ.
+    "volume_at": (
+        "{percent} percent, sir.",
+        "Volume's at {percent} percent now.",
+        "There you go -- {percent} percent.",
+        "{percent} percent.",
+    ),
+    # IAudioEndpointVolume couldn't be reached at all (no default
+    # device, or the COM call failed) -- distinct from "no amount was
+    # said", which isn't a failure, just the plain tap path.
+    "volume_unavailable": (
+        "I can't get an exact level right now, sir.",
+        "No exact control over the volume right now, sir.",
+        "Can't read the volume just now.",
+    ),
     "mute": ("Silenced, sir.", "Muted.", "Sound off.", "Quiet now, sir."),
     "play_pause": ("There you go.", "Done, sir.", "Toggled.", "Right away."),
     "next_track": ("Skipping ahead, sir.", "Next one.", "Moving on.", "Ahead we go."),
     "prev_track": ("Going back a track, sir.", "Back one.", "Previous track, sir.", "Rewinding."),
     "lock": ("Locking up, sir.", "Locking the machine.", "Securing it now, sir."),
-    # --- counts / files ---------------------------------------------
+    # --- counts -----------------------------------------------------
     "count_none": ("None open right now, sir.", "Nothing open at the moment.", "Not one, sir."),
     "count_one": ("One window open, sir.", "Just the one.", "A single window, sir."),
     "count_many": ("{count} windows open, sir.", "{count} of them.", "{count} windows, sir."),
-    "explorer_not_focused": (
-        "No File Explorer window is focused right now, sir.",
-        "Nothing from File Explorer in focus, sir.",
-        "I'd need a File Explorer window in focus for that.",
-    ),
     "screen_unknown": (
         "I can't tell what's in focus right now, sir.",
         "Nothing I can make out has focus at the moment.",
@@ -229,12 +253,6 @@ PHRASES = {
         "Nothing I can make out has focus at the moment.",
         "I'm not seeing a usable window in focus, sir.",
     ),
-    "folder_count": ("{count} files in that folder, sir.", "{count} files.", "That's {count} files, sir."),
-    "folder_unreadable": (
-        "Couldn't read that folder, sir.",
-        "That folder won't open for me, sir.",
-        "No luck reading that one.",
-    ),
     # --- conversation / meta ----------------------------------------
     "session_open": ("Yes, sir?", "Sir?", "Go ahead, sir.", "Listening.", "With you, sir."),
     "thinking": (
@@ -333,6 +351,138 @@ PHRASES = {
         "Couldn't get a word out there, sir -- audio output seems to be having trouble.",
         "Something's wrong with the audio output, sir.",
     ),
+    # One-shot boot diagnostic (main.py) -- the mic's software input
+    # level measured high enough to plausibly be clipping speech.
+    # {percent} is the measured level, not a guess.
+    "input_level_high": (
+        "Sir, your microphone input level looks quite high, around {percent} percent -- that can clip speech and come through as garbled words.",
+        "Your mic input is sitting around {percent} percent, sir -- worth turning it down a little if I keep mishearing you.",
+    ),
+    # --- timers -------------------------------------------------------
+    "timer_set": (
+        "{duration} on the clock, sir.",
+        "Timer set for {duration}.",
+        "You've got {duration}, sir.",
+        "{duration}, starting now.",
+    ),
+    "timer_no_duration": (
+        "I didn't catch how long, sir -- try an amount of time, like 'ten minutes'.",
+        "How long should I set it for, sir?",
+        "Didn't catch a duration there, sir.",
+    ),
+    "timer_done_unlabeled": (
+        "Time's up, sir.",
+        "That's your timer, sir.",
+        "Timer's done.",
+    ),
+    "timer_done_labeled": (
+        "Reminder, sir: {label}.",
+        "Time to {label}, sir.",
+        "Sir -- {label}.",
+    ),
+    "timer_overdue_prefix": (
+        "Sorry for the delay, sir --",
+        "This one's a bit late, sir --",
+    ),
+    "timer_cancelled": (
+        "Cancelled, sir.",
+        "Timer's off.",
+        "Done -- that timer's cancelled, sir.",
+    ),
+    "timer_none_to_cancel": (
+        "No timer running, sir.",
+        "Nothing to cancel, sir.",
+        "There's nothing set, sir.",
+    ),
+    "timer_list_none": (
+        "No timers running, sir.",
+        "Nothing on the clock, sir.",
+    ),
+    "timer_list_one": (
+        "{duration} left, sir.",
+        "{duration} remaining on your timer, sir.",
+    ),
+    "timer_list_many": (
+        "{count} timers running, sir -- the next one's in {duration}.",
+        "{count} on the clock, sir; soonest is {duration} out.",
+    ),
+    # --- system status --------------------------------------------
+    "system_status": (
+        "{summary}, sir.",
+        "Sir -- {summary}.",
+        "{summary}.",
+    ),
+    "system_status_no_battery": (
+        "No battery detected, sir -- looks like a desktop.",
+        "I'm not finding a battery to report on, sir.",
+    ),
+    # --- proactive briefing (boot only, see actions.morning_briefing) --
+    "briefing_greeting_morning": (
+        "Good morning, sir.",
+        "Morning, sir.",
+        "Good morning.",
+    ),
+    "briefing_greeting_afternoon": (
+        "Good afternoon, sir.",
+        "Afternoon.",
+        "Good afternoon to you, sir.",
+    ),
+    "briefing_greeting_evening": (
+        "Good evening, sir.",
+        "Evening, sir.",
+        "Good evening.",
+    ),
+    "briefing_greeting_night": (
+        "Still up, sir?",
+        "Online, sir -- burning the midnight oil.",
+        "Evening, sir. Late one.",
+    ),
+    # {summary} is a noun phrase of varying number ("VS Code" / "three
+    # Chrome windows and VS Code") -- every variant below is built
+    # around a verb that doesn't need to agree with it ("got", "is"
+    # only ever following "there's"), on purpose, rather than risking
+    # "{summary} are/is open" picking the wrong one.
+    "briefing_layout_current": (
+        "You've got {summary} open, sir.",
+        "There's {summary} open right now.",
+        "Sir, you've got {summary} open at the moment.",
+    ),
+    "briefing_layout_unchanged": (
+        "You've still got {summary} open, sir -- right where you left them.",
+        "Still got {summary} open, exactly where you left them.",
+        "Sir, {summary} -- still open, right where you left them.",
+    ),
+    # --- screenshots --------------------------------------------------
+    "snip_tool_opened": (
+        "Go ahead and select the area, sir.",
+        "There you go -- select what you'd like, sir.",
+        "Ready when you are, sir.",
+    ),
+    "screenshot_saved": (
+        "Saved, sir.",
+        "Got it -- saved to your screenshots, sir.",
+        "There you go, sir.",
+    ),
+    "screenshot_failed": (
+        "Couldn't save that, sir.",
+        "That didn't save, sir -- something went wrong.",
+    ),
+    "screenshot_no_window": (
+        "I'm not seeing a usable window in focus, sir.",
+        "Nothing I can make out has focus at the moment.",
+    ),
+    # --- social (main.py, meta intents -- see intent_matcher.py) -------
+    "social_thanks_reply": (
+        "You're welcome, sir.",
+        "Any time, sir.",
+        "Of course.",
+        "My pleasure, sir.",
+    ),
+    "social_ack_reply": (
+        "Very good, sir.",
+        "Right you are.",
+        "Understood, sir.",
+    ),
 }
 
 
@@ -342,9 +492,20 @@ def pick(key: str, **fmt: object) -> str:
     return an empty string rather than raising -- a missing phrase
     should degrade to silence, not take down the action that was
     already carried out successfully.
+
+    That silence used to be completely untraceable -- a typo'd key
+    (test_actions_only_references_keys_that_exist and
+    test_main_only_references_keys_that_exist now catch every *known*
+    call site, but not a new one added without a matching pool) made an
+    action that had just genuinely succeeded say nothing at all, with
+    no record anywhere that anything had gone wrong. Noted via hud.note
+    (debug-only, like every other internal aside in this codebase) --
+    not louder than that: the silence itself stays exactly as designed,
+    this only makes it possible to find *why* after the fact.
     """
     options = PHRASES.get(key)
     if not options:
+        hud.note(f"phrases.pick: no such key {key!r}")
         return ""
     if len(options) > 1:
         previous = _last_choice.get(key)

@@ -16,9 +16,8 @@ Scope: only the bounded-enum actions (focus_or_launch_app, minimize_app,
 switch_desktop) get logged/promoted here. Their compound labels
 ("focus_or_launch_app:chrome", "switch_desktop:next", ...) are a small
 fixed set that makes sense as embedding-matcher seed buckets. Free-text
-actions (focus_vscode_repo, count_files_in_folder) are never logged --
-there's no fixed bucket to promote an arbitrary repo name or a query
-phrasing into.
+actions (focus_vscode_repo) are never logged -- there's no fixed bucket
+to promote an arbitrary repo name into.
 
 Promotion requires the same (text, label) pair to have been seen at
 least PROMOTION_THRESHOLD times, not just once -- guards against a

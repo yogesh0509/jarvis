@@ -12,23 +12,69 @@ layer does its own `if app_key not in APPS` check).
 """
 
 import ctypes
+import datetime
+import difflib
 import os
+import re
 import subprocess
 import time
+from pathlib import Path
 
 import psutil
 import win32api
-import win32com.client
 import win32con
 import win32gui
 import win32process
+from pathvalidate import sanitize_filename
+from PIL import ImageGrab
 
 import app_titles
+import audio_endpoint
+import fuzzy_match
+import memory
 import monitors
 import phrases
+import slots
+import timers
 import window_context
 from apps_registry import APPS
 from virtual_desktop import is_window_on_current_desktop
+from typing import NamedTuple
+
+
+class Outcome(NamedTuple):
+    """
+    What an action actually did, not just what it says. Every action
+    used to return a bare spoken string, which meant success and
+    failure were indistinguishable to everything downstream: the same
+    "understood" chirp, the same reply glyph, the same stats category
+    for "Done, sir" and "That didn't take, sir" alike -- confirmed live
+    as a real correctness gap, not a theoretical one, by checking how
+    many times `hud.reply()`'s `ok=False` branch had ever actually
+    fired in practice (zero; `hud.ERROR` was unreachable).
+
+    Three states, not two, because the phrase pools already draw this
+    distinction and always have -- this type just makes it visible
+    outside the string itself:
+      - "ok": it worked. ("Minimised, sir.")
+      - "no_effect": understood, correctly, and there was genuinely
+        nothing to do. ("Already up on this desktop, sir." /
+        "Nothing to minimise, sir." / "It's already on your laptop
+        screen, sir.") Not a failure -- the goal state may already
+        hold -- but distinct from "ok" because something was *asked
+        for* and nothing changed.
+      - "failed": attempted and it did not work, or the request
+        couldn't be serviced at all (an unregistered app, a folder
+        that wouldn't read, a window that never appeared).
+
+    `dispatch_llm_action` normalizes a bare `str` return to
+    `Outcome(text, "ok")` -- real actions convert to returning this
+    directly one at a time, and anything that hasn't yet (or a test's
+    monkeypatched stand-in) keeps working unchanged either way.
+    """
+
+    text: str
+    status: str = "ok"  # "ok" | "no_effect" | "failed"
 
 
 def _process_exe_name(hwnd) -> str:
@@ -175,7 +221,7 @@ def _choose_window(app_key: str, windows: "list[int]", hint_text: str) -> int:
     return chosen.hwnd if chosen is not None else windows[0]
 
 
-def focus_or_launch_app(app_key: str, hint_text: str = "") -> str:
+def focus_or_launch_app(app_key: str, hint_text: str = "") -> Outcome:
     """
     Only considers/launches on the *current* virtual desktop -- a
     matching window on a different desktop doesn't count as "already
@@ -190,13 +236,13 @@ def focus_or_launch_app(app_key: str, hint_text: str = "") -> str:
     in deciding *whether* to launch a fresh instance.
     """
     if app_key not in APPS:
-        return phrases.pick("app_not_registered", app=app_key)
+        return Outcome(phrases.pick("app_not_registered", app=app_key), "failed")
 
     windows = _find_app_windows(app_key, current_desktop_only=True)
     if windows:
         target = _choose_window(app_key, windows, hint_text) if len(windows) > 1 else windows[0]
         _force_foreground(target)
-        return phrases.pick("focus_already_here")
+        return Outcome(phrases.pick("focus_already_here"), "no_effect")
 
     was_running_elsewhere = bool(_find_app_windows(app_key, current_desktop_only=False))
 
@@ -207,39 +253,74 @@ def focus_or_launch_app(app_key: str, hint_text: str = "") -> str:
         if windows:
             _force_foreground(windows[0])
             if was_running_elsewhere:
-                return phrases.pick("focus_other_desktop")
-            return phrases.pick("focus_launched")
-    return phrases.pick("focus_launched_no_window")
+                return Outcome(phrases.pick("focus_other_desktop"), "ok")
+            return Outcome(phrases.pick("focus_launched"), "ok")
+    return Outcome(phrases.pick("focus_launched_no_window"), "failed")
 
 
-def minimize_app(app_key: str) -> str:
+def minimize_app(app_key: str) -> Outcome:
     if app_key not in APPS:
-        return phrases.pick("app_not_registered", app=app_key)
+        return Outcome(phrases.pick("app_not_registered", app=app_key), "failed")
     windows = _find_app_windows(app_key, current_desktop_only=True)
     if not windows:
-        return phrases.pick("minimize_nothing")
+        return Outcome(phrases.pick("minimize_nothing"), "no_effect")
     for hwnd in windows:
         win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-    return phrases.pick("minimize_ok")
+    return Outcome(phrases.pick("minimize_ok"), "ok")
 
 
-def maximize_app(app_key: str) -> str:
+def maximize_app(app_key: str) -> Outcome:
     """
     Same shape as minimize_app -- only ever acts on an already-open
     window (current desktop only), never launches a fresh one just to
     maximize it.
     """
     if app_key not in APPS:
-        return phrases.pick("app_not_registered", app=app_key)
+        return Outcome(phrases.pick("app_not_registered", app=app_key), "failed")
     windows = _find_app_windows(app_key, current_desktop_only=True)
     if not windows:
-        return phrases.pick("maximize_nothing")
+        return Outcome(phrases.pick("maximize_nothing"), "no_effect")
     for hwnd in windows:
         win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-    return phrases.pick("maximize_ok")
+    return Outcome(phrases.pick("maximize_ok"), "ok")
 
 
-def focus_vscode_repo(repo_name: str) -> str:
+_REPO_FUZZY_CUTOFF = 0.72
+# Looser than fuzzy_match.py's own 0.80 default -- justified by a much
+# lower-severity failure mode. The candidate set here is only ever
+# whatever VS Code windows are actually open (a handful, not "any
+# English word"), so a wrong pick means focusing a different real,
+# already-open repo -- never inventing content the way a broader
+# whole-transcript repair risked (see fuzzy_match.py's module
+# docstring for that test).
+
+
+def _best_fuzzy_repo_match(normalized_query: str, candidates: "list[tuple[int, str]]"):
+    """
+    Pure matching logic behind the fallback below, kept separate from
+    the EnumWindows call so it's testable without a real window manager
+    (see CLAUDE.md: tests run with no window manager present).
+
+    `candidates` is a list of (hwnd, normalized_title) pairs -- every
+    open Code.exe window the exact substring check already failed to
+    place. Scores each title's word n-grams (see fuzzy_match.ngrams)
+    against the spoken phrase and returns the hwnd of the best-scoring
+    one, or None if nothing clears _REPO_FUZZY_CUTOFF.
+    """
+    best_hwnd = None
+    best_ratio = 0.0
+    for hwnd, title in candidates:
+        for phrase in fuzzy_match.ngrams(title.split()):
+            ratio = difflib.SequenceMatcher(None, normalized_query, phrase).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_hwnd = hwnd
+    if best_hwnd is not None and best_ratio >= _REPO_FUZZY_CUTOFF:
+        return best_hwnd
+    return None
+
+
+def focus_vscode_repo(repo_name: str) -> Outcome:
     """
     repo_name is free text (can't pre-register every repo), matched
     as a substring against open Code.exe window titles -- inherently
@@ -249,9 +330,18 @@ def focus_vscode_repo(repo_name: str) -> str:
     desktops if that's where the match is -- there's no "launch fresh"
     fallback for an arbitrary repo the way there is for a registered
     app, and "go to X" implies actually navigating there.
+
+    Falls back to a fuzzy match (_best_fuzzy_repo_match) when no window
+    title contains repo_name as an exact substring -- Whisper mishears
+    repo names it was never primed on, and priming them was tried and
+    reverted (see main.py's TRANSCRIBE_HOTWORDS comment for why: it
+    caused real false dispatches from near-silent audio). Correcting
+    after the fact, against real open windows only, doesn't share that
+    failure mode.
     """
     normalized = repo_name.lower().replace("_", " ").replace("-", " ")
     found: list[int] = []
+    all_code_windows: "list[tuple[int, str]]" = []
 
     def _enum(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd) or not win32gui.GetWindowText(hwnd):
@@ -259,20 +349,27 @@ def focus_vscode_repo(repo_name: str) -> str:
         if _process_exe_name(hwnd) != "code.exe":
             return
         title = win32gui.GetWindowText(hwnd).lower().replace("_", " ").replace("-", " ")
+        all_code_windows.append((hwnd, title))
         if normalized in title:
             found.append(hwnd)
 
     win32gui.EnumWindows(_enum, None)
+
     if not found:
-        return phrases.pick("vscode_no_window", repo=repo_name)
+        fuzzy_hwnd = _best_fuzzy_repo_match(normalized, all_code_windows)
+        if fuzzy_hwnd is not None:
+            found = [fuzzy_hwnd]
+
+    if not found:
+        return Outcome(phrases.pick("vscode_no_window", repo=repo_name), "failed")
 
     current_desktop = [hwnd for hwnd in found if is_window_on_current_desktop(hwnd)]
     target = current_desktop or found
     _force_foreground(target[0])
-    return phrases.pick("vscode_switching", repo=repo_name)
+    return Outcome(phrases.pick("vscode_switching", repo=repo_name), "ok")
 
 
-def switch_desktop(direction: str) -> str:
+def switch_desktop(direction: str) -> Outcome:
     """
     Simulates Windows' own built-in Ctrl+Win+Right/Left shortcut via
     synthetic key events -- deliberately not using any undocumented
@@ -288,10 +385,10 @@ def switch_desktop(direction: str) -> str:
     win32api.keybd_event(vk_arrow, 0, win32con.KEYEVENTF_KEYUP, 0)
     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
     win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
-    return phrases.pick("switch_desktop", direction=direction)
+    return Outcome(phrases.pick("switch_desktop", direction=direction), "ok")
 
 
-def snap_window(direction: str) -> str:
+def snap_window(direction: str) -> Outcome:
     """
     Simulates Windows' own built-in Win+Left/Right snap shortcut --
     same synthetic-key approach as switch_desktop, and for the same
@@ -305,7 +402,7 @@ def snap_window(direction: str) -> str:
     time.sleep(0.05)
     win32api.keybd_event(vk_arrow, 0, win32con.KEYEVENTF_KEYUP, 0)
     win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
-    return phrases.pick("snap", direction=direction)
+    return Outcome(phrases.pick("snap", direction=direction), "ok")
 
 
 def _tap_media_key(vk_code: int) -> None:
@@ -313,58 +410,309 @@ def _tap_media_key(vk_code: int) -> None:
     win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
-def volume_up() -> str:
+def _apply_volume_amount(hint_text: str, step_sign: int) -> "Outcome | None":
+    """
+    Shared by volume_up/volume_down. Returns the Outcome to use if the
+    utterance carried a parseable amount, or None if it didn't -- the
+    caller's cue to fall back to the plain single-tap behaviour, which
+    stays completely unchanged for the common "turn it up"/"turn it
+    down" case with no amount said.
+
+    An *absolute* amount ("set the volume to 30") is applied exactly as
+    given, regardless of step_sign -- confirmed live that this phrasing
+    fast-path matches volume_up's own seeds (~0.83-0.85 cosine) purely
+    because of surface similarity to "turn the volume up", not because
+    it means "up"; direction only matters for the *relative* case ("by
+    10"), where step_sign says which of volume_up/volume_down asked.
+    """
+    amount = slots.parse_amount(hint_text)
+    if amount is None:
+        return None
+
+    if amount.mode == "absolute":
+        result = audio_endpoint.set_output_volume(amount.value / 100.0)
+    else:
+        result = audio_endpoint.step_output_volume(step_sign * amount.value / 100.0)
+
+    if result is None:
+        return Outcome(phrases.pick("volume_unavailable"), "failed")
+    return Outcome(phrases.pick("volume_at", percent=round(result * 100)), "ok")
+
+
+def volume_up(hint_text: str = "") -> Outcome:
+    outcome = _apply_volume_amount(hint_text, +1)
+    if outcome is not None:
+        return outcome
     _tap_media_key(win32con.VK_VOLUME_UP)
-    return phrases.pick("volume_up")
+    return Outcome(phrases.pick("volume_up"), "ok")
 
 
-def volume_down() -> str:
+def volume_down(hint_text: str = "") -> Outcome:
+    outcome = _apply_volume_amount(hint_text, -1)
+    if outcome is not None:
+        return outcome
     _tap_media_key(win32con.VK_VOLUME_DOWN)
-    return phrases.pick("volume_down")
+    return Outcome(phrases.pick("volume_down"), "ok")
 
 
-def toggle_mute() -> str:
+def toggle_mute() -> Outcome:
     _tap_media_key(win32con.VK_VOLUME_MUTE)
-    return phrases.pick("mute")
+    return Outcome(phrases.pick("mute"), "ok")
 
 
-def media_play_pause() -> str:
+def media_play_pause() -> Outcome:
     _tap_media_key(win32con.VK_MEDIA_PLAY_PAUSE)
-    return phrases.pick("play_pause")
+    return Outcome(phrases.pick("play_pause"), "ok")
 
 
-def media_next_track() -> str:
+def media_next_track() -> Outcome:
     _tap_media_key(win32con.VK_MEDIA_NEXT_TRACK)
-    return phrases.pick("next_track")
+    return Outcome(phrases.pick("next_track"), "ok")
 
 
-def media_previous_track() -> str:
+def media_previous_track() -> Outcome:
     _tap_media_key(win32con.VK_MEDIA_PREV_TRACK)
-    return phrases.pick("prev_track")
+    return Outcome(phrases.pick("prev_track"), "ok")
 
 
-def lock_workstation() -> str:
+def lock_workstation() -> Outcome:
     """
     user32!LockWorkStation -- the documented, direct API for this
     (used by Win+L itself), rather than simulating that key combo.
     """
     ctypes.windll.user32.LockWorkStation()
-    return phrases.pick("lock")
+    return Outcome(phrases.pick("lock"), "ok")
 
 
-def count_app_windows(app_key: str) -> str:
+def set_timer(hint_text: str = "") -> Outcome:
+    """
+    "Set a timer for ten minutes" / "remind me in an hour to stretch" --
+    duration and an optional label are both lexical hints pulled from
+    the raw utterance (slots.parse_duration / slots.extract_reminder_
+    label), the same zero-schema-cost pattern describe_screen's screen
+    hint and volume_up/volume_down's amount already use. The actual
+    scheduling lives in timers.py, a leaf module this one just calls
+    into and translates the result out of, the same relationship this
+    file already has with monitors.resolve_monitor_mention.
+    """
+    seconds = slots.parse_duration(hint_text)
+    if seconds is None:
+        return Outcome(phrases.pick("timer_no_duration"), "no_effect")
+    label = slots.extract_reminder_label(hint_text)
+    timers.set_timer(seconds, label)
+    return Outcome(phrases.pick("timer_set", duration=slots.format_duration(seconds)), "ok")
+
+
+def cancel_timer(hint_text: str = "") -> Outcome:
+    """
+    "Cancel the timer" / "cancel my stretch reminder" -- see
+    timers.cancel_most_recent for how a bare cancel (no label) picks
+    which timer, when more than one is running.
+    """
+    label = slots.extract_reminder_label(hint_text)
+    cancelled = timers.cancel_most_recent(label)
+    if cancelled is None:
+        return Outcome(phrases.pick("timer_none_to_cancel"), "no_effect")
+    return Outcome(phrases.pick("timer_cancelled"), "ok")
+
+
+def list_timers() -> Outcome:
+    """"How much time is left" / "what timers do I have" -- read-only, same class as now_playing/count_app_windows."""
+    active = timers.list_active()
+    if not active:
+        return Outcome(phrases.pick("timer_list_none"), "ok")
+    remaining = max(0, round(active[0]["fires_at"] - time.time()))
+    duration = slots.format_duration(remaining)
+    if len(active) == 1:
+        return Outcome(phrases.pick("timer_list_one", duration=duration), "ok")
+    return Outcome(phrases.pick("timer_list_many", count=len(active), duration=duration), "ok")
+
+
+_BATTERY_WORDS = {"battery", "charge", "charged", "charging"}
+_MEMORY_WORDS = {"memory", "ram"}
+_DISK_WORDS = {"disk", "storage", "space", "drive"}
+
+
+def _detect_status_topics(hint_text: str) -> "list[str]":
+    """
+    Which of battery/memory/disk was actually asked about, from the raw
+    utterance -- another zero-schema-cost lexical hint, same pattern as
+    monitors.resolve_monitor_mention's word sets. No recognized topic
+    word at all ("how am I doing") reports all three rather than
+    guessing wrong or declining -- a query action erring toward saying
+    more, not less.
+    """
+    words = set(re.findall(r"[a-z]+", hint_text.lower()))
+    topics = []
+    if words & _BATTERY_WORDS:
+        topics.append("battery")
+    if words & _MEMORY_WORDS:
+        topics.append("memory")
+    if words & _DISK_WORDS:
+        topics.append("disk")
+    return topics or ["battery", "memory", "disk"]
+
+
+def _format_bytes_gb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.0f} GB"
+
+
+def _battery_fact() -> "str | None":
+    battery = psutil.sensors_battery()
+    if battery is None:
+        return None  # desktops/some VMs report no battery at all -- honest omission, not a guess
+    percent = round(battery.percent)
+    if battery.power_plugged:
+        return f"battery at {percent} percent, plugged in"
+    return f"battery at {percent} percent, unplugged"
+
+
+def _memory_fact() -> str:
+    vmem = psutil.virtual_memory()
+    return f"memory at {round(vmem.percent)} percent used"
+
+
+def _disk_fact(hint_text: str) -> str:
+    # Named drive letter in the utterance ("how much space on D") wins;
+    # otherwise the system drive Windows itself is installed on --
+    # os.environ is what Windows itself uses to answer "which drive is
+    # the system on", not an assumption that it's always C.
+    named = re.search(r"\b([a-z])\s*(?:drive|:)\b", hint_text.lower())
+    drive = f"{named.group(1).upper()}:/" if named else os.environ.get("SystemDrive", "C:") + "/"
+    try:
+        usage = psutil.disk_usage(drive)
+    except OSError:
+        return f"couldn't read {drive}, sir -- that drive may not exist"
+    return f"the {drive[:2]} drive at {round(usage.percent)} percent full, {_format_bytes_gb(usage.free)} free"
+
+
+def system_status(hint_text: str = "") -> Outcome:
+    """
+    "How's my battery" / "how much memory am I using" / "is my disk
+    full" -- one action covering all three (psutil, already a
+    dependency, used today only for process names), disambiguated by
+    which topic word is actually in the utterance -- see
+    _detect_status_topics. Always "ok": a query that gets a true,
+    honest answer has succeeded at being a query even when the number
+    isn't good news (a nearly-full disk is still a real, correct
+    answer) -- the one exception is no battery detected at all, which
+    still reports whatever other topics were asked about rather than
+    failing the whole request over one missing sensor.
+    """
+    topics = _detect_status_topics(hint_text)
+    facts = []
+    for topic in topics:
+        if topic == "battery":
+            fact = _battery_fact()
+            if fact is not None:
+                facts.append(fact)
+            elif len(topics) == 1:
+                return Outcome(phrases.pick("system_status_no_battery"), "ok")
+        elif topic == "memory":
+            facts.append(_memory_fact())
+        elif topic == "disk":
+            facts.append(_disk_fact(hint_text))
+    if not facts:
+        return Outcome(phrases.pick("system_status_no_battery"), "ok")
+    return Outcome(phrases.pick("system_status", summary="; ".join(facts)), "ok")
+
+
+# Windows' own default location for a screenshot -- PrintScreen, Snipping
+# Tool, and Win+Shift+S all save here already, so a screenshot Jarvis
+# takes shows up alongside every other one the user already knows to
+# look for, rather than a project-internal folder nobody would think
+# to check.
+SCREENSHOTS_DIR = Path.home() / "Pictures" / "Screenshots"
+
+
+def open_snipping_tool() -> Outcome:
+    """
+    "Take a screenshot" / "open snipping tool" -- Win+Shift+S, the same
+    synthetic-built-in-shortcut precedent switch_desktop/snap_window
+    already use, rather than launching Snipping Tool's own executable
+    directly: this is the exact gesture that opens the region-select
+    overlay, not just the app window. Always "ok" -- like every other
+    synthetic-key action here, there's no OS feedback to verify against.
+    """
+    win32api.keybd_event(win32con.VK_LWIN, 0, 0, 0)
+    win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
+    win32api.keybd_event(ord("S"), 0, 0, 0)
+    time.sleep(0.05)
+    win32api.keybd_event(ord("S"), 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
+    return Outcome(phrases.pick("snip_tool_opened"), "ok")
+
+
+def _save_screenshot(image, prefix: str) -> "Path | None":
+    try:
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        filename = sanitize_filename(f"{prefix}_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}.png")
+        path = SCREENSHOTS_DIR / filename
+        image.save(path)
+        return path
+    except Exception:
+        return None
+
+
+def screenshot_full() -> Outcome:
+    """
+    "Take a screenshot of my screen" -- a silent full-screen grab (all
+    monitors, PIL.ImageGrab already a dependency and unused elsewhere
+    until now), saved with no UI at all, unlike open_snipping_tool's
+    interactive overlay.
+    """
+    try:
+        image = ImageGrab.grab(all_screens=True)
+    except Exception:
+        return Outcome(phrases.pick("screenshot_failed"), "failed")
+    path = _save_screenshot(image, "screenshot")
+    if path is None:
+        return Outcome(phrases.pick("screenshot_failed"), "failed")
+    return Outcome(phrases.pick("screenshot_saved"), "ok")
+
+
+def screenshot_window() -> Outcome:
+    """
+    "Screenshot this window" -- just the focused window's own bounds
+    (win32gui.GetWindowRect, the same live-bounds call move_window_to_
+    monitor's own postcondition check uses), not the whole screen.
+    Named after what's actually in it (app_titles.describe_title, the
+    same per-app title cleanup describe_screen already uses) rather
+    than a bare timestamp, so the file is identifiable at a glance
+    later without having to open it first.
+    """
+    fg_hwnd = win32gui.GetForegroundWindow()
+    if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):
+        return Outcome(phrases.pick("screenshot_no_window"), "failed")
+    try:
+        rect = win32gui.GetWindowRect(fg_hwnd)
+        image = ImageGrab.grab(bbox=rect)
+    except Exception:
+        return Outcome(phrases.pick("screenshot_failed"), "failed")
+
+    title = win32gui.GetWindowText(fg_hwnd)
+    app_key = next((key for key in APPS if _matches_app(fg_hwnd, key)), None)
+    descriptor = app_titles.describe_title(app_key, title) or title or "window"
+    path = _save_screenshot(image, descriptor)
+    if path is None:
+        return Outcome(phrases.pick("screenshot_failed"), "failed")
+    return Outcome(phrases.pick("screenshot_saved"), "ok")
+
+
+def count_app_windows(app_key: str) -> Outcome:
     """Counts across all desktops -- "how many X are open" is naturally system-wide, not scoped to the current desktop."""
     if app_key not in APPS:
-        return phrases.pick("app_not_registered", app=app_key)
+        return Outcome(phrases.pick("app_not_registered", app=app_key), "failed")
     count = len(_find_app_windows(app_key, current_desktop_only=False))
     if count == 0:
-        return phrases.pick("count_none")
+        return Outcome(phrases.pick("count_none"), "ok")
     if count == 1:
-        return phrases.pick("count_one")
-    return phrases.pick("count_many", count=count)
+        return Outcome(phrases.pick("count_one"), "ok")
+    return Outcome(phrases.pick("count_many", count=count), "ok")
 
 
-def now_playing() -> str:
+def now_playing() -> Outcome:
     """
     "What's playing" -- reads Spotify's own window title, which only
     ever carries "Artist - Track" while something is actually playing
@@ -374,43 +722,23 @@ def now_playing() -> str:
     system-wide (current_desktop_only=False), same reasoning as
     count_app_windows -- "what's playing" is naturally not scoped to
     whichever desktop happens to be active.
+
+    Every branch here is "ok" except the unregistered case: a query
+    that gets a true, honest answer ("not open", "can't tell what's
+    queued") has succeeded at being a query, even when the answer isn't
+    exciting -- only "I don't know Spotify at all" is a real failure to
+    service the request.
     """
     if "spotify" not in APPS:
-        return phrases.pick("now_playing_no_spotify")
+        return Outcome(phrases.pick("now_playing_no_spotify"), "failed")
     windows = _find_app_windows("spotify", current_desktop_only=False)
     if not windows:
-        return phrases.pick("now_playing_not_open")
+        return Outcome(phrases.pick("now_playing_not_open"), "ok")
     for hwnd in windows:
         track = app_titles.describe_spotify(win32gui.GetWindowText(hwnd))
         if track:
-            return phrases.pick("now_playing_track", track=track)
-    return phrases.pick("now_playing_unknown")
-
-
-def count_files_in_active_explorer_folder() -> str:
-    """
-    "This folder" = whatever the currently-focused File Explorer window
-    is showing, read via Shell.Application COM automation. Read-only --
-    just os.scandir on a path Explorer itself already has open.
-    """
-    fg_hwnd = win32gui.GetForegroundWindow()
-    # GetForegroundWindow can return 0, or a handle that's gone stale
-    # between this call and the next -- GetClassName throws on either
-    # (crashed the listener thread once with "Invalid window handle").
-    if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):
-        return phrases.pick("explorer_not_focused")
-    if win32gui.GetClassName(fg_hwnd) != "CabinetWClass":
-        return phrases.pick("explorer_not_focused")
-    try:
-        shell = win32com.client.Dispatch("Shell.Application")
-        for window in shell.Windows():
-            if window.HWND == fg_hwnd:
-                path = window.Document.Folder.Self.Path
-                count = sum(1 for entry in os.scandir(path) if entry.is_file())
-                return phrases.pick("folder_count", count=count)
-    except Exception:
-        pass
-    return phrases.pick("folder_unreadable")
+            return Outcome(phrases.pick("now_playing_track", track=track), "ok")
+    return Outcome(phrases.pick("now_playing_unknown"), "ok")
 
 
 _MONITOR_SPOKEN_NAMES = {
@@ -550,12 +878,12 @@ def _summarize_other_monitor(current_monitor: "str | None", monitors_list: "list
     return phrases.pick("screen_other_summary", monitor=label, summary=summary)
 
 
-def _describe_focused_window(fg_hwnd: int, current_monitor: "str | None", monitors_list: "list") -> str:
+def _describe_focused_window(fg_hwnd: int, current_monitor: "str | None", monitors_list: "list") -> Outcome:
     if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):
-        return phrases.pick("screen_unknown")
+        return Outcome(phrases.pick("screen_unknown"), "failed")
     title = win32gui.GetWindowText(fg_hwnd)
     if not title:
-        return phrases.pick("screen_unknown")
+        return Outcome(phrases.pick("screen_unknown"), "failed")
 
     app_key = next((key for key in APPS if _matches_app(fg_hwnd, key)), None)
     descriptor = app_titles.describe_title(app_key, title) or title
@@ -567,22 +895,22 @@ def _describe_focused_window(fg_hwnd: int, current_monitor: "str | None", monito
         base = phrases.pick("screen_summary_unknown", title=descriptor, monitor=monitor_label)
 
     other_summary = _summarize_other_monitor(current_monitor, monitors_list)
-    return f"{base} {other_summary}" if other_summary else base
+    text = f"{base} {other_summary}" if other_summary else base
+    return Outcome(text, "ok")
 
 
-def _describe_named_screen(monitor_key: str) -> str:
+def _describe_named_screen(monitor_key: str) -> Outcome:
     entries = _describe_screen_entries(monitor_key)
     label = _MONITOR_SPOKEN_NAMES.get(monitor_key, "that screen")
     if not entries:
-        return phrases.pick("screen_empty", monitor=label)
+        return Outcome(phrases.pick("screen_empty", monitor=label), "ok")
     summary = _phrase_app_counts(_count_by_app(entries))
-    return phrases.pick("screen_named_summary", monitor=label, summary=summary)
+    return Outcome(phrases.pick("screen_named_summary", monitor=label, summary=summary), "ok")
 
 
-def describe_screen(hint_text: str = "") -> str:
+def describe_screen(hint_text: str = "") -> Outcome:
     """
-    "What's on my screen" -- read-only, same class as
-    count_files_in_active_explorer_folder/count_app_windows.
+    "What's on my screen" -- read-only, same class as count_app_windows.
 
     With no screen named, describes the focused window plus a one-line
     summary of the other screen (see _describe_focused_window). With a
@@ -602,19 +930,107 @@ def describe_screen(hint_text: str = "") -> str:
 
     named_key, reason = monitors.resolve_monitor_mention(hint_text, monitors_list, current_monitor)
     if reason == "numbered":
-        return phrases.pick("screen_unnamed")
+        return Outcome(phrases.pick("screen_unnamed"), "no_effect")
     if reason == "unnamed":
-        return phrases.pick("screen_unnamed")
+        return Outcome(phrases.pick("screen_unnamed"), "no_effect")
     if reason == "ambiguous":
-        return phrases.pick("screen_ambiguous")
+        return Outcome(phrases.pick("screen_ambiguous"), "no_effect")
     if reason == "single":
-        return phrases.pick("screen_single")
+        return Outcome(phrases.pick("screen_single"), "ok")
 
     if named_key is not None:
         return _describe_named_screen(named_key)
 
     fg_hwnd = win32gui.GetForegroundWindow()
     return _describe_focused_window(fg_hwnd, current_monitor, monitors_list)
+
+
+def save_current_layout() -> None:
+    """
+    A one-line snapshot of what's open across every monitor, written to
+    memory.json's "last_layout" key -- called once, at shutdown (see
+    main.py's _shutdown), so the *next* boot's morning_briefing below
+    can honestly say whether anything changed while Jarvis was down,
+    rather than guessing. Shutdown, not boot, is the correct write
+    point: it's the last true snapshot of the session that just ended,
+    which is what the next boot needs to compare against. An unclean
+    shutdown (crash, kill) just means the snapshot goes stale until the
+    next clean one -- a known, low-stakes gap, not worth a second write
+    path for.
+    """
+    entries = _describe_screen_entries(None)
+    summary = _phrase_app_counts(_count_by_app(entries))
+    memory.update("last_layout", lambda _current: summary)
+
+
+def _time_of_day_bucket(hour: int) -> str:
+    """
+    Pure on purpose -- takes the hour rather than calling
+    datetime.datetime.now() itself, so the four boundaries are directly
+    testable without mocking the clock (same reasoning as slots.py's
+    parsers staying pure). Boundaries match common usage, not sunrise/
+    sunset: a 2am "good evening" would read as more broken than a 5am
+    one landing in "night" instead of "morning". Returns a bare bucket
+    name, not a phrase key -- morning_briefing below does the dispatch
+    to phrases.pick with a literal string argument per branch, so
+    test_phrases.py's "every pool gets picked somewhere" source scan
+    (which only matches a quoted string directly inside the call) can
+    actually see these keys being used.
+    """
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 22:
+        return "evening"
+    return "night"
+
+
+def morning_briefing() -> str:
+    """
+    Composed once at boot (see main.py, replacing the old flat "boot"
+    phrase) -- never a dispatchable action, so it isn't in ACTIONS/
+    _NO_PARAM_ACTIONS and costs nothing in the LLM schema. Reuses
+    system_status/describe_screen's own building blocks rather than
+    re-deriving battery or window facts a second way.
+
+    memory.json also defines "notes" and "preferences" keys, and
+    neither is mentioned here -- nothing in this project writes to
+    either one yet (both are placeholders for a feature that was never
+    built), so there is nothing true to report; inventing content to
+    fill them out would be a guess dressed up as a fact, which this
+    project's own battery-sensor handling (_battery_fact's "honest
+    omission, not a guess") already treats as the wrong move. "Still
+    where you left them" is only ever said when the current layout
+    genuinely matches the snapshot save_current_layout took at the
+    *previous* shutdown -- a fresh boot with a changed desktop, or no
+    prior snapshot at all, gets the plain current-state phrasing
+    instead.
+    """
+    bucket = _time_of_day_bucket(datetime.datetime.now().hour)
+    if bucket == "morning":
+        sentences = [phrases.pick("briefing_greeting_morning")]
+    elif bucket == "afternoon":
+        sentences = [phrases.pick("briefing_greeting_afternoon")]
+    elif bucket == "evening":
+        sentences = [phrases.pick("briefing_greeting_evening")]
+    else:
+        sentences = [phrases.pick("briefing_greeting_night")]
+
+    battery = _battery_fact()
+    if battery is not None:
+        sentences.append(f"{battery[0].upper()}{battery[1:]}.")
+
+    entries = _describe_screen_entries(None)
+    summary = _phrase_app_counts(_count_by_app(entries))
+    if summary:
+        previous_layout = memory.get("last_layout")
+        if summary == previous_layout:
+            sentences.append(phrases.pick("briefing_layout_unchanged", summary=summary))
+        else:
+            sentences.append(phrases.pick("briefing_layout_current", summary=summary))
+
+    return " ".join(sentences)
 
 
 def llm_screen_context() -> "str | None":
@@ -644,7 +1060,7 @@ def llm_screen_context() -> "str | None":
     return f'{app_label} -- "{descriptor}" on {monitor_label}'
 
 
-def move_window_to_monitor(hint_text: str = "") -> str:
+def move_window_to_monitor(hint_text: str = "") -> Outcome:
     """
     "Move this to my laptop screen" -- moves the FOREGROUND window to a
     named monitor (no app parameter, acts on whatever has focus, same
@@ -681,28 +1097,31 @@ def move_window_to_monitor(hint_text: str = "") -> str:
     monitors_list = monitors.list_monitors(force_refresh=True)
     fg_hwnd = win32gui.GetForegroundWindow()
     if not fg_hwnd or not win32gui.IsWindow(fg_hwnd):
-        return phrases.pick("move_monitor_no_window")
+        return Outcome(phrases.pick("move_monitor_no_window"), "failed")
 
     current_key = window_context.foreground_monitor_key()
     target_key, reason = monitors.resolve_monitor_mention(hint_text, monitors_list, current_key)
 
     if reason in ("numbered", "unnamed"):
-        return phrases.pick("move_monitor_unnamed")
+        return Outcome(phrases.pick("move_monitor_unnamed"), "no_effect")
     if reason == "ambiguous" or (reason == "none" and target_key is None):
-        return phrases.pick("move_monitor_unclear")
+        return Outcome(phrases.pick("move_monitor_unclear"), "no_effect")
     if reason == "single":
-        return phrases.pick("move_monitor_single")
+        return Outcome(phrases.pick("move_monitor_single"), "no_effect")
 
     by_key = {m.key: m for m in monitors_list}
     target_monitor = by_key.get(target_key)
     if target_monitor is None:
-        return phrases.pick("move_monitor_unnamed")
+        return Outcome(phrases.pick("move_monitor_unnamed"), "no_effect")
 
     if target_key == current_key:
-        return phrases.pick("move_monitor_already_there", monitor=_MONITOR_SPOKEN_NAMES.get(target_key, "that screen"))
+        return Outcome(
+            phrases.pick("move_monitor_already_there", monitor=_MONITOR_SPOKEN_NAMES.get(target_key, "that screen")),
+            "no_effect",
+        )
 
     if win32gui.IsIconic(fg_hwnd):
-        return phrases.pick("move_monitor_minimized")
+        return Outcome(phrases.pick("move_monitor_minimized"), "no_effect")
 
     original_placement = win32gui.GetWindowPlacement(fg_hwnd)
     is_maximized = original_placement[1] == win32con.SW_SHOWMAXIMIZED
@@ -756,7 +1175,7 @@ def move_window_to_monitor(hint_text: str = "") -> str:
             win32gui.SetWindowPlacement(fg_hwnd, original_placement)
         except Exception:
             pass
-        return phrases.pick("move_monitor_failed")
+        return Outcome(phrases.pick("move_monitor_failed"), "failed")
 
     # Final postcondition -- checked against GetWindowRect (the window's
     # actual current bounds), not rcNormalPosition, since a maximized
@@ -765,9 +1184,9 @@ def move_window_to_monitor(hint_text: str = "") -> str:
     # closed, matching the rest of this project's correctness-adjacent
     # checks.
     if not _poll_until(lambda: monitors.monitor_key_for_rect(win32gui.GetWindowRect(fg_hwnd)) == target_key):
-        return phrases.pick("move_monitor_failed")
+        return Outcome(phrases.pick("move_monitor_failed"), "failed")
 
-    return phrases.pick("move_monitor_ok", monitor=_MONITOR_SPOKEN_NAMES.get(target_key, "that screen"))
+    return Outcome(phrases.pick("move_monitor_ok", monitor=_MONITOR_SPOKEN_NAMES.get(target_key, "that screen")), "ok")
 
 
 ACTIONS = {
@@ -778,7 +1197,6 @@ ACTIONS = {
     "switch_desktop": switch_desktop,
     "snap_window": snap_window,
     "count_app_windows": count_app_windows,
-    "count_files_in_folder": count_files_in_active_explorer_folder,
     "describe_screen": describe_screen,
     "now_playing": now_playing,
     "move_to_monitor": move_window_to_monitor,
@@ -789,6 +1207,13 @@ ACTIONS = {
     "media_next_track": media_next_track,
     "media_previous_track": media_previous_track,
     "lock_workstation": lock_workstation,
+    "set_timer": set_timer,
+    "cancel_timer": cancel_timer,
+    "list_timers": list_timers,
+    "system_status": system_status,
+    "open_snipping_tool": open_snipping_tool,
+    "screenshot_full": screenshot_full,
+    "screenshot_window": screenshot_window,
 }
 
 # Actions that take no parameter at all -- system/media controls that
@@ -806,10 +1231,17 @@ _NO_PARAM_ACTIONS = (
     "describe_screen",
     "now_playing",
     "move_to_monitor",
+    "set_timer",
+    "cancel_timer",
+    "list_timers",
+    "system_status",
+    "open_snipping_tool",
+    "screenshot_full",
+    "screenshot_window",
 )
 
 
-def dispatch_llm_action(parsed: dict, text: str = "") -> str:
+def dispatch_llm_action(parsed: dict, text: str = "") -> Outcome:
     """
     Takes an already-validated dict from llm_intent.infer() (action,
     app, direction, repo -- app/direction/repo may be "none"/"" when
@@ -819,31 +1251,53 @@ def dispatch_llm_action(parsed: dict, text: str = "") -> str:
 
     text is the raw utterance that produced `parsed` -- optional (default
     "" so every existing single-argument call site keeps working
-    unchanged) and used by three actions as a free-text hint, never
+    unchanged) and used by several actions as a free-text hint, never
     anything schema-carried: focus_or_launch_app (which window to raise
     when several of the same app are open), describe_screen (which
-    screen to describe, if one was named), and move_to_monitor (which
-    screen to send the focused window to). All three stay in
-    _NO_PARAM_ACTIONS for parse_fast_path_intent's sake (their fast-path
-    label carries no parameter -- see that function), but need their own
-    branch here since the *Python* call takes an argument even though
-    the *schema* doesn't; _NO_PARAM_ACTIONS itself still means "zero
-    Python args" for everything else in it.
+    screen to describe, if one was named), move_to_monitor (which screen
+    to send the focused window to), volume_up/volume_down (how much to
+    change by, or an exact target -- see slots.parse_amount), and
+    set_timer/cancel_timer (a duration and an optional label -- see
+    slots.parse_duration/extract_reminder_label). The no-param ones
+    among these (describe_screen, move_to_monitor, volume_up,
+    volume_down, set_timer, cancel_timer) stay in _NO_PARAM_ACTIONS for
+    parse_fast_path_intent's sake (their fast-path label carries no
+    parameter -- see that function), but need their own branch here
+    since the *Python* call takes an argument even though the *schema*
+    doesn't; _NO_PARAM_ACTIONS itself still means "zero Python args" for
+    everything else in it.
+
+    Always returns an Outcome. Every real action in ACTIONS returns one
+    directly now, but a bare `str` (from a not-yet-converted action, or
+    a test's monkeypatched stand-in -- see test_actions.py, which mocks
+    ACTIONS entries with plain lambdas returning "ok") is normalized to
+    Outcome(text, "ok") here rather than assumed away, so neither needs
+    to change in lockstep with the other.
     """
     action = parsed["action"]
     if action == "focus_or_launch_app":
-        return ACTIONS[action](parsed["app"], text)
-    if action in ("describe_screen", "move_to_monitor"):
-        return ACTIONS[action](text)
-    if action in ("minimize_app", "maximize_app", "count_app_windows"):
-        return ACTIONS[action](parsed["app"])
-    if action in ("switch_desktop", "snap_window"):
-        return ACTIONS[action](parsed["direction"])
-    if action == "focus_vscode_repo":
-        return ACTIONS[action](parsed["repo"])
-    if action == "count_files_in_folder" or action in _NO_PARAM_ACTIONS:
-        return ACTIONS[action]()
-    return phrases.pick("unknown_action")
+        result = ACTIONS[action](parsed["app"], text)
+    elif action in (
+        "describe_screen",
+        "move_to_monitor",
+        "volume_up",
+        "volume_down",
+        "set_timer",
+        "cancel_timer",
+        "system_status",
+    ):
+        result = ACTIONS[action](text)
+    elif action in ("minimize_app", "maximize_app", "count_app_windows"):
+        result = ACTIONS[action](parsed["app"])
+    elif action in ("switch_desktop", "snap_window"):
+        result = ACTIONS[action](parsed["direction"])
+    elif action == "focus_vscode_repo":
+        result = ACTIONS[action](parsed["repo"])
+    elif action in _NO_PARAM_ACTIONS:
+        result = ACTIONS[action]()
+    else:
+        return Outcome(phrases.pick("unknown_action"), "failed")
+    return result if isinstance(result, Outcome) else Outcome(result, "ok")
 
 
 def parse_fast_path_intent(label: str) -> dict | None:
